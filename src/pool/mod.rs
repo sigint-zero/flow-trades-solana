@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod discovery;
 pub mod fetcher;
+pub mod layouts;
 pub mod registry;
 pub mod types;
 

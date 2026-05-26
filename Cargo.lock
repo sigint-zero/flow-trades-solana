@@ -1474,6 +1474,7 @@ dependencies = [
  "ureq",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
+ "zeropod",
 ]
 
 [[package]]
@@ -7953,6 +7954,26 @@ name = "zeroize_derive"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "zeropod"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efea93c3bd4eaad26f65af88348e5e08077f4a4682adb37147765172100313c4"
+dependencies = [
+ "zeropod-derive",
+]
+
+[[package]]
+name = "zeropod-derive"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8274ac397f401621161eb645a2bc19b641a81a4f4b4a1e0e4795867fe494f6b1"
 dependencies = [
  "proc-macro2",
  "quote",

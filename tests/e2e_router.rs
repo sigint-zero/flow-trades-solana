@@ -179,7 +179,7 @@ async fn test_router_wrap_with_protocol_fee_account() {
 }
 
 #[tokio::test]
-async fn test_router_wrap_swap() {
+async fn test_router_wrap_swap_multi_hop() {
     eprintln!("\n=== ROUTER WRAP: MULTI-HOP (2 DEX CPIs) ===\n");
     let rpc = rpc();
     let user = Pubkey::from_str("6TwqjGNQ8c2aUHvbpAjMd4bdHdone9CTrz3c8S71E2WW").unwrap();

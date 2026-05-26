@@ -8,6 +8,16 @@ use tracing::debug;
 use crate::constants::*;
 use crate::error::{TradeError, TradeResult};
 use super::types::{PoolState, PoolType};
+use super::layouts::{
+    RaydiumV4Pool, SerumMarketAccounts,
+    RaydiumCpmmPool, RaydiumClmmPool, RaydiumLpPool,
+    PumpFunBondingCurve, PumpFunGlobal, PumpFunAmmPool,
+    MeteoraPool, MeteoraVault, MeteoraDlmmLbPair, MeteoraDammPool,
+    MeteoraDbcVirtualPool, MeteoraDbcConfig,
+    OrcaWhirlpool, SplTokenSwapPool, FlashTradePool,
+    DefiTunaFusionPool, DefiTunaPoolsPool, PancakeSwapPool,
+    PumpupPool, PumpupBondingCurve, PumpupConfig,
+};
 
 // Pre-computed global PDAs -- `find_program_address` does elliptic curve math,
 // so computing once avoids ~10-50us per pool fetch for these fixed seeds.
@@ -151,192 +161,81 @@ pub async fn get_mint_token_program(rpc: &RpcClient, mint: &Pubkey) -> TradeResu
     }
 }
 
+// Thin wrapper so the test module (which does `use super::*`) can call
+// read_pubkey without importing from layouts.
+#[cfg(test)]
 fn read_pubkey(data: &[u8], offset: usize) -> TradeResult<Pubkey> {
-    if data.len() < offset + 32 {
-        return Err(TradeError::Execution(format!(
-            "account data too short: need {} bytes at offset {offset}, have {}",
-            offset + 32,
-            data.len()
-        )));
-    }
-    let arr: [u8; 32] = data[offset..offset + 32]
-        .try_into()
-        .map_err(|_| TradeError::Execution(format!("failed to read pubkey at offset {offset}")))?;
-    Ok(Pubkey::new_from_array(arr))
+    super::layouts::read_pubkey(data, offset)
 }
 
 // -- Raydium V4 --
-// AmmInfo layout: authority(32) open_orders(32) target_orders(32)
-// coin_vault(32) pc_vault(32) ... serum_market(32) ...
-// Total AmmInfo ~752 bytes
 async fn parse_raydium_v4(
     rpc: &RpcClient,
     pool_address: &Pubkey,
     pool_data: &Account,
 ) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 680 {
-        return Err(TradeError::Execution("raydium v4 account too small".into()));
-    }
-
-    let coin_vault = read_pubkey(data, 336)?;
-    let pc_vault = read_pubkey(data, 368)?;
-    let open_orders = read_pubkey(data, 432)?;
-    let serum_market = read_pubkey(data, 464)?;
-    let serum_program = read_pubkey(data, 496)?;
-    let target_orders = read_pubkey(data, 528)?;
-
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    // Fetch serum market to get bids, asks, event_queue, vaults, vault_signer.
-    // Post Serum-shutdown many market accounts have been reclaimed (82 bytes / Token account).
-    // The Raydium V4 program still works for AMM-only swaps -- pass the market address
-    // as a placeholder for all serum fields when the market is closed.
-    let market_data = fetch_account(rpc, &serum_market).await?;
-    let mdata = &market_data.data;
-
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().unwrap());
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                &market_data.owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            // Serum market closed -- use market address as placeholder for all fields.
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
+    let pool = RaydiumV4Pool::try_from_bytes(&pool_data.data)?;
+    let market_data = fetch_account(rpc, &pool.serum_market).await?;
+    let serum = SerumMarketAccounts::parse(&market_data.data, pool.serum_market, &market_data.owner)?;
 
     Ok(PoolState::RaydiumV4 {
         amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
+        authority: *RAYDIUM_V4_AUTHORITY,
+        open_orders: pool.open_orders,
+        target_orders: pool.target_orders,
+        coin_vault: pool.coin_vault,
+        pc_vault: pool.pc_vault,
+        serum_program: pool.serum_program,
+        serum_market: pool.serum_market,
+        serum_bids: serum.bids,
+        serum_asks: serum.asks,
+        serum_event_queue: serum.event_queue,
+        serum_coin_vault: serum.coin_vault,
+        serum_pc_vault: serum.pc_vault,
+        serum_vault_signer: serum.vault_signer,
     })
 }
 
 // -- Raydium CPMM --
-// Pool state layout (after 8-byte Anchor discriminator):
-// amm_config(32), pool_creator(32), token_0_vault(32), token_1_vault(32),
-// lp_mint(32), token_0_mint(32), token_1_mint(32), token_0_program(32),
-// token_1_program(32), observation_key(32), auth_bump(1), ...
-// NOTE: authority is NOT stored in the struct -- it's a PDA derived from seeds.
 fn parse_raydium_cpmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 10 * 32 + 1 {
-        return Err(TradeError::Execution("raydium cpmm account too small".into()));
-    }
-    let off = 8; // skip Anchor discriminator
-    let config = read_pubkey(data, off)?;
-    let token_0_vault = read_pubkey(data, off + 64)?;
-    let token_1_vault = read_pubkey(data, off + 96)?;
-    let token_0_mint = read_pubkey(data, off + 160)?;
-    let token_1_mint = read_pubkey(data, off + 192)?;
-    let observation = read_pubkey(data, off + 288)?;
-
-    let authority = *RAYDIUM_CPMM_AUTHORITY;
-
+    let pool = RaydiumCpmmPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::RaydiumCpmm {
         pool: *pool_address,
-        authority,
-        config,
-        token_0_vault,
-        token_1_vault,
-        token_0_mint,
-        token_1_mint,
-        observation,
+        authority: *RAYDIUM_CPMM_AUTHORITY,
+        config: pool.amm_config,
+        token_0_vault: pool.token_0_vault,
+        token_1_vault: pool.token_1_vault,
+        token_0_mint: pool.token_0_mint,
+        token_1_mint: pool.token_1_mint,
+        observation: pool.observation_key,
     })
 }
 
 // -- Raydium CLMM --
-// Pool state (after 8-byte discriminator):
-// bump(1), amm_config(32), owner(32), token_mint_0(32), token_mint_1(32),
-// token_vault_0(32), token_vault_1(32), observation_key(32), ...
-// tick_current(i32), ...
 fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 1 + 7 * 32 {
-        return Err(TradeError::Execution("raydium clmm account too small".into()));
-    }
-    let off = 8;
-    // bump at off, skip 2 bytes (bump + padding)
-    let amm_config = read_pubkey(data, off + 1)?;
-    let token_mint_0 = read_pubkey(data, off + 65)?;
-    let token_mint_1 = read_pubkey(data, off + 97)?;
-    let token_vault_0 = read_pubkey(data, off + 129)?;
-    let token_vault_1 = read_pubkey(data, off + 161)?;
-    let observation = read_pubkey(data, off + 193)?;
+    let pool = RaydiumClmmPool::try_from_bytes(&pool_data.data)?;
 
-    // tick_spacing: u16 at off+227 (after 7xPubkey + 2xu8)
-    let tick_spacing = if data.len() >= off + 229 {
-        u16::from_le_bytes(data[off + 227..off + 229].try_into().unwrap()) as i32
-    } else {
-        1
-    };
+    let tick_array_0 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, pool.tick_current, pool.tick_spacing, 0);
+    let tick_array_1 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, pool.tick_current, pool.tick_spacing, -1);
+    let tick_array_2 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, pool.tick_current, pool.tick_spacing, 1);
 
-    // liquidity: u128 at off+229
-    let liquidity = if data.len() >= off + 245 {
-        u128::from_le_bytes(data[off + 229..off + 245].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // sqrt_price_x64: u128 at off+245
-    let sqrt_price_x64 = if data.len() >= off + 261 {
-        u128::from_le_bytes(data[off + 245..off + 261].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // tick_current: i32 at off+261 (after tick_spacing + u128 liquidity + u128 sqrt_price)
-    let tick_current = if data.len() >= off + 265 {
-        i32::from_le_bytes(data[off + 261..off + 265].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // Fee rate is stored in the amm_config account, not pool data.
-    // Default to 25 bps (2500 hundredths-of-bps). Common values: 100 (1bp), 2500 (25bp), 10000 (100bp).
-    let fee_rate: u16 = 25;
-
-    // Tick arrays are PDAs: seeds = ["tick_array", pool, start_tick_index]
-    let tick_array_0 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, tick_current, tick_spacing, 0);
-    let tick_array_1 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, tick_current, tick_spacing, -1);
-    let tick_array_2 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, tick_current, tick_spacing, 1);
-
+    // Fee rate lives in amm_config; default 25 bps (common values: 100/2500/10000 hundredths-of-bp).
     Ok(PoolState::RaydiumClmm {
         pool: *pool_address,
-        amm_config,
-        observation,
-        token_vault_0,
-        token_vault_1,
+        amm_config: pool.amm_config,
+        observation: pool.observation,
+        token_vault_0: pool.token_vault_0,
+        token_vault_1: pool.token_vault_1,
         tick_array_0,
         tick_array_1,
         tick_array_2,
-        token_mint_0,
-        token_mint_1,
-        tick_current,
-        tick_spacing,
-        sqrt_price_x64,
-        liquidity,
-        fee_rate,
+        token_mint_0: pool.token_mint_0,
+        token_mint_1: pool.token_mint_1,
+        tick_current: pool.tick_current,
+        tick_spacing: pool.tick_spacing,
+        sqrt_price_x64: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
+        fee_rate: 25,
     })
 }
 
@@ -365,35 +264,18 @@ fn derive_tick_array(
 }
 
 // -- Raydium LaunchPad (LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj) --
-// Pool account layout (verified from mainnet, 429 bytes):
-// disc(8) + params(133) + configId(32@141) + platformId(32@173)
-// + mintA(32@205) + mintB(32@237) + vaultA(32@269) + vaultB(32@301)
-// + creator(32@333)
 fn parse_raydium_lp(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 365 {
-        return Err(TradeError::Execution("raydium lp account too small".into()));
-    }
-    let config_id = read_pubkey(data, 141)?;
-    let platform_id = read_pubkey(data, 173)?;
-    let base_mint = read_pubkey(data, 205)?;
-    let quote_mint = read_pubkey(data, 237)?;
-    let base_vault = read_pubkey(data, 269)?;
-    let quote_vault = read_pubkey(data, 301)?;
-    let creator = read_pubkey(data, 333)?;
-
-    let authority = *RAYDIUM_LP_AUTHORITY;
-
+    let pool = RaydiumLpPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::RaydiumLp {
         pool_state: *pool_address,
-        authority,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
-        config_id,
-        platform_id,
-        creator,
+        authority: *RAYDIUM_LP_AUTHORITY,
+        base_vault: pool.base_vault,
+        quote_vault: pool.quote_vault,
+        base_mint: pool.base_mint,
+        quote_mint: pool.quote_mint,
+        config_id: pool.config_id,
+        platform_id: pool.platform_id,
+        creator: pool.creator,
     })
 }
 
@@ -443,12 +325,7 @@ async fn parse_pumpfun(
         return Err(TradeError::Execution("pumpfun: unexpected account data format".into()));
     };
 
-    // Read creator from bonding curve data (offset 49, 32 bytes)
-    let creator = if pool_data.data.len() >= 81 {
-        read_pubkey(&pool_data.data, 49)?
-    } else {
-        Pubkey::default()
-    };
+    let curve = PumpFunBondingCurve::try_from_bytes(&pool_data.data);
 
     // Fetch mint account (for token program) and global config in parallel
     let global = *PUMPFUN_GLOBAL;
@@ -462,12 +339,9 @@ async fn parse_pumpfun(
         &mint,
         &token_prog,
     );
-    // Global layout: disc(8) + initialized(1) + authority(32@9) + fee_recipient(32@41)
-    let fee_account = if global_data.data.len() >= 73 {
-        read_pubkey(&global_data.data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
+    let fee_account = PumpFunGlobal::try_from_bytes(&global_data.data)
+        .map(|g| g.fee_recipient)
+        .unwrap_or(*PUMPFUN_FEE_FALLBACK);
     let event_authority = *PUMPFUN_EVENT_AUTHORITY;
 
     Ok(PoolState::PumpFun {
@@ -477,42 +351,20 @@ async fn parse_pumpfun(
         bonding_curve: *pool_address,
         associated_bonding_curve,
         event_authority,
-        creator,
+        creator: curve.creator,
     })
 }
 
-// -- PumpFun AMM (pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA) --
-// Pool account layout (verified from mainnet):
-// 0-7:   Anchor discriminator (account:Pool)
-// 8:     pool_bump (1)
-// 9-10:  index (u16)
-// 11-42: creator (32)
-// 43-74: base_mint (32)
-// 75-106: quote_mint (32)
-// 107-138: lp_mint (32)
-// 139-170: pool_base_vault (32)
-// 171-202: pool_quote_vault (32)
-// 203-210: lp_supply (u64)
-// 211-242: coin_creator (32)
 /// Parse PumpFun AMM pool layout (sync, no RPC needed).
 fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 243 {
-        return Err(TradeError::Execution("pumpfun amm account too small".into()));
-    }
-    let coin_creator = read_pubkey(data, 211)?;
-    let base_mint = read_pubkey(data, 43)?;
-    let quote_mint = read_pubkey(data, 75)?;
-    let pool_base_vault = read_pubkey(data, 139)?;
-    let pool_quote_vault = read_pubkey(data, 171)?;
-
+    let p = PumpFunAmmPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::PumpFunAmm {
         pool: *pool_address,
-        base_mint,
-        quote_mint,
-        pool_base_vault,
-        pool_quote_vault,
-        coin_creator,
+        base_mint: p.base_mint,
+        quote_mint: p.quote_mint,
+        pool_base_vault: p.pool_base_vault,
+        pool_quote_vault: p.pool_quote_vault,
+        coin_creator: p.coin_creator,
         base_reserve: 0,
         quote_reserve: 0,
     })
@@ -547,109 +399,49 @@ async fn fetch_token_balance(rpc: &RpcClient, token_account: &Pubkey) -> TradeRe
 }
 
 // -- Meteora Standard (Dynamic AMM, vault-based) --
-// Pool layout (verified from mainnet, program Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB):
-// disc(8) + lp_mint(32@8) + token_a_mint(32@40) + token_b_mint(32@72)
-// + a_vault(32@104) + b_vault(32@136) + a_vault_lp(32@168) + b_vault_lp(32@200)
-// + a_vault_lp_bump(1@232) + enabled(1@233) + admin_token_a_fee(32@234) + admin_token_b_fee(32@266)
-//
-// NOTE: a_token_vault, b_token_vault, a_vault_lp_mint, b_vault_lp_mint are stored
-// inside the vault accounts (program 24Uqj9...), NOT in the pool account.
-// Vault layout: disc(8) + enabled(1@8) + bump(1@9) + flag(1@10) + total_amount(u64@11)
-// + token_vault(32@19) + fee_vault(32@51) + token_mint(32@83) + lp_mint(32@115)
 async fn parse_meteora(
     rpc: &RpcClient,
     pool_address: &Pubkey,
     pool_data: &Account,
 ) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 298 {
-        return Err(TradeError::Execution("meteora pool account too small".into()));
-    }
+    let pool = MeteoraPool::try_from_bytes(&pool_data.data)?;
 
-    let token_a_mint = read_pubkey(data, 40)?;
-    let token_b_mint = read_pubkey(data, 72)?;
-    let a_vault = read_pubkey(data, 104)?;
-    let b_vault = read_pubkey(data, 136)?;
-    let a_vault_lp = read_pubkey(data, 168)?;
-    let b_vault_lp = read_pubkey(data, 200)?;
-    let admin_token_a_fee = read_pubkey(data, 234)?;
-    let admin_token_b_fee = read_pubkey(data, 266)?;
-
-    // Fetch vault accounts in parallel to get token_vaults and lp_mints
     let (a_vault_data, b_vault_data) = tokio::try_join!(
-        fetch_account(rpc, &a_vault),
-        fetch_account(rpc, &b_vault),
+        fetch_account(rpc, &pool.a_vault),
+        fetch_account(rpc, &pool.b_vault),
     )?;
 
-    if a_vault_data.data.len() < 147 || b_vault_data.data.len() < 147 {
-        return Err(TradeError::Execution("meteora vault account too small".into()));
-    }
-
-    let a_token_vault = read_pubkey(&a_vault_data.data, 19)?;
-    let b_token_vault = read_pubkey(&b_vault_data.data, 19)?;
-    let a_vault_lp_mint = read_pubkey(&a_vault_data.data, 115)?;
-    let b_vault_lp_mint = read_pubkey(&b_vault_data.data, 115)?;
-
-    let vault_program = *METEORA_VAULT_PROGRAM;
+    let av = MeteoraVault::try_from_bytes(&a_vault_data.data)?;
+    let bv = MeteoraVault::try_from_bytes(&b_vault_data.data)?;
 
     Ok(PoolState::Meteora {
         pool: *pool_address,
-        token_a_mint,
-        token_b_mint,
-        a_vault,
-        b_vault,
-        a_token_vault,
-        b_token_vault,
-        a_vault_lp_mint,
-        b_vault_lp_mint,
-        a_vault_lp,
-        b_vault_lp,
-        admin_token_a_fee,
-        admin_token_b_fee,
-        vault_program,
+        token_a_mint: pool.token_a_mint,
+        token_b_mint: pool.token_b_mint,
+        a_vault: pool.a_vault,
+        b_vault: pool.b_vault,
+        a_token_vault: av.token_vault,
+        b_token_vault: bv.token_vault,
+        a_vault_lp_mint: av.lp_mint,
+        b_vault_lp_mint: bv.lp_mint,
+        a_vault_lp: pool.a_vault_lp,
+        b_vault_lp: pool.b_vault_lp,
+        admin_token_a_fee: pool.admin_token_a_fee,
+        admin_token_b_fee: pool.admin_token_b_fee,
+        vault_program: *METEORA_VAULT_PROGRAM,
     })
 }
 
 // -- Meteora DLMM --
-// LbPair layout (after 8-byte Anchor discriminator):
-// parameters (StaticParameters, 32), v_parameters (VariableParameters, 32),
-// bump_seed(1), bin_step_seed(2), pair_type(1), active_id(4), bin_step(2),
-// status(1), require_base_factor_seed(1), base_factor_seed(2), activation_type(1), _pad(1),
-// token_x_mint(32), token_y_mint(32), reserve_x(32), reserve_y(32),
-// protocol_fee(16), _padding_1(32), reward_infos(2x144=288), oracle(32), ...
 fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 584 {
-        return Err(TradeError::Execution("meteora dlmm account too small".into()));
-    }
-    let off = 8; // skip Anchor discriminator
-    // active_id at off + 68 (32+32+1+2+1 = 68)
-    let active_id = i32::from_le_bytes(data[off + 68..off + 72].try_into().unwrap());
-    // token_x_mint at off + 80
-    let token_x_mint = read_pubkey(data, off + 80)?;
-    let token_y_mint = read_pubkey(data, off + 112)?;
-    let reserve_x = read_pubkey(data, off + 144)?;
-    let reserve_y = read_pubkey(data, off + 176)?;
-    // oracle at off + 544 (176+32+16+32+288 = 544)
-    let oracle = read_pubkey(data, off + 544)?;
+    let lb = MeteoraDlmmLbPair::try_from_bytes(&pool_data.data)?;
 
-    // bin_array_bitmap_extension: None -> use DLMM program ID as placeholder
-    let bin_array_bitmap_extension = METEORA_DLMM_PROG_ID;
-
-    // host_fee_in: None -> use DLMM program ID as placeholder
-    let host_fee_in = METEORA_DLMM_PROG_ID;
-
-    let event_authority = *METEORA_DLMM_EVENT_AUTHORITY;
-
-    // Derive bin array PDAs from active_id
-    // MAX_BIN_PER_ARRAY = 70
-    let bin_idx = active_id.div_euclid(70);
+    let bin_idx = lb.active_id.div_euclid(70); // MAX_BIN_PER_ARRAY = 70
     let bin_arrays: Vec<Pubkey> = [bin_idx, bin_idx - 1, bin_idx + 1]
         .iter()
         .map(|&idx| {
-            let idx_bytes = (idx as i64).to_le_bytes();
             let (pda, _) = Pubkey::find_program_address(
-                &[b"bin_array", pool_address.as_ref(), &idx_bytes],
+                &[b"bin_array", pool_address.as_ref(), &(idx as i64).to_le_bytes()],
                 &METEORA_DLMM_PROG_ID,
             );
             pda
@@ -658,433 +450,191 @@ fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
 
     Ok(PoolState::MeteoraDlmm {
         lb_pair: *pool_address,
-        bin_array_bitmap_extension,
-        reserve_x,
-        reserve_y,
-        token_x_mint,
-        token_y_mint,
-        oracle,
-        host_fee_in,
-        event_authority,
+        bin_array_bitmap_extension: METEORA_DLMM_PROG_ID, // None → program ID placeholder
+        reserve_x: lb.reserve_x,
+        reserve_y: lb.reserve_y,
+        token_x_mint: lb.token_x_mint,
+        token_y_mint: lb.token_y_mint,
+        oracle: lb.oracle,
+        host_fee_in: METEORA_DLMM_PROG_ID, // None → program ID placeholder
+        event_authority: *METEORA_DLMM_EVENT_AUTHORITY,
         bin_arrays,
     })
 }
 
 // -- Meteora DAMM (cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG) --
-// Pool account layout (verified from mainnet, 1112 bytes):
-// disc(8) + pool_fees(160@8) + token_a_mint(32@168) + token_b_mint(32@200)
-// + token_a_vault(32@232) + token_b_vault(32@264)
 fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 296 {
-        return Err(TradeError::Execution("meteora damm account too small".into()));
-    }
-    let token_a_mint = read_pubkey(data, 168)?;
-    let token_b_mint = read_pubkey(data, 200)?;
-    let token_a_vault = read_pubkey(data, 232)?;
-    let token_b_vault = read_pubkey(data, 264)?;
-
+    let pool = MeteoraDammPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::MeteoraDamm {
         pool: *pool_address,
-        token_a_vault,
-        token_b_vault,
-        token_a_mint,
-        token_b_mint,
+        token_a_vault: pool.token_a_vault,
+        token_b_vault: pool.token_b_vault,
+        token_a_mint: pool.token_a_mint,
+        token_b_mint: pool.token_b_mint,
     })
 }
 
 // -- Meteora DBC (dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN) --
-// VirtualPool layout (verified from mainnet):
-//  72:  config (Pubkey)
-//  136: base_mint (Pubkey)
-//  168: base_vault (Pubkey)
-//  200: quote_vault (Pubkey)
-// PoolConfig layout (1048 bytes):
-//   8:  quote_mint (Pubkey)
 async fn parse_meteora_dbc(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 232 {
-        return Err(TradeError::Execution("meteora dbc pool too small".into()));
-    }
-
-    let config_key = read_pubkey(data, 72)?;
-    let base_mint = read_pubkey(data, 136)?;
-    let base_vault = read_pubkey(data, 168)?;
-    let quote_vault = read_pubkey(data, 200)?;
-
-    // Fetch config account to get quote_mint
-    let config_data = fetch_account(rpc, &config_key).await?;
-    if config_data.data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(&config_data.data, 8)?;
+    let pool = MeteoraDbcVirtualPool::try_from_bytes(&pool_data.data)?;
+    let config_data = fetch_account(rpc, &pool.config).await?;
+    let cfg = MeteoraDbcConfig::try_from_bytes(&config_data.data)?;
 
     Ok(PoolState::MeteoraDbc {
         pool: *pool_address,
-        config: config_key,
+        config: pool.config,
         pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
+        base_vault: pool.base_vault,
+        quote_vault: pool.quote_vault,
+        base_mint: pool.base_mint,
+        quote_mint: cfg.quote_mint,
     })
 }
 
 // -- Orca Whirlpool --
 fn parse_orca(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 9 * 32 {
-        return Err(TradeError::Execution("orca whirlpool account too small".into()));
-    }
-    // Whirlpool layout (after 8-byte discriminator):
-    // config(32), bump(1), tick_spacing(2), tick_spacing_seed(2),
-    // fee_rate(2), protocol_fee_rate(2), liquidity(16), sqrt_price(16),
-    // tick_current_index(4), protocol_fee_owed_a(8), protocol_fee_owed_b(8),
-    // token_mint_a(32), token_vault_a(32), fee_growth_global_a(16),
-    // token_mint_b(32), token_vault_b(32), fee_growth_global_b(16)
-    let off = 8;
-    let token_mint_a = read_pubkey(data, off + 93)?;
-    let token_vault_a = read_pubkey(data, off + 125)?;
-    let token_mint_b = read_pubkey(data, off + 173)?;
-    let token_vault_b = read_pubkey(data, off + 205)?;
-
-    // tick_spacing: u16 at off+33
-    let tick_spacing = if data.len() >= off + 35 {
-        u16::from_le_bytes(data[off + 33..off + 35].try_into().unwrap()) as i32
-    } else {
-        1
-    };
-
-    // fee_rate: u16 at off+37 (in hundredths of a basis point)
-    let fee_rate = if data.len() >= off + 39 {
-        u16::from_le_bytes(data[off + 37..off + 39].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // liquidity: u128 at off+41
-    let liquidity = if data.len() >= off + 57 {
-        u128::from_le_bytes(data[off + 41..off + 57].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // sqrt_price_x64: u128 at off+57
-    let sqrt_price_x64 = if data.len() >= off + 73 {
-        u128::from_le_bytes(data[off + 57..off + 73].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // tick_current_index: i32 at off+73
-    let tick_current = if data.len() >= off + 77 {
-        i32::from_le_bytes(data[off + 73..off + 77].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // Oracle PDA
+    let pool = OrcaWhirlpool::try_from_bytes(&pool_data.data)?;
     let (oracle, _) = Pubkey::find_program_address(
         &[b"oracle", pool_address.as_ref()],
         &ORCA_PROG_ID,
     );
-
     Ok(PoolState::Orca {
         whirlpool: *pool_address,
-        token_vault_a,
-        token_vault_b,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
         oracle,
-        token_mint_a,
-        token_mint_b,
-        tick_current,
-        tick_spacing,
-        sqrt_price_x64,
-        liquidity,
-        fee_rate,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
+        tick_current: pool.tick_current,
+        tick_spacing: pool.tick_spacing,
+        sqrt_price_x64: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
+        fee_rate: pool.fee_rate,
     })
 }
 
 // -- Tier 2 parsers (simpler account layouts) --
 
-/// Shared SPL Token Swap layout parser (used by FluxBeam, Saros, Dooar).
-/// Layout: version(1) + is_init(1) + bump(1) + token_program(32@3)
-/// + vault_a(32@35) + vault_b(32@67) + pool_mint(32@99)
-/// + mint_a(32@131) + mint_b(32@163) + fee_account(32@195)
-struct SplTokenSwapFields {
-    pool_token_program: Option<Pubkey>, // Only FluxBeam uses this
-    token_a_vault: Pubkey,
-    token_b_vault: Pubkey,
-    pool_mint: Pubkey,
-    token_a_mint: Pubkey,
-    token_b_mint: Pubkey,
-    fee_account: Pubkey,
-    authority: Pubkey,
-}
-
+/// Parse the shared SPL Token Swap layout used by FluxBeam, Saros, and Dooar,
+/// and derive the program-specific authority PDA. Returns (layout, authority).
 fn parse_spl_token_swap(
     pool_address: &Pubkey,
     pool_data: &Account,
     program_id: &Pubkey,
     name: &str,
-    read_token_program: bool,
-) -> TradeResult<SplTokenSwapFields> {
-    let data = &pool_data.data;
-    if data.len() < 227 {
-        return Err(TradeError::Execution(format!("{name} pool too small")));
-    }
-    let pool_token_program = if read_token_program {
-        Some(read_pubkey(data, 3)?)
-    } else {
-        None
-    };
-    let token_a_vault = read_pubkey(data, 35)?;
-    let token_b_vault = read_pubkey(data, 67)?;
-    let pool_mint = read_pubkey(data, 99)?;
-    let token_a_mint = read_pubkey(data, 131)?;
-    let token_b_mint = read_pubkey(data, 163)?;
-    let fee_account = read_pubkey(data, 195)?;
-
-    let (authority, _) = Pubkey::find_program_address(
-        &[pool_address.as_ref()],
-        program_id,
-    );
-
-    Ok(SplTokenSwapFields {
-        pool_token_program,
-        token_a_vault,
-        token_b_vault,
-        pool_mint,
-        token_a_mint,
-        token_b_mint,
-        fee_account,
-        authority,
-    })
+) -> TradeResult<(SplTokenSwapPool, Pubkey)> {
+    let layout = SplTokenSwapPool::try_from_bytes(&pool_data.data)
+        .map_err(|_| TradeError::Execution(format!("{name} pool too small")))?;
+    let (authority, _) = Pubkey::find_program_address(&[pool_address.as_ref()], program_id);
+    Ok((layout, authority))
 }
 
 // -- FluxBeam (SPL Token Swap fork) --
 fn parse_fluxbeam(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let f = parse_spl_token_swap(pool_address, pool_data, &FLUXBEAM_PROG_ID, "fluxbeam", true)?;
-
+    let (layout, authority) = parse_spl_token_swap(pool_address, pool_data, &FLUXBEAM_PROG_ID, "fluxbeam")?;
     Ok(PoolState::FluxBeam {
         pool: *pool_address,
-        authority: f.authority,
-        token_a_vault: f.token_a_vault,
-        token_b_vault: f.token_b_vault,
-        pool_mint: f.pool_mint,
-        fee_account: f.fee_account,
-        token_a_mint: f.token_a_mint,
-        token_b_mint: f.token_b_mint,
-        pool_token_program: f.pool_token_program.unwrap_or(TOKEN_PROGRAM_ID),
+        authority,
+        token_a_vault: layout.token_a_vault,
+        token_b_vault: layout.token_b_vault,
+        pool_mint: layout.pool_mint,
+        fee_account: layout.fee_account,
+        token_a_mint: layout.token_a_mint,
+        token_b_mint: layout.token_b_mint,
+        pool_token_program: layout.token_program,
     })
 }
 
 fn parse_flash_trade(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 4 * 32 {
-        return Err(TradeError::Execution("flash trade pool too small".into()));
-    }
-    let off = 8;
-    let oracle = read_pubkey(data, off)?;
-    let custody = read_pubkey(data, off + 32)?;
-    let token_mint = read_pubkey(data, off + 64)?;
-
+    let pool = FlashTradePool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::FlashTrade {
         pool: *pool_address,
-        oracle,
-        custody,
-        token_mint,
+        oracle: pool.oracle,
+        custody: pool.custody,
+        token_mint: pool.token_mint,
     })
 }
 
 fn parse_byreal(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 9 * 32 {
-        return Err(TradeError::Execution("byreal pool too small".into()));
-    }
-    // Orca Whirlpool fork -- same interleaved layout
-    let off = 8;
-    let token_mint_a = read_pubkey(data, off + 93)?;
-    let token_vault_a = read_pubkey(data, off + 125)?;
-    let token_mint_b = read_pubkey(data, off + 173)?;
-    let token_vault_b = read_pubkey(data, off + 205)?;
-
-    let tick_spacing = if data.len() >= off + 35 {
-        u16::from_le_bytes(data[off + 33..off + 35].try_into().unwrap()) as i32
-    } else {
-        1
-    };
-
-    // liquidity: u128 at off+41 (same as Orca)
-    let liquidity = if data.len() >= off + 57 {
-        u128::from_le_bytes(data[off + 41..off + 57].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // sqrt_price_x64: u128 at off+57
-    let sqrt_price_x64 = if data.len() >= off + 73 {
-        u128::from_le_bytes(data[off + 57..off + 73].try_into().unwrap())
-    } else {
-        0
-    };
-
-    let tick_current = if data.len() >= off + 77 {
-        i32::from_le_bytes(data[off + 73..off + 77].try_into().unwrap())
-    } else {
-        0
-    };
-
+    // Byreal is an Orca Whirlpool fork with the identical account layout.
+    let pool = OrcaWhirlpool::try_from_bytes(&pool_data.data)
+        .map_err(|_| TradeError::Execution("byreal pool too small".into()))?;
     let (oracle, _) = Pubkey::find_program_address(
         &[b"oracle", pool_address.as_ref()],
         &BYREAL_PROG_ID,
     );
-
     Ok(PoolState::Byreal {
         pool: *pool_address,
-        token_vault_a,
-        token_vault_b,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
         oracle,
-        token_mint_a,
-        token_mint_b,
-        tick_current,
-        tick_spacing,
-        sqrt_price_x64,
-        liquidity,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
+        tick_current: pool.tick_current,
+        tick_spacing: pool.tick_spacing,
+        sqrt_price_x64: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
     })
 }
 
 // -- DefiTuna Fusion --
-// Pool account layout (verified from fusionamm-client docs, 423 bytes):
-// 0-7:   Anchor discriminator
-// 8:     bump (1), 9-10: version (u16)
-// 11:    token_mint_a (32)
-// 43:    token_mint_b (32)
-// 75:    token_vault_a (32)
-// 107:   token_vault_b (32)
-// 139:   tick_spacing (u16)
-// 141:   tick_spacing_seed (2), 143: fee_rate (u16), 145: protocol_fee_rate (u16)
-// 147:   unused0 (u32)
-// 151:   liquidity (u128)
-// 167:   sqrt_price (u128)
-// 183:   tick_current_index (i32)
 fn parse_defituna_fusion(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 187 {
-        return Err(TradeError::Execution("defituna fusion pool too small".into()));
-    }
-    let token_mint_a = read_pubkey(data, 11)?;
-    let token_mint_b = read_pubkey(data, 43)?;
-    let token_vault_a = read_pubkey(data, 75)?;
-    let token_vault_b = read_pubkey(data, 107)?;
-    let tick_spacing = u16::from_le_bytes(data[139..141].try_into().unwrap());
-    // fee_rate: u16 at 143
-    let fee_rate = if data.len() >= 145 {
-        u16::from_le_bytes(data[143..145].try_into().unwrap())
-    } else {
-        0
-    };
-    // liquidity: u128 at 151
-    let liquidity = if data.len() >= 167 {
-        u128::from_le_bytes(data[151..167].try_into().unwrap())
-    } else {
-        0
-    };
-    // sqrt_price: u128 at 167
-    let sqrt_price_x64 = if data.len() >= 183 {
-        u128::from_le_bytes(data[167..183].try_into().unwrap())
-    } else {
-        0
-    };
-    let tick_current_index = i32::from_le_bytes(data[183..187].try_into().unwrap());
-
+    let pool = DefiTunaFusionPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::DefiTunaFusion {
         pool: *pool_address,
-        token_vault_a,
-        token_vault_b,
-        token_mint_a,
-        token_mint_b,
-        tick_spacing,
-        tick_current_index,
-        sqrt_price_x64,
-        liquidity,
-        fee_rate,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
+        tick_spacing: pool.tick_spacing,
+        tick_current_index: pool.tick_current_index,
+        sqrt_price_x64: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
+        fee_rate: pool.fee_rate,
     })
 }
 
 fn parse_defituna_pools(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    if data.len() < 8 + 5 * 32 {
-        return Err(TradeError::Execution("defituna pools too small".into()));
-    }
-    let off = 8;
-    let token_mint_a = read_pubkey(data, off)?;
-    let token_mint_b = read_pubkey(data, off + 32)?;
-    let token_vault_a = read_pubkey(data, off + 64)?;
-    let token_vault_b = read_pubkey(data, off + 96)?;
-
+    let pool = DefiTunaPoolsPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::DefiTunaPools {
         pool: *pool_address,
-        token_vault_a,
-        token_vault_b,
-        token_mint_a,
-        token_mint_b,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
     })
 }
 
 // -- Saros (SPL Token Swap fork) --
 fn parse_saros(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let f = parse_spl_token_swap(pool_address, pool_data, &SAROS_PROG_ID, "saros", false)?;
-
+    let (layout, authority) = parse_spl_token_swap(pool_address, pool_data, &SAROS_PROG_ID, "saros")?;
     Ok(PoolState::Saros {
         pool: *pool_address,
-        authority: f.authority,
-        token_a_vault: f.token_a_vault,
-        token_b_vault: f.token_b_vault,
-        pool_mint: f.pool_mint,
-        fee_account: f.fee_account,
-        token_a_mint: f.token_a_mint,
-        token_b_mint: f.token_b_mint,
+        authority,
+        token_a_vault: layout.token_a_vault,
+        token_b_vault: layout.token_b_vault,
+        pool_mint: layout.pool_mint,
+        fee_account: layout.fee_account,
+        token_a_mint: layout.token_a_mint,
+        token_b_mint: layout.token_b_mint,
     })
 }
 
 fn parse_pancakeswap(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let data = &pool_data.data;
-    // PancakeSwap CLMM = Raydium CLMM fork, 1544-byte pool account
-    // disc(8) + bump(1@8) + amm_config(32@9) + owner(32@41) + mint_a(32@73)
-    // + mint_b(32@105) + vault_a(32@137) + vault_b(32@169) + observation(32@201)
-    // + decimals_a(1@233) + decimals_b(1@234) + tick_spacing(u16@235)
-    // + liquidity(u128@237) + sqrt_price(u128@253) + tick_current(i32@269)
-    if data.len() < 273 {
-        return Err(TradeError::Execution("pancakeswap pool too small".into()));
-    }
-    let amm_config = read_pubkey(data, 9)?;
-    let token_mint_a = read_pubkey(data, 73)?;
-    let token_mint_b = read_pubkey(data, 105)?;
-    let token_vault_a = read_pubkey(data, 137)?;
-    let token_vault_b = read_pubkey(data, 169)?;
-    let observation = read_pubkey(data, 201)?;
-    let tick_spacing = u16::from_le_bytes(data[235..237].try_into().unwrap()) as i32;
-    // liquidity: u128 at 237
-    let liquidity = u128::from_le_bytes(data[237..253].try_into().unwrap());
-    // sqrt_price_x64: u128 at 253
-    let sqrt_price_x64 = u128::from_le_bytes(data[253..269].try_into().unwrap());
-    let tick_current = i32::from_le_bytes(data[269..273].try_into().unwrap());
-    // Fee rate stored in amm_config account, default to 25 bps
-    let fee_rate: u16 = 25;
-
+    let pool = PancakeSwapPool::try_from_bytes(&pool_data.data)?;
     Ok(PoolState::PancakeSwap {
         pool: *pool_address,
-        amm_config,
-        token_vault_a,
-        token_vault_b,
-        observation,
-        token_mint_a,
-        token_mint_b,
-        tick_current,
-        tick_spacing,
-        sqrt_price_x64,
-        liquidity,
-        fee_rate,
+        amm_config: pool.amm_config,
+        token_vault_a: pool.token_vault_a,
+        token_vault_b: pool.token_vault_b,
+        observation: pool.observation,
+        token_mint_a: pool.token_mint_a,
+        token_mint_b: pool.token_mint_b,
+        tick_current: pool.tick_current,
+        tick_spacing: pool.tick_spacing,
+        sqrt_price_x64: pool.sqrt_price_x64,
+        liquidity: pool.liquidity,
+        fee_rate: 25,
     })
 }
 
@@ -1112,7 +662,6 @@ fn parse_pancakeswap(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
 //
 // Verified against live mainnet pool 7Q9RYYbijphbAXBV527Jz2QmgY4BXdaAzfXhJ3wT8hv1.
 const PUMPUP_POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
-const PUMPUP_POOL_MIN_SIZE: usize = 8 + 6 * 32 + 3 * 8 + 2 + 1 + 32 + 2; // = 261
 
 fn parse_pumpup(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     if pool_data.owner != PUMPUP_PROG_ID {
@@ -1122,13 +671,10 @@ fn parse_pumpup(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolS
         )));
     }
     let d = &pool_data.data;
-    if d.len() < PUMPUP_POOL_MIN_SIZE {
-        return Err(TradeError::Execution(format!(
-            "pumpup pool {pool_address} data too short: {} bytes (need >= {})",
-            d.len(),
-            PUMPUP_POOL_MIN_SIZE
-        )));
-    }
+    let pool = PumpupPool::try_from_bytes(d).map_err(|_| TradeError::Execution(format!(
+        "pumpup pool {pool_address} data too short: {} bytes (need >= {})",
+        d.len(), PumpupPool::MIN_SIZE
+    )))?;
     if d[..8] != PUMPUP_POOL_DISCRIMINATOR {
         return Err(TradeError::Execution(format!(
             "pumpup pool {pool_address} has wrong discriminator: {:02x?} (expected {:02x?})",
@@ -1136,32 +682,16 @@ fn parse_pumpup(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolS
             PUMPUP_POOL_DISCRIMINATOR
         )));
     }
-
-    let token_a_mint = Pubkey::try_from(&d[8..40])
-        .map_err(|_| TradeError::Execution("pumpup token_a_mint slice".into()))?;
-    let token_b_mint = Pubkey::try_from(&d[40..72])
-        .map_err(|_| TradeError::Execution("pumpup token_b_mint slice".into()))?;
-    let token_a_vault = Pubkey::try_from(&d[72..104])
-        .map_err(|_| TradeError::Execution("pumpup token_a_vault slice".into()))?;
-    let token_b_vault = Pubkey::try_from(&d[104..136])
-        .map_err(|_| TradeError::Execution("pumpup token_b_vault slice".into()))?;
-    let fee_recipient = Pubkey::try_from(&d[168..200])
-        .map_err(|_| TradeError::Execution("pumpup fee_recipient slice".into()))?;
-    let token_a_reserve = u64::from_le_bytes(d[200..208].try_into().unwrap());
-    let token_b_reserve = u64::from_le_bytes(d[208..216].try_into().unwrap());
-    let fee_recipient2 = Pubkey::try_from(&d[227..259])
-        .map_err(|_| TradeError::Execution("pumpup fee_recipient2 slice".into()))?;
-
     Ok(PoolState::Pumpup {
         pool: *pool_address,
-        token_a_mint,
-        token_b_mint,
-        token_a_vault,
-        token_b_vault,
-        fee_recipient,
-        fee_recipient2,
-        token_a_reserve,
-        token_b_reserve,
+        token_a_mint: pool.token_a_mint,
+        token_b_mint: pool.token_b_mint,
+        token_a_vault: pool.token_a_vault,
+        token_b_vault: pool.token_b_vault,
+        fee_recipient: pool.fee_recipient,
+        fee_recipient2: pool.fee_recipient2,
+        token_a_reserve: pool.token_a_reserve,
+        token_b_reserve: pool.token_b_reserve,
     })
 }
 
@@ -1185,7 +715,6 @@ fn parse_pumpup(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolS
 // Account discriminator = sha256("account:BondingCurve")[0..8]
 //   = [23, 183, 248, 55, 96, 216, 172, 96] = `17b7f83760d8ac60`.
 const PUMPUP_BONDING_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
-const PUMPUP_BONDING_MIN_SIZE: usize = 8 + 5 * 8 + 1; // = 49 (vec len optional)
 
 const PUMPUP_CONFIG_SEED: &[u8] = b"pumpup.config";
 const PUMPUP_POOL_SEED: &[u8] = b"pumpup.pool";
@@ -1201,14 +730,6 @@ static PUMPUP_CONFIG_PDA: LazyLock<Pubkey> = LazyLock::new(|| {
 static PUMPUP_FEE_CACHE: tokio::sync::OnceCell<Pubkey> =
     tokio::sync::OnceCell::const_new();
 
-/// Fetch the global PumpupConfiguration once and extract `fee_address`.
-///
-/// Layout (after 8-byte Anchor disc, packed bytemuck repr):
-///   offset 8   bump                (u8)
-///   offset 9   fee_rate            (u64)
-///   offset 17  authority_address   (Pubkey)
-///   offset 49  fee_address         (Pubkey)  ← what we want
-///   offset 81  migration_address   (Pubkey)
 async fn fetch_pumpup_fee_recipient(rpc: &RpcClient) -> TradeResult<Pubkey> {
     PUMPUP_FEE_CACHE
         .get_or_try_init(|| async {
@@ -1219,16 +740,8 @@ async fn fetch_pumpup_fee_recipient(rpc: &RpcClient) -> TradeResult<Pubkey> {
                     *PUMPUP_CONFIG_PDA, cfg.owner
                 )));
             }
-            if cfg.data.len() < 81 {
-                return Err(TradeError::Execution(format!(
-                    "pumpup config too short: {} bytes (need >= 81)",
-                    cfg.data.len()
-                )));
-            }
-            // fee_address at offset 49 (8 disc + 1 bump + 8 fee_rate + 32 authority)
-            Pubkey::try_from(&cfg.data[49..81]).map_err(|_| {
-                TradeError::Execution("pumpup config fee_address slice".into())
-            })
+            let config = PumpupConfig::try_from_bytes(&cfg.data)?;
+            Ok(config.fee_address)
         })
         .await
         .copied()
@@ -1251,13 +764,12 @@ fn parse_pumpup_bonding_layout(
         )));
     }
     let d = &pool_data.data;
-    if d.len() < PUMPUP_BONDING_MIN_SIZE {
-        return Err(TradeError::Execution(format!(
+    let curve = PumpupBondingCurve::try_from_bytes(d).map_err(|_| {
+        TradeError::Execution(format!(
             "pumpup bonding curve {pool_address} data too short: {} bytes (need >= {})",
-            d.len(),
-            PUMPUP_BONDING_MIN_SIZE
-        )));
-    }
+            d.len(), PumpupBondingCurve::MIN_SIZE
+        ))
+    })?;
     if d[..8] != PUMPUP_BONDING_DISCRIMINATOR {
         return Err(TradeError::Execution(format!(
             "pumpup bonding curve {pool_address} has wrong discriminator: {:02x?} (expected {:02x?})",
@@ -1265,12 +777,7 @@ fn parse_pumpup_bonding_layout(
             PUMPUP_BONDING_DISCRIMINATOR
         )));
     }
-    let launch_token_surplus = u64::from_le_bytes(d[8..16].try_into().unwrap());
-    let virtual_sol = u64::from_le_bytes(d[16..24].try_into().unwrap());
-    let real_sol = u64::from_le_bytes(d[24..32].try_into().unwrap());
-    let pool_sol_reserves = u64::from_le_bytes(d[32..40].try_into().unwrap());
-    let pool_token_reserves = u64::from_le_bytes(d[40..48].try_into().unwrap());
-    Ok((launch_token_surplus, virtual_sol, real_sol, pool_sol_reserves, pool_token_reserves))
+    Ok((curve.launch_token_surplus, curve.virtual_sol, curve.real_sol, curve.pool_sol_reserves, curve.pool_token_reserves))
 }
 
 /// Fetch a Pumpup bonding curve. Uses RPC to discover the mint from the
@@ -1348,17 +855,16 @@ async fn parse_pumpup_bonding(
 
 // -- Dooar (SPL Token Swap fork) --
 fn parse_dooar(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
-    let f = parse_spl_token_swap(pool_address, pool_data, &DOOAR_PROG_ID, "dooar", false)?;
-
+    let (layout, authority) = parse_spl_token_swap(pool_address, pool_data, &DOOAR_PROG_ID, "dooar")?;
     Ok(PoolState::Dooar {
         pool: *pool_address,
-        authority: f.authority,
-        token_a_vault: f.token_a_vault,
-        token_b_vault: f.token_b_vault,
-        pool_mint: f.pool_mint,
-        fee_account: f.fee_account,
-        token_a_mint: f.token_a_mint,
-        token_b_mint: f.token_b_mint,
+        authority,
+        token_a_vault: layout.token_a_vault,
+        token_b_vault: layout.token_b_vault,
+        pool_mint: layout.pool_mint,
+        fee_account: layout.fee_account,
+        token_a_mint: layout.token_a_mint,
+        token_b_mint: layout.token_b_mint,
     })
 }
 
@@ -1377,33 +883,15 @@ fn pubkey_from_str(s: &str) -> Pubkey {
 /// Returns an empty Vec for sync-parseable types.
 pub fn extract_companion_keys(pool_type: PoolType, data: &[u8]) -> Vec<Pubkey> {
     match pool_type {
-        PoolType::RaydiumV4 => {
-            // Serum market at offset 464
-            if data.len() >= 496 {
-                read_pubkey(data, 464).into_iter().collect()
-            } else {
-                vec![]
-            }
-        }
-        PoolType::Meteora => {
-            // a_vault at 104, b_vault at 136
-            if data.len() >= 168 {
-                let mut keys = Vec::with_capacity(2);
-                if let Ok(a) = read_pubkey(data, 104) { keys.push(a); }
-                if let Ok(b) = read_pubkey(data, 136) { keys.push(b); }
-                keys
-            } else {
-                vec![]
-            }
-        }
-        PoolType::MeteoraDbc => {
-            // config at offset 72
-            if data.len() >= 104 {
-                read_pubkey(data, 72).into_iter().collect()
-            } else {
-                vec![]
-            }
-        }
+        PoolType::RaydiumV4 => RaydiumV4Pool::try_from_bytes(data)
+            .map(|p| vec![p.serum_market])
+            .unwrap_or_default(),
+        PoolType::Meteora => MeteoraPool::try_from_bytes(data)
+            .map(|p| vec![p.a_vault, p.b_vault])
+            .unwrap_or_default(),
+        PoolType::MeteoraDbc => MeteoraDbcVirtualPool::try_from_bytes(data)
+            .map(|p| vec![p.config])
+            .unwrap_or_default(),
         // PumpFun bonding: mint must be discovered via RPC (get_token_accounts_by_owner).
         // PumpFunAmm: sync parser exists (parse_pumpfun_amm_layout), vault balances are Phase 2.
         // All other types are already sync-parseable.
@@ -1418,53 +906,23 @@ pub fn parse_raydium_v4_with_companion(
     serum_market_data: &[u8],
     serum_market_owner: &Pubkey,
 ) -> TradeResult<PoolState> {
-    if pool_data.len() < 680 {
-        return Err(TradeError::Execution("raydium v4 account too small".into()));
-    }
-
-    let coin_vault = read_pubkey(pool_data, 336)?;
-    let pc_vault = read_pubkey(pool_data, 368)?;
-    let open_orders = read_pubkey(pool_data, 432)?;
-    let serum_market = read_pubkey(pool_data, 464)?;
-    let serum_program = read_pubkey(pool_data, 496)?;
-    let target_orders = read_pubkey(pool_data, 528)?;
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    let mdata = serum_market_data;
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().map_err(|_|
-                TradeError::Execution("raydium v4: nonce slice".into()))?);
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                serum_market_owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
-
+    let pool = RaydiumV4Pool::try_from_bytes(pool_data)?;
+    let serum = SerumMarketAccounts::parse(serum_market_data, pool.serum_market, serum_market_owner)?;
     Ok(PoolState::RaydiumV4 {
         amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
+        authority: *RAYDIUM_V4_AUTHORITY,
+        open_orders: pool.open_orders,
+        target_orders: pool.target_orders,
+        coin_vault: pool.coin_vault,
+        pc_vault: pool.pc_vault,
+        serum_program: pool.serum_program,
+        serum_market: pool.serum_market,
+        serum_bids: serum.bids,
+        serum_asks: serum.asks,
+        serum_event_queue: serum.event_queue,
+        serum_coin_vault: serum.coin_vault,
+        serum_pc_vault: serum.pc_vault,
+        serum_vault_signer: serum.vault_signer,
     })
 }
 
@@ -1479,36 +937,23 @@ pub fn parse_pumpfun_with_companion(
     token_prog: Pubkey,
     global_data: &[u8],
 ) -> TradeResult<PoolState> {
-    let global = *PUMPFUN_GLOBAL;
-    let event_authority = *PUMPFUN_EVENT_AUTHORITY;
-
-    let creator = if pool_data.len() >= 81 {
-        read_pubkey(pool_data, 49)?
-    } else {
-        Pubkey::default()
-    };
-
+    let bonding = PumpFunBondingCurve::try_from_bytes(pool_data);
+    let global_cfg = PumpFunGlobal::try_from_bytes(global_data)
+        .unwrap_or(PumpFunGlobal { fee_recipient: *PUMPFUN_FEE_FALLBACK });
     let associated_bonding_curve =
         spl_associated_token_account::get_associated_token_address_with_program_id(
             pool_address,
             &mint,
             &token_prog,
         );
-
-    let fee_account = if global_data.len() >= 73 {
-        read_pubkey(global_data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
-
     Ok(PoolState::PumpFun {
-        global,
-        fee_account,
+        global: *PUMPFUN_GLOBAL,
+        fee_account: global_cfg.fee_recipient,
         mint,
         bonding_curve: *pool_address,
         associated_bonding_curve,
-        event_authority,
-        creator,
+        event_authority: *PUMPFUN_EVENT_AUTHORITY,
+        creator: bonding.creator,
     })
 }
 
@@ -1551,44 +996,24 @@ pub fn parse_meteora_with_companion(
     a_vault_data: &[u8],
     b_vault_data: &[u8],
 ) -> TradeResult<PoolState> {
-    if pool_data.len() < 298 {
-        return Err(TradeError::Execution("meteora pool account too small".into()));
-    }
-
-    let token_a_mint = read_pubkey(pool_data, 40)?;
-    let token_b_mint = read_pubkey(pool_data, 72)?;
-    let a_vault = read_pubkey(pool_data, 104)?;
-    let b_vault = read_pubkey(pool_data, 136)?;
-    let a_vault_lp = read_pubkey(pool_data, 168)?;
-    let b_vault_lp = read_pubkey(pool_data, 200)?;
-    let admin_token_a_fee = read_pubkey(pool_data, 234)?;
-    let admin_token_b_fee = read_pubkey(pool_data, 266)?;
-
-    if a_vault_data.len() < 147 || b_vault_data.len() < 147 {
-        return Err(TradeError::Execution("meteora vault account too small".into()));
-    }
-
-    let a_token_vault = read_pubkey(a_vault_data, 19)?;
-    let b_token_vault = read_pubkey(b_vault_data, 19)?;
-    let a_vault_lp_mint = read_pubkey(a_vault_data, 115)?;
-    let b_vault_lp_mint = read_pubkey(b_vault_data, 115)?;
-    let vault_program = *METEORA_VAULT_PROGRAM;
-
+    let pool = MeteoraPool::try_from_bytes(pool_data)?;
+    let a_vault = MeteoraVault::try_from_bytes(a_vault_data)?;
+    let b_vault = MeteoraVault::try_from_bytes(b_vault_data)?;
     Ok(PoolState::Meteora {
         pool: *pool_address,
-        token_a_mint,
-        token_b_mint,
-        a_vault,
-        b_vault,
-        a_token_vault,
-        b_token_vault,
-        a_vault_lp_mint,
-        b_vault_lp_mint,
-        a_vault_lp,
-        b_vault_lp,
-        admin_token_a_fee,
-        admin_token_b_fee,
-        vault_program,
+        token_a_mint: pool.token_a_mint,
+        token_b_mint: pool.token_b_mint,
+        a_vault: pool.a_vault,
+        b_vault: pool.b_vault,
+        a_token_vault: a_vault.token_vault,
+        b_token_vault: b_vault.token_vault,
+        a_vault_lp_mint: a_vault.lp_mint,
+        b_vault_lp_mint: b_vault.lp_mint,
+        a_vault_lp: pool.a_vault_lp,
+        b_vault_lp: pool.b_vault_lp,
+        admin_token_a_fee: pool.admin_token_a_fee,
+        admin_token_b_fee: pool.admin_token_b_fee,
+        vault_program: *METEORA_VAULT_PROGRAM,
     })
 }
 
@@ -1598,28 +1023,16 @@ pub fn parse_meteora_dbc_with_companion(
     pool_data: &[u8],
     config_data: &[u8],
 ) -> TradeResult<PoolState> {
-    if pool_data.len() < 232 {
-        return Err(TradeError::Execution("meteora dbc pool too small".into()));
-    }
-
-    let config_key = read_pubkey(pool_data, 72)?;
-    let base_mint = read_pubkey(pool_data, 136)?;
-    let base_vault = read_pubkey(pool_data, 168)?;
-    let quote_vault = read_pubkey(pool_data, 200)?;
-
-    if config_data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(config_data, 8)?;
-
+    let pool = MeteoraDbcVirtualPool::try_from_bytes(pool_data)?;
+    let cfg = MeteoraDbcConfig::try_from_bytes(config_data)?;
     Ok(PoolState::MeteoraDbc {
         pool: *pool_address,
-        config: config_key,
+        config: pool.config,
         pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
+        base_vault: pool.base_vault,
+        quote_vault: pool.quote_vault,
+        base_mint: pool.base_mint,
+        quote_mint: cfg.quote_mint,
     })
 }
 
@@ -1637,37 +1050,34 @@ pub fn parse_with_mirror(
         pt if is_sync_parseable(pt) => parse_pool_state_from_bytes(pt, pool_address, data, owner),
 
         PoolType::RaydiumV4 => {
-            let market_key = read_pubkey(data, 464)?;
-            let market_data = mirror.get_companion(&market_key).ok_or_else(||
+            let pool = RaydiumV4Pool::try_from_bytes(data)?;
+            let market_data = mirror.get_companion(&pool.serum_market).ok_or_else(||
                 TradeError::Execution("raydium v4: serum market not in mirror".into()))?;
-            // We need the market owner for vault_signer derivation. Since Serum is closed,
-            // the owner doesn't matter (placeholder path). Use a default.
+            // Serum is closed — market owner doesn't matter for the placeholder path.
             let market_owner = Pubkey::default();
             parse_raydium_v4_with_companion(pool_address, data, &market_data, &market_owner)
         }
 
         PoolType::PumpFunAmm => {
             // Sync layout parser + vault balances from mirror
-            let base_vault = read_pubkey(data, 139)?;
-            let quote_vault = read_pubkey(data, 171)?;
-            let base_bal = mirror.get_vault_balance(&base_vault);
-            let quote_bal = mirror.get_vault_balance(&quote_vault);
+            let amm = PumpFunAmmPool::try_from_bytes(data)?;
+            let base_bal = mirror.get_vault_balance(&amm.pool_base_vault);
+            let quote_bal = mirror.get_vault_balance(&amm.pool_quote_vault);
             parse_pumpfun_amm_with_balances(pool_address, data, base_bal, quote_bal)
         }
 
         PoolType::Meteora => {
-            let a_vault = read_pubkey(data, 104)?;
-            let b_vault = read_pubkey(data, 136)?;
-            let a_data = mirror.get_companion(&a_vault).ok_or_else(||
+            let pool = MeteoraPool::try_from_bytes(data)?;
+            let a_data = mirror.get_companion(&pool.a_vault).ok_or_else(||
                 TradeError::Execution("meteora: vault A not in mirror".into()))?;
-            let b_data = mirror.get_companion(&b_vault).ok_or_else(||
+            let b_data = mirror.get_companion(&pool.b_vault).ok_or_else(||
                 TradeError::Execution("meteora: vault B not in mirror".into()))?;
             parse_meteora_with_companion(pool_address, data, &a_data, &b_data)
         }
 
         PoolType::MeteoraDbc => {
-            let config_key = read_pubkey(data, 72)?;
-            let config_data = mirror.get_companion(&config_key).ok_or_else(||
+            let pool = MeteoraDbcVirtualPool::try_from_bytes(data)?;
+            let config_data = mirror.get_companion(&pool.config).ok_or_else(||
                 TradeError::Execution("meteora dbc: config not in mirror".into()))?;
             parse_meteora_dbc_with_companion(pool_address, data, &config_data)
         }
@@ -2670,9 +2080,9 @@ mod tests {
     #[test]
     fn test_raydium_cpmm_exact_min_size() {
         let pool_addr = Pubkey::new_unique();
-        let acct_ok = make_account(329);
+        let acct_ok = make_account(328);   // RaydiumCpmmWire = 8 + 10*32 = 328
         assert!(parse_raydium_cpmm(&pool_addr, &acct_ok).is_ok());
-        let acct_fail = make_account(328);
+        let acct_fail = make_account(327);
         assert!(parse_raydium_cpmm(&pool_addr, &acct_fail).is_err());
     }
 
@@ -2706,9 +2116,9 @@ mod tests {
     #[test]
     fn test_defituna_pools_exact_min_size() {
         let pool_addr = Pubkey::new_unique();
-        let acct_ok = make_account(168);
+        let acct_ok = make_account(136);   // DefiTunaPoolsWire = 8 + 4*32 = 136
         assert!(parse_defituna_pools(&pool_addr, &acct_ok).is_ok());
-        let acct_fail = make_account(167);
+        let acct_fail = make_account(135);
         assert!(parse_defituna_pools(&pool_addr, &acct_fail).is_err());
     }
 

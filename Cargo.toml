@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Serialization (binary)
 borsh = "1.0"
+zeropod = "0.3"
 
 # Concurrency
 dashmap = "6"
