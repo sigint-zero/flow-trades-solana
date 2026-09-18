@@ -210,6 +210,12 @@ mod tests {
             token_0_mint: mint_a,
             token_1_mint: mint_b,
             observation: Pubkey::new_unique(),
+            trade_fee_bps: 0,
+            protocol_fees_0: 0,
+            protocol_fees_1: 0,
+            fund_fees_0: 0,
+            fund_fees_1: 0,
+            creator_fee_ppm: 0, enable_creator_fee: false, creator_fee_on: 0,
         };
 
         let order = SwapOrder {
@@ -260,6 +266,10 @@ mod tests {
             coin_creator: Pubkey::new_unique(),
             base_reserve: 10_000_000,
             quote_reserve: 5_000_000,
+            protocol_fee_recipient: Pubkey::default(),
+            buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
+            base_supply: 0,
+            virtual_quote_reserve: 0,
         };
 
         let order = SwapOrder {
@@ -287,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pumpfun_amm_buy_encodes_amount_in_as_max_quote() {
+    fn test_pumpfun_amm_buy_is_exact_input_with_floor() {
         use crate::pool::types::{PoolState, PoolType, SwapOrder};
         use solana_sdk::pubkey::Pubkey;
 
@@ -308,6 +318,10 @@ mod tests {
             coin_creator: Pubkey::new_unique(),
             base_reserve: 10_000_000,
             quote_reserve: 5_000_000,
+            protocol_fee_recipient: Pubkey::default(),
+            buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
+            base_supply: 0,
+            virtual_quote_reserve: 0,
         };
 
         let order = SwapOrder {
@@ -330,8 +344,10 @@ mod tests {
 
         // Buy layout: disc(8) + base_amount_out(8) + max_quote_amount_in(8)
         // max_quote_amount_in = amount_in at bytes [16..24]
-        assert!(check_u64_le_at(data, 16, amount_in),
-            "amount_in {} not found at offset 16 in PumpFunAmm buy instruction data", amount_in);
+        // BuyExactQuoteIn: disc(8) + quote_amount_in(8) + min_base_amount_out(8) + track_volume(1)
+        assert!(check_u64_le_at(data, 8, amount_in),
+            "amount_in {} not found at offset 8 (BuyExactQuoteIn quote_amount_in)", amount_in);
+        assert!(check_u64_le_at(data, 16, 900_000), "min_amount_out at offset 16");
     }
 
     #[test]
@@ -350,6 +366,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
 
         let order = SwapOrder {
@@ -397,6 +414,7 @@ mod tests {
             config_id: Pubkey::new_unique(),
             platform_id: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
         };
 
         // Buy: input=quote, output=base
@@ -447,6 +465,7 @@ mod tests {
             config_id: Pubkey::new_unique(),
             platform_id: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
         };
 
         // Sell: input=base, output=quote
@@ -493,6 +512,12 @@ mod tests {
             token_0_mint: mint_a,
             token_1_mint: mint_b,
             observation: Pubkey::new_unique(),
+            trade_fee_bps: 0,
+            protocol_fees_0: 0,
+            protocol_fees_1: 0,
+            fund_fees_0: 0,
+            fund_fees_1: 0,
+            creator_fee_ppm: 0, enable_creator_fee: false, creator_fee_on: 0,
         };
 
         let order = SwapOrder {

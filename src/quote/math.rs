@@ -754,12 +754,14 @@ pub fn extract_clmm_params(
             if *input_mint != *token_mint_0 && *input_mint != *token_mint_1 {
                 return None;
             }
+            // fee_rate is hundredths of a basis point from the AmmConfig.
             Some(ClmmParams {
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
-                fee_bps: *fee_rate,
+                fee_bps: (*fee_rate / 100).max(1),
+                fee_ppm: *fee_rate as u32,
                 a_to_b,
-                tick_liquidities: Vec::new(), // No tick array data yet
+                tick_liquidities: Vec::new(),
             })
         }
         PoolState::Orca {
@@ -781,6 +783,7 @@ pub fn extract_clmm_params(
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
                 fee_bps,
+                fee_ppm: *fee_rate as u32,
                 a_to_b,
                 tick_liquidities: Vec::new(),
             })
@@ -797,10 +800,12 @@ pub fn extract_clmm_params(
             if *input_mint != *token_mint_a && *input_mint != *token_mint_b {
                 return None;
             }
+            // fee_rate is hundredths of a basis point from the AmmConfig.
             Some(ClmmParams {
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
-                fee_bps: *fee_rate,
+                fee_bps: (*fee_rate / 100).max(1),
+                fee_ppm: *fee_rate as u32,
                 a_to_b,
                 tick_liquidities: Vec::new(),
             })
@@ -821,6 +826,7 @@ pub fn extract_clmm_params(
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
                 fee_bps: 30,
+                fee_ppm: 3_000,
                 a_to_b,
                 tick_liquidities: Vec::new(),
             })
@@ -843,6 +849,7 @@ pub fn extract_clmm_params(
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
                 fee_bps,
+                fee_ppm: *fee_rate as u32,
                 a_to_b,
                 tick_liquidities: Vec::new(),
             })
@@ -856,7 +863,10 @@ pub fn extract_clmm_params(
 pub struct ClmmParams {
     pub sqrt_price_x64: u128,
     pub liquidity: u128,
+    /// Whole basis points (legacy single-range math and fee reporting).
     pub fee_bps: u16,
+    /// Exact fee in parts per million, as the program applies it.
+    pub fee_ppm: u32,
     pub a_to_b: bool,
     pub tick_liquidities: Vec<(i32, u128)>,
 }
@@ -1762,7 +1772,7 @@ mod tests {
             tick_spacing: 10,
             sqrt_price_x64: Q64,
             liquidity: 500_000,
-            fee_rate: 25,
+            fee_rate: 2500, // hundredths of a bp from the AmmConfig
         };
 
         let params = extract_clmm_params(&state, &mint_0).unwrap();
@@ -1770,6 +1780,7 @@ mod tests {
         assert_eq!(params.sqrt_price_x64, Q64);
         assert_eq!(params.liquidity, 500_000);
         assert_eq!(params.fee_bps, 25);
+        assert_eq!(params.fee_ppm, 2500);
 
         let params_rev = extract_clmm_params(&state, &mint_1).unwrap();
         assert!(!params_rev.a_to_b);
@@ -1820,6 +1831,10 @@ mod tests {
             coin_creator: Pubkey::new_unique(),
             base_reserve: 1000,
             quote_reserve: 2000,
+            protocol_fee_recipient: Pubkey::default(),
+            buyback_accounts: Vec::new(),
+            base_supply: 0,
+            virtual_quote_reserve: 0,
         };
 
         assert!(extract_clmm_params(&state, &Pubkey::new_unique()).is_none());

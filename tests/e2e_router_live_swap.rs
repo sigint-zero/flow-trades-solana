@@ -99,7 +99,7 @@ async fn test_real_swap_single_hop() {
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
         &protocol_fee_acct, None, &[ixs.swap[0].clone()],
-        1_000_000, 0, &output_tp,
+        1_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap");
 
     let mut all_ixs = vec![

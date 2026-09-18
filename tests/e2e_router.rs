@@ -91,7 +91,7 @@ async fn test_router_wrap_swap() {
     let protocol_fee = Pubkey::new_unique();
     let dex_ix_clone = dex_ix.clone();
     let wrapped = wrap_swap(
-        &router, &user, &[input_ata, output_ata], &protocol_fee, None, &[dex_ix_clone], 1_000_000, 1, &TOKEN_PROGRAM_ID,
+        &router, &user, &[input_ata, output_ata], &protocol_fee, None, &[dex_ix_clone], 1_000_000, 1, &TOKEN_PROGRAM_ID, &output_mint,
         ).unwrap();
 
     eprintln!("  Wrapped IX: {} accounts, {} bytes data", wrapped.accounts.len(), wrapped.data.len());
@@ -166,7 +166,7 @@ async fn test_router_wrap_with_protocol_fee_account() {
         &[Pubkey::new_unique(), Pubkey::new_unique()],
         &protocol_fee_token_account,
         None,
-        &[dex_ix], 1_000_000_000, 100_000, &TOKEN_PROGRAM_ID,
+        &[dex_ix], 1_000_000_000, 100_000, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
     ).unwrap();
 
     // protocol_fee_token_account: payer(1) + tokens(2) + config(1) = index 4
@@ -179,7 +179,7 @@ async fn test_router_wrap_with_protocol_fee_account() {
 }
 
 #[tokio::test]
-async fn test_router_wrap_swap() {
+async fn test_router_wrap_swap_multi_hop() {
     eprintln!("\n=== ROUTER WRAP: MULTI-HOP (2 DEX CPIs) ===\n");
     let rpc = rpc();
     let user = Pubkey::from_str("6TwqjGNQ8c2aUHvbpAjMd4bdHdone9CTrz3c8S71E2WW").unwrap();
@@ -229,7 +229,7 @@ async fn test_router_wrap_swap() {
         &[input_ata, intermediate_ata, output_ata],
         &protocol_fee, None,
         &[hop1_clone, hop2_clone],
-        1_000_000, 1, &TOKEN_PROGRAM_ID,
+        1_000_000, 1, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
     eprintln!("  Wrapped: {} accounts, {} bytes data", wrapped.accounts.len(), wrapped.data.len());
@@ -298,7 +298,7 @@ async fn test_router_tx_size_comparison() {
             &user, &output_mint, &TOKEN_PROGRAM_ID,
         );
         let protocol_fee = Pubkey::new_unique();
-        let wrapped = wrap_swap(&router, &user, &[input_ata, output_ata], &protocol_fee, None, &[ixs.swap[0].clone()], 1_000_000, 1, &TOKEN_PROGRAM_ID).unwrap();
+        let wrapped = wrap_swap(&router, &user, &[input_ata, output_ata], &protocol_fee, None, &[ixs.swap[0].clone()], 1_000_000, 1, &TOKEN_PROGRAM_ID, &output_mint).unwrap();
         let router_ixs = flow_trades::pool::types::SwapInstructions {
             setup: ixs.setup.clone(), swap: vec![wrapped], cleanup: ixs.cleanup.clone(),
         };

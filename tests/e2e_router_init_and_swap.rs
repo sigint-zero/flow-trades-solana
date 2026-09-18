@@ -185,7 +185,7 @@ async fn test_single_hop_router_swap() {
         &[user_input_ata, user_output_ata],
         &protocol_fee_acct, None,
         &[ixs.swap[0].clone()],
-        1_000_000, 0, &output_tp,
+        1_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap");
 
     eprintln!("  Router IX: {} accounts, {} bytes", router_ix.accounts.len(), router_ix.data.len());
@@ -277,7 +277,7 @@ async fn test_two_hop_router_swap() {
         &[user_input_ata, user_bridge_ata, user_output_ata],
         &protocol_fee_acct, None,
         &[ixs1.swap[0].clone(), ixs2.swap[0].clone()],
-        1_000_000_000, 0, &output_tp,
+        1_000_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap 2-hop");
 
     eprintln!("  Router IX: {} accounts, {} bytes", router_ix.accounts.len(), router_ix.data.len());

@@ -25,7 +25,7 @@ impl AmmExecutor for MeteoraExecutor {
                 pool, token_a_mint, token_b_mint,
                 a_vault, b_vault, a_token_vault, b_token_vault,
                 a_vault_lp_mint, b_vault_lp_mint, a_vault_lp, b_vault_lp,
-                admin_token_a_fee, admin_token_b_fee, vault_program,
+                admin_token_a_fee, admin_token_b_fee, vault_program, ..
             } => (
                 pool, token_a_mint, token_b_mint,
                 a_vault, b_vault, a_token_vault, b_token_vault,

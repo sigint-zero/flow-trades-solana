@@ -206,7 +206,7 @@ async fn test_02_single_hop_swap() {
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
         &protocol_fee_acct, None, &[ixs.swap[0].clone()],
-        1_000_000, 0, &output_tp,
+        1_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap");
 
     eprintln!("  Router IX: {} accounts, {} bytes", router_ix.accounts.len(), router_ix.data.len());
@@ -270,7 +270,7 @@ async fn test_03_two_hop_swap() {
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_bridge_ata, user_output_ata],
         &protocol_fee_acct, None, &[ixs1.swap[0].clone(), ixs2.swap[0].clone()],
-        1_000_000_000, 0, &output_tp,
+        1_000_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap 2-hop");
 
     eprintln!("  Router IX: {} accounts, {} bytes", router_ix.accounts.len(), router_ix.data.len());
@@ -374,7 +374,7 @@ async fn test_04_three_hop_swap() {
         &[user_input_ata, user_bridge1_ata, user_bridge2_ata, user_output_ata],
         &protocol_fee_acct, None,
         &[ixs1.swap[0].clone(), ixs2.swap[0].clone(), ixs3.swap[0].clone()],
-        1_000_000, 0, &output_tp,
+        1_000_000, 0, &output_tp, &output_mint,
     ).expect("wrap_swap 3-hop");
 
     eprintln!("  Router IX: {} accounts, {} bytes data", router_ix.accounts.len(), router_ix.data.len());

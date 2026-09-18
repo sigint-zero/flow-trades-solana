@@ -153,7 +153,7 @@ async fn execute_swap_full(
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
         &protocol_fee_acct, referral_ata.as_ref(), &[dex_ix.clone()], amount_in, min_amount_out,
-        &fee_token_program,
+        &fee_token_program, &fee_mint,
     ).map_err(|e| format!("router wrap: {e}"))?;
 
     // Assemble TX: compute budget + setup + ROUTER swap + cleanup
@@ -759,7 +759,7 @@ async fn execute_swap_no_alt(
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
         &protocol_fee_acct, referral_ata.as_ref(), &[dex_ix.clone()], amount_in, min_amount_out,
-        &output_tp,
+        &output_tp, &fee_mint,
     ).map_err(|e| format!("router wrap: {e}"))?;
 
     let mut all_ixs = vec![

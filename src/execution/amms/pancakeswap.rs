@@ -1,27 +1,14 @@
 use solana_sdk::instruction::{AccountMeta, Instruction};
-use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
 
 use crate::error::{TradeError, TradeResult};
 use crate::pool::types::{PoolState, SwapInstructions, SwapOrder};
 use crate::constants::*;
-use super::{AmmExecutor, DISC_SWAP};
+use super::{AmmExecutor, DISC_SWAP, DISC_SWAP_V2};
 
 pub struct PancakeSwapExecutor;
 
-fn derive_tick_array(pool: &Pubkey, tick_current: i32, tick_spacing: i32, offset: i32) -> Pubkey {
-    let ticks_per_array = 88 * tick_spacing;
-    let start_index = if ticks_per_array == 0 { 0 } else {
-        (tick_current.div_euclid(ticks_per_array) + offset) * ticks_per_array
-    };
-    let start_str = start_index.to_string();
-    let (pda, _) = Pubkey::find_program_address(
-        &[b"tick_array", pool.as_ref(), start_str.as_bytes()],
-        &PANCAKESWAP_PROG_ID,
-    );
-    pda
-}
 
 impl AmmExecutor for PancakeSwapExecutor {
     fn build_swap_ix(
@@ -42,8 +29,12 @@ impl AmmExecutor for PancakeSwapExecutor {
 
         let a_to_b = order.input_mint == *token_mint_a;
 
-        // Derive tick arrays for the swap direction
-        let tick_array = derive_tick_array(pool, tick_current, tick_spacing, 0);
+        // Tick arrays for the swap direction, as Raydium CLMM: the current
+        // array plus the next two in the direction the price moves
+        // (a_to_b: price down → [0, -1, -2]; b_to_a: price up → [0, +1, +2]).
+        // Same rules as Raydium CLMM (bitmap extension first, then initialised
+        // arrays in walk order) — see `raydium_clmm::clmm_swap_tick_arrays`.
+        let (bitmap_ext, tick_arrays) = super::raydium_clmm::clmm_swap_tick_arrays(&PANCAKESWAP_PROG_ID, pool, tick_current, tick_spacing, a_to_b);
 
         let (prog_a, prog_b) = if a_to_b {
             (order.input_token_program, order.output_token_program)
@@ -81,7 +72,13 @@ impl AmmExecutor for PancakeSwapExecutor {
         // sqrt_price_limit: boundary values
         let sqrt_price_limit: u128 = if a_to_b { 4295048017 } else { 79226673515401279992447579054 };
 
-        let disc = DISC_SWAP;
+        // Raydium-CLMM fork: Token-2022 on either side needs `swap_v2`, which
+        // takes the 2022 program, the memo program and both mints after the
+        // token program (plain `swap` fails AccountOwnedByWrongProgram on the
+        // user's Token-2022 account).
+        let needs_token_2022 = order.input_token_program == TOKEN_2022_PROGRAM_ID
+            || order.output_token_program == TOKEN_2022_PROGRAM_ID;
+        let disc = if needs_token_2022 { DISC_SWAP_V2 } else { DISC_SWAP };
         let mut data = Vec::with_capacity(41);
         data.extend_from_slice(&disc);
         data.extend_from_slice(&order.amount_in.to_le_bytes());
@@ -102,8 +99,8 @@ impl AmmExecutor for PancakeSwapExecutor {
             (user_token_b, user_token_a)
         };
 
-        // Accounts (10) -- PancakeSwap CLMM Swap (Raydium CLMM fork)
-        let accounts = vec![
+        // Accounts -- PancakeSwap CLMM Swap / SwapV2 (Raydium CLMM fork)
+        let mut accounts = vec![
             AccountMeta::new(order.user, true),                     // [0] payer
             AccountMeta::new_readonly(*amm_config, false),          // [1] amm_config
             AccountMeta::new(*pool, false),                         // [2] pool_state
@@ -113,8 +110,15 @@ impl AmmExecutor for PancakeSwapExecutor {
             AccountMeta::new(output_vault, false),                  // [6] output_vault
             AccountMeta::new(*observation, false),                  // [7] observation_state
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),     // [8] token_program
-            AccountMeta::new(tick_array, false),                    // [9] tick_array
         ];
+        if needs_token_2022 {
+            accounts.push(AccountMeta::new_readonly(TOKEN_2022_PROGRAM_ID, false)); // token_program_2022
+            accounts.push(AccountMeta::new_readonly(MEMO_PROGRAM_ID, false));       // memo_program
+            accounts.push(AccountMeta::new_readonly(order.input_mint, false));      // input_vault_mint
+            accounts.push(AccountMeta::new_readonly(order.output_mint, false));     // output_vault_mint
+        }
+        // v1: named tick_array, then remaining [ext, arrays…]; v2: remaining [ext, arrays…]
+        super::raydium_clmm::push_tick_array_accounts(&mut accounts, needs_token_2022, bitmap_ext, &tick_arrays);
 
         let swap_ix = Instruction {
             program_id: PANCAKESWAP_PROG_ID,

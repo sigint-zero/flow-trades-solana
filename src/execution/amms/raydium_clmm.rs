@@ -11,6 +11,49 @@ use super::{AmmExecutor, DISC_SWAP, DISC_SWAP_V2};
 pub struct RaydiumClmmExecutor;
 
 /// Derive a tick array PDA for Raydium CLMM pools.
+/// Tick arrays for a Raydium-style CLMM swap: `(bitmap_extension, arrays in
+/// walk order)`. Uses `quote::clmm::TICKS` when the pool's ticks are loaded
+/// (extension present iff it exists on chain; arrays = the initialised ones the
+/// program walks); falls back to [current, ±1, ±2] and no extension otherwise.
+pub fn clmm_swap_tick_arrays(program: &Pubkey, pool: &Pubkey, tick_current: i32, tick_spacing: i32, a_to_b: bool) -> (Option<Pubkey>, Vec<Pubkey>) {
+    use crate::quote::clmm::{TickLayout, TICKS};
+    let layout = TickLayout::Raydium;
+    if let Some(td) = TICKS.get(pool) {
+        let starts = td.arrays_for_swap(layout, tick_current, tick_spacing, a_to_b, 3);
+        if !starts.is_empty() {
+            return (td.bitmap_extension, starts.iter().map(|s| layout.array_pda(program, pool, *s)).collect());
+        }
+    }
+    let dir = if a_to_b { -1 } else { 1 };
+    (None, (0..3).map(|k| derive_tick_array(program, pool, tick_current, tick_spacing, k * dir)).collect())
+}
+
+/// Append the tick-array accounts in the order the program reads them.
+/// `swap` (v1) names the FIRST tick array as an account of the instruction and
+/// takes the extension + further arrays as remaining accounts; `swap_v2` has
+/// no named tick array — everything is remaining, extension first. Getting
+/// this wrong is `AccountDiscriminatorMismatch` on `tick_array`.
+pub fn push_tick_array_accounts(accounts: &mut Vec<AccountMeta>, v2: bool, ext: Option<Pubkey>, arrays: &[Pubkey]) {
+    if v2 {
+        if let Some(e) = ext {
+            accounts.push(AccountMeta::new(e, false));
+        }
+        for ta in arrays {
+            accounts.push(AccountMeta::new(*ta, false));
+        }
+    } else {
+        if let Some(first) = arrays.first() {
+            accounts.push(AccountMeta::new(*first, false));
+        }
+        if let Some(e) = ext {
+            accounts.push(AccountMeta::new(e, false));
+        }
+        for ta in arrays.iter().skip(1) {
+            accounts.push(AccountMeta::new(*ta, false));
+        }
+    }
+}
+
 /// Seeds: ["tick_array", pool, start_tick_index.to_be_bytes()]
 fn derive_tick_array(
     program_id: &Pubkey,
@@ -71,22 +114,16 @@ impl AmmExecutor for RaydiumClmmExecutor {
             (token_vault_1, token_vault_0)
         };
 
-        // Derive tick arrays based on swap direction.
-        // For a_to_b (price goes DOWN): offsets [0, -1, -2]
-        // For b_to_a (price goes UP):   offsets [0, +1, +2]
-        let (ta0, ta1, ta2) = if a_to_b {
-            (
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, 0),
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, -1),
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, -2),
-            )
-        } else {
-            (
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, 0),
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, 1),
-                derive_tick_array(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, 2),
-            )
-        };
+        // Tick arrays. With the pool's ticks in memory (loaded by the quoter's
+        // cold path / revalidation) the program gets exactly what it checks:
+        // the bitmap extension first, then the first INITIALISED array at or
+        // beyond the current tick in the swap direction, then the next ones.
+        // Passing the current array when it holds no initialised tick is what
+        // produced `InvalidFirstTickArrayAccount`; passing fewer arrays than the
+        // swap crosses is `NotEnoughTickArrayAccount`. Without tick data fall
+        // back to the current array and the next two (pruned of missing
+        // accounts by the API layer).
+        let (bitmap_ext, tick_arrays) = clmm_swap_tick_arrays(&RAYDIUM_CL_PROG_ID, pool, tick_current, tick_spacing, a_to_b);
 
         let user_input_ata = get_associated_token_address_with_program_id(&order.user, &order.input_mint, &order.input_token_program);
         let user_output_ata = get_associated_token_address_with_program_id(&order.user, &order.output_mint, &order.output_token_program);
@@ -165,10 +202,8 @@ impl AmmExecutor for RaydiumClmmExecutor {
             accounts.push(AccountMeta::new_readonly(order.output_mint, false));     // 12: output_vault_mint
         }
 
-        // remaining: tick arrays (direction-dependent order)
-        accounts.push(AccountMeta::new(ta0, false));
-        accounts.push(AccountMeta::new(ta1, false));
-        accounts.push(AccountMeta::new(ta2, false));
+        // v1: named tick_array, then remaining [ext, arrays…]; v2: remaining [ext, arrays…]
+        push_tick_array_accounts(&mut accounts, needs_token_2022, bitmap_ext, &tick_arrays);
 
         let swap_ix = Instruction {
             program_id: RAYDIUM_CL_PROG_ID,
@@ -181,5 +216,35 @@ impl AmmExecutor for RaydiumClmmExecutor {
             swap: vec![swap_ix],
             cleanup,
         })
+    }
+}
+
+#[cfg(test)]
+mod tick_array_order_tests {
+    use super::*;
+
+    #[test]
+    fn v1_names_the_first_array_and_v2_puts_the_extension_first() {
+        let (ext, a, b, c) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let mut v1 = Vec::new();
+        push_tick_array_accounts(&mut v1, false, Some(ext), &[a, b, c]);
+        assert_eq!(v1.iter().map(|m| m.pubkey).collect::<Vec<_>>(), vec![a, ext, b, c]);
+        let mut v2 = Vec::new();
+        push_tick_array_accounts(&mut v2, true, Some(ext), &[a, b, c]);
+        assert_eq!(v2.iter().map(|m| m.pubkey).collect::<Vec<_>>(), vec![ext, a, b, c]);
+        let mut none = Vec::new();
+        push_tick_array_accounts(&mut none, false, None, &[a, b]);
+        assert_eq!(none.iter().map(|m| m.pubkey).collect::<Vec<_>>(), vec![a, b]);
+        assert!(v1.iter().all(|m| m.is_writable));
+    }
+
+    #[test]
+    fn without_tick_data_falls_back_to_three_derived_arrays() {
+        let pool = Pubkey::new_unique();
+        let (ext, arrays) = clmm_swap_tick_arrays(&RAYDIUM_CL_PROG_ID, &pool, 1234, 10, true);
+        assert!(ext.is_none());
+        assert_eq!(arrays.len(), 3);
+        assert_eq!(arrays[0], derive_tick_array(&RAYDIUM_CL_PROG_ID, &pool, 1234, 10, 0));
+        assert_eq!(arrays[1], derive_tick_array(&RAYDIUM_CL_PROG_ID, &pool, 1234, 10, -1));
     }
 }

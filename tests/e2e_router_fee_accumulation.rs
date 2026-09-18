@@ -86,7 +86,7 @@ async fn execute_swap(rpc: &RpcClient, signer: &Keypair, swap: &SwapDef) -> Resu
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
         &protocol_fee_acct, None, &[ixs.swap[0].clone()],
-        swap.amount_in, 0, &output_tp,
+        swap.amount_in, 0, &output_tp, &Pubkey::default() /* output mint: ignored by the legacy layout */,
     ).map_err(|e| format!("wrap: {e}"))?;
 
     let mut all_ixs = vec![

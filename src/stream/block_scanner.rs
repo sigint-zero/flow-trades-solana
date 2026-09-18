@@ -13,16 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status_client_types::{
-    EncodedTransaction, TransactionDetails, UiConfirmedBlock, UiMessage,
+    option_serializer::OptionSerializer, UiInstruction,
+    EncodedTransaction, UiConfirmedBlock, UiMessage,
     UiTransactionEncoding,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::constants::*;
 use crate::enrichment::PriceOracle;
+use crate::stream::account_mirror::AccountMirror;
 use crate::pool::cache::PoolCache;
 use crate::pool::registry::{PoolEntry, PoolRegistry};
 use crate::pool::types::PoolType;
@@ -100,7 +101,11 @@ pub fn dex_program_to_type(program_id: &Pubkey) -> Option<PoolType> {
 /// Each DEX puts the pool account at a specific index:
 /// - accounts[1]: RaydiumV4, RaydiumCpmm, RaydiumLp, Meteora, MeteoraDlmm, FluxBeam, Saros, Dooar
 /// - accounts[2]: RaydiumCl, PumpFun, MeteoraDamm, MeteoraDbc, Orca, PancakeSwap
-/// - accounts[3]: PumpFunAmm, PumpupBonding (pool_sol_account)
+/// - accounts[3]: PumpupBonding (pool_sol_account)
+/// - accounts[0]: PumpFunAmm (buy/sell: `[0] pool, [1] user, [2] global_config,
+///   [3] base_mint, ...` — index 3 was the MINT, which made every pAMM pool
+///   discovered from a block an undecodable "pool" and the swap-stream `pool`
+///   field the token mint; the Geyser account stream masked it)
 pub fn extract_pool_index(pool_type: PoolType) -> usize {
     match pool_type {
         PoolType::RaydiumV4 => 1,
@@ -117,7 +122,7 @@ pub fn extract_pool_index(pool_type: PoolType) -> usize {
         PoolType::MeteoraDbc => 2,
         PoolType::Orca => 2,
         PoolType::PancakeSwap => 2,
-        PoolType::PumpFunAmm => 3,
+        PoolType::PumpFunAmm => 0,
         // Pumpup `swap` ix puts pool at accounts[0] per IDL.
         PoolType::Pumpup => 0,
         // Pumpup `buy`/`sell` put pool_sol_account at accounts[3] per IDL.
@@ -144,16 +149,142 @@ const PUMPUP_SELL_DISC: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 /// the scanner skips it instead of registering an unrelated account as a pool.
 pub(crate) fn pumpup_pool_type_from_ix_data(ix_data_b58: &str) -> Option<PoolType> {
     let bytes = bs58::decode(ix_data_b58).into_vec().ok()?;
-    if bytes.len() < 8 {
-        return None;
+    refine_pool_type(PoolType::Pumpup, &bytes)
+}
+
+/// The pool type an instruction to `base`'s program actually refers to, or
+/// `None` when the instruction is not a swap whose accounts carry a pool.
+///
+/// Two programs need the discriminator, not just the program id:
+/// - **Pumpup** shares one program across the AMM (`swap`) and the bonding
+///   curve (`buy`/`sell`).
+/// - **pump.fun AMM** invokes ITSELF for Anchor event emission after every
+///   swap (accounts `[event_authority, program, ...]`), and also has
+///   `create_pool`/`deposit`/`withdraw`. Treating those as swaps registered
+///   the event authority as a "pool" and made the swap stream emit every pAMM
+///   trade twice (once per distinct "pool" in the same transaction).
+pub(crate) fn refine_pool_type(base: PoolType, ix_data: &[u8]) -> Option<PoolType> {
+    match base {
+        PoolType::Pumpup | PoolType::PumpupBonding => {
+            let disc: [u8; 8] = ix_data.get(..8)?.try_into().ok()?;
+            if disc == PUMPUP_SWAP_DISC {
+                Some(PoolType::Pumpup)
+            } else if disc == PUMPUP_BUY_DISC || disc == PUMPUP_SELL_DISC {
+                Some(PoolType::PumpupBonding)
+            } else {
+                None
+            }
+        }
+        PoolType::PumpFunAmm => {
+            use crate::execution::amms::pumpfun_amm::{BUY_DISC, BUY_EXACT_QUOTE_IN_DISC, SELL_DISC};
+            let disc: [u8; 8] = ix_data.get(..8)?.try_into().ok()?;
+            (disc == BUY_DISC || disc == SELL_DISC || disc == BUY_EXACT_QUOTE_IN_DISC)
+                .then_some(PoolType::PumpFunAmm)
+        }
+        other => Some(other),
     }
-    let disc: [u8; 8] = bytes[..8].try_into().ok()?;
-    if disc == PUMPUP_SWAP_DISC {
-        Some(PoolType::Pumpup)
-    } else if disc == PUMPUP_BUY_DISC || disc == PUMPUP_SELL_DISC {
-        Some(PoolType::PumpupBonding)
-    } else {
-        None
+}
+
+/// Where a SWAP instruction keeps its pool account, for every program we
+/// discover from blocks — keyed by program AND instruction discriminator,
+/// because one program has several swap shapes (Orca `swap` vs `swapV2`,
+/// Raydium LP's four exact-in/out variants) and non-swap instructions
+/// (deposit, create, event self-CPI) carry no pool at any fixed position.
+/// Returns `None` for anything that is not a recognised swap.
+///
+/// Positions (CPMM 3, Raydium LP 4, Meteora / DLMM 0, DAMM 1, pump.fun bonding
+/// 3, the SPL token-swap forks 0, DefiTuna Fusion 4, …) were verified against
+/// ~200k attributed mainnet swaps.
+pub fn swap_pool_index(program_id: &Pubkey, ix_data: &[u8]) -> Option<(PoolType, usize)> {
+    use crate::execution::amms::pumpfun_amm::{BUY_DISC, BUY_EXACT_QUOTE_IN_DISC, SELL_DISC};
+    let base = dex_program_to_type(program_id)?;
+    let disc: Option<[u8; 8]> = ix_data.get(..8).and_then(|d| d.try_into().ok());
+    let d = |x: [u8; 8]| disc == Some(x);
+    // Anchor `global:swap` / `global:swap_v2` — shared by Raydium CLMM, Orca V1,
+    // Meteora Standard/DAMM, Pumpup AMM, PancakeSwap.
+    const ANCHOR_SWAP: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
+    const ANCHOR_SWAP_V2: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
+    const SWAP2: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136]; // DLMM swap2 / DBC swap2
+    const DLMM_EXACT_OUT: [u8; 8] = [250, 73, 101, 33, 38, 207, 75, 184];
+    const DLMM_WITH_PRICE: [u8; 8] = [56, 173, 230, 208, 173, 228, 156, 205];
+    const CPMM_SWAP_BASE_IN: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
+    const CPMM_SWAP_BASE_OUT: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
+    const LP_BUY_EXACT_IN: [u8; 8] = [250, 234, 13, 123, 213, 156, 19, 236];
+    const LP_BUY_EXACT_OUT: [u8; 8] = [24, 211, 116, 40, 105, 3, 153, 56];
+    const LP_SELL_EXACT_IN: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
+    const LP_SELL_EXACT_OUT: [u8; 8] = [95, 200, 71, 34, 8, 9, 11, 166];
+    let idx = match base {
+        // Raydium V4: legacy u8 tag — 9 = swap_base_in, 11 = swap_base_out; [1] = amm
+        PoolType::RaydiumV4 => (matches!(ix_data.first(), Some(9) | Some(11))).then_some(1)?,
+        PoolType::RaydiumCpmm => (d(CPMM_SWAP_BASE_IN) || d(CPMM_SWAP_BASE_OUT)).then_some(3)?,
+        PoolType::RaydiumLp => (d(LP_BUY_EXACT_IN) || d(LP_BUY_EXACT_OUT) || d(LP_SELL_EXACT_IN) || d(LP_SELL_EXACT_OUT)).then_some(4)?,
+        PoolType::RaydiumCl | PoolType::PancakeSwap => (d(ANCHOR_SWAP) || d(ANCHOR_SWAP_V2)).then_some(2)?,
+        PoolType::PumpFun => (d(BUY_DISC) || d(SELL_DISC)).then_some(3)?,
+        PoolType::PumpFunAmm => (d(BUY_DISC) || d(SELL_DISC) || d(BUY_EXACT_QUOTE_IN_DISC)).then_some(0)?,
+        PoolType::Meteora => d(ANCHOR_SWAP).then_some(0)?,
+        PoolType::MeteoraDlmm => (d(ANCHOR_SWAP) || d(SWAP2) || d(DLMM_EXACT_OUT) || d(DLMM_WITH_PRICE)).then_some(0)?,
+        PoolType::MeteoraDamm => d(ANCHOR_SWAP).then_some(1)?,
+        PoolType::MeteoraDbc => (d(SWAP2) || d(ANCHOR_SWAP)).then_some(2)?,
+        PoolType::Orca => {
+            if d(ANCHOR_SWAP) { 2 } else if d(ANCHOR_SWAP_V2) { 4 } else { return None }
+        }
+        // SPL token-swap forks: single-byte tag 1 = Swap; [0] = swap state
+        PoolType::FluxBeam | PoolType::Saros | PoolType::Dooar => (ix_data.first() == Some(&1)).then_some(0)?,
+        PoolType::FlashTrade | PoolType::Byreal | PoolType::DefiTunaPools => 0,
+        PoolType::DefiTunaFusion => 4,
+        // Pumpup shares one program across the AMM (`swap`, [0] pool) and the
+        // bonding curve (`buy`/`sell`, [3] pool_sol_account).
+        PoolType::Pumpup | PoolType::PumpupBonding => {
+            return match refine_pool_type(PoolType::Pumpup, ix_data)? {
+                PoolType::Pumpup => Some((PoolType::Pumpup, 0)),
+                _ => Some((PoolType::PumpupBonding, 3)),
+            };
+        }
+        PoolType::Unknown => return None,
+    };
+    Some((base, idx))
+}
+
+/// [`swap_pool_index`] for the RPC paths, where instruction data is base58.
+pub fn swap_pool_index_b58(program_id: &Pubkey, ix_data_b58: &str) -> Option<(PoolType, usize)> {
+    dex_program_to_type(program_id)?;
+    let bytes = bs58::decode(ix_data_b58).into_vec().ok()?;
+    swap_pool_index(program_id, &bytes)
+}
+
+/// Candidates whose state fetch failed recently (not a pool, or a transient
+/// RPC error). Without this the same wrong account would be re-discovered on
+/// every block that touches it and re-fetched.
+static FAILED_CANDIDATES: std::sync::LazyLock<dashmap::DashMap<Pubkey, std::time::Instant>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+const FAILED_CANDIDATE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const FAILED_CANDIDATE_CAP: usize = 50_000;
+
+/// Remember a candidate whose fetch failed (bounded; oldest are evicted by TTL).
+pub fn note_failed_candidate(pool: Pubkey) {
+    if FAILED_CANDIDATES.len() >= FAILED_CANDIDATE_CAP {
+        let now = std::time::Instant::now();
+        FAILED_CANDIDATES.retain(|_, t| now.duration_since(*t) < FAILED_CANDIDATE_TTL);
+    }
+    FAILED_CANDIDATES.insert(pool, std::time::Instant::now());
+}
+
+/// True when `pool` failed a fetch within the TTL.
+pub fn recently_failed(pool: &Pubkey) -> bool {
+    FAILED_CANDIDATES
+        .get(pool)
+        .is_some_and(|t| t.elapsed() < FAILED_CANDIDATE_TTL)
+}
+
+/// [`refine_pool_type`] for the RPC paths, where instruction data is base58.
+pub(crate) fn pool_type_for_ix_b58(program_id: &Pubkey, ix_data_b58: &str) -> Option<PoolType> {
+    let base = dex_program_to_type(program_id)?;
+    match base {
+        PoolType::Pumpup | PoolType::PumpupBonding | PoolType::PumpFunAmm => {
+            let bytes = bs58::decode(ix_data_b58).into_vec().ok()?;
+            refine_pool_type(base, &bytes)
+        }
+        other => Some(other),
     }
 }
 
@@ -261,7 +392,7 @@ pub fn extract_mints_from_state(state: &crate::pool::types::PoolState) -> Option
 /// Returns the number of newly discovered pools.
 /// Extract new pool candidates from a block — sync, no RPC, no async.
 /// Returns (pool_address, pool_type) pairs for pools not yet in the registry.
-fn extract_candidates_from_block(
+pub fn extract_candidates_from_block(
     block: &UiConfirmedBlock,
     registry: &PoolRegistry,
 ) -> Vec<(Pubkey, PoolType)> {
@@ -277,16 +408,41 @@ fn extract_candidates_from_block(
             if meta.err.is_some() { continue; }
         }
 
-        let (account_keys, instructions) = match &encoded_tx.transaction {
+        let (static_keys, instructions) = match &encoded_tx.transaction {
             EncodedTransaction::Json(ui_tx) => match &ui_tx.message {
                 UiMessage::Raw(raw) => (&raw.account_keys, &raw.instructions),
                 UiMessage::Parsed(_) => continue,
             },
             _ => continue,
         };
+        // Full key table: static keys ++ ALT-loaded writable ++ readonly — inner
+        // instructions index into this, exactly as the runtime does.
+        let mut account_keys: Vec<String> = static_keys.clone();
+        if let Some(meta) = &encoded_tx.meta {
+            if let OptionSerializer::Some(la) = &meta.loaded_addresses {
+                account_keys.extend(la.writable.iter().cloned());
+                account_keys.extend(la.readonly.iter().cloned());
+            }
+        }
+        // Top-level AND inner instructions: most volume on the large pools is
+        // routed through aggregators, where the DEX call is a CPI. Scanning
+        // only the top level left those pools undiscovered without Geyser.
+        let mut all_ixs: Vec<(u8, &Vec<u8>, &String)> =
+            instructions.iter().map(|ix| (ix.program_id_index, &ix.accounts, &ix.data)).collect();
+        if let Some(meta) = &encoded_tx.meta {
+            if let OptionSerializer::Some(inner) = &meta.inner_instructions {
+                for ii in inner {
+                    for ux in &ii.instructions {
+                        if let UiInstruction::Compiled(c) = ux {
+                            all_ixs.push((c.program_id_index, &c.accounts, &c.data));
+                        }
+                    }
+                }
+            }
+        }
 
-        for ix in instructions {
-            let prog_idx = ix.program_id_index as usize;
+        for (prog_idx_u8, ix_accounts, ix_data) in all_ixs {
+            let prog_idx = prog_idx_u8 as usize;
             if prog_idx >= account_keys.len() { continue; }
 
             let program_id = match Pubkey::from_str(&account_keys[prog_idx]) {
@@ -294,26 +450,15 @@ fn extract_candidates_from_block(
                 Err(_) => continue,
             };
 
-            let pool_type = match dex_program_to_type(&program_id) {
-                Some(pt) => pt,
+            // Program id + discriminator decide both the pool type and WHERE
+            // the pool sits in this instruction's accounts; non-swaps are skipped.
+            let (pool_type, pool_idx) = match swap_pool_index_b58(&program_id, ix_data) {
+                Some(x) => x,
                 None => continue,
             };
+            if pool_idx >= ix_accounts.len() { continue; }
 
-            // Pumpup shares one program ID across two distinct pool types
-            // (AMM vs bonding curve). Disambiguate via the ix discriminator.
-            let pool_type = if program_id == PUMPUP_PROG_ID {
-                match pumpup_pool_type_from_ix_data(&ix.data) {
-                    Some(pt) => pt,
-                    None => continue,
-                }
-            } else {
-                pool_type
-            };
-
-            let pool_idx = extract_pool_index(pool_type);
-            if pool_idx >= ix.accounts.len() { continue; }
-
-            let account_idx = ix.accounts[pool_idx] as usize;
+            let account_idx = ix_accounts[pool_idx] as usize;
             if account_idx >= account_keys.len() { continue; }
 
             let pool_address = match Pubkey::from_str(&account_keys[account_idx]) {
@@ -321,7 +466,7 @@ fn extract_candidates_from_block(
                 Err(_) => continue,
             };
 
-            if registry.contains(&pool_address) { continue; }
+            if registry.contains(&pool_address) || recently_failed(&pool_address) { continue; }
             candidates.insert((pool_address, pool_type));
         }
     }
@@ -348,7 +493,15 @@ pub async fn run_block_scanner(
     pool_db: Arc<PoolDb>,
     _scan_interval_ms: u64, // unused — blockSubscribe is push-based
     swap_stream: Option<SwapStreamCtx>,
+    mirror: Option<Arc<AccountMirror>>,
 ) {
+    let refresh = mirror.map(|m| Arc::new(crate::stream::block_refresh::BlockRefreshCtx {
+        rpc: Arc::clone(&rpc),
+        registry: Arc::clone(&registry),
+        cache: Arc::clone(&cache),
+        mirror: m,
+        in_flight: Arc::new(dashmap::DashSet::new()),
+    }));
     let ws_url = http_to_ws(&rpc.url());
 
     // Summary counters (reset every SUMMARY_INTERVAL_SECS)
@@ -366,7 +519,7 @@ pub async fn run_block_scanner(
         match run_block_subscribe(
             &ws_url, &rpc, &registry, &cache, &stats, &pool_db,
             &mut summary_slots_scanned, &mut summary_pools_discovered, &mut summary_errors,
-            &mut last_summary, swap_stream.as_ref(),
+            &mut last_summary, swap_stream.as_ref(), refresh.as_ref(),
         ).await {
             Ok(()) => info!("blockSubscribe ended, reconnecting"),
             Err(e) => warn!(error = %e, "blockSubscribe error, reconnecting in 5s"),
@@ -389,23 +542,19 @@ async fn run_block_subscribe(
     summary_errors: &mut u64,
     last_summary: &mut std::time::Instant,
     swap_stream: Option<&SwapStreamCtx>,
+    refresh: Option<&Arc<crate::stream::block_refresh::BlockRefreshCtx>>,
 ) -> crate::error::TradeResult<()> {
     use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
     use solana_client::rpc_config::RpcBlockSubscribeFilter;
-    use solana_client::rpc_config::RpcBlockSubscribeConfig;
     use futures::StreamExt;
 
     let pubsub = PubsubClient::new(ws_url)
         .await
         .map_err(|e| crate::error::TradeError::Rpc(format!("WS connect: {e}")))?;
 
-    let config = RpcBlockSubscribeConfig {
-        commitment: Some(CommitmentConfig::confirmed()),
-        encoding: Some(UiTransactionEncoding::Json),
-        transaction_details: Some(TransactionDetails::Full),
-        show_rewards: Some(false),
-        max_supported_transaction_version: Some(0),
-    };
+    // The version is declared once, in `stream::tx_version` — a stale number
+    // here would turn every block holding a newer transaction into `block: null`.
+    let config = crate::stream::tx_version::block_subscribe_config(UiTransactionEncoding::Json);
 
     // Subscribe to ALL blocks. We process each block synchronously (extract pool
     // candidates = fast, no RPC), then spawn async RPC fetches for new pools in
@@ -422,6 +571,7 @@ async fn run_block_subscribe(
 
     while let Some(notification) = stream.next().await {
         let update = notification.value;
+        crate::stream::note_slot(update.slot);
         if let Some(block) = update.block {
             *summary_slots += 1;
 
@@ -431,6 +581,23 @@ async fn run_block_subscribe(
                 let emitted = parse_swaps_from_block(&block, &ctx.oracle, &ctx.tx);
                 if emitted > 0 {
                     stats.record_swap_emitted(emitted as u64);
+                }
+            }
+
+            // Block-driven freshness (the Geyser job, from the block): vault
+            // balances → mirror now; touched state-priced pools re-read in the
+            // background. The quote path never has to notice staleness itself.
+            if let Some(ctx) = refresh {
+                let pass = crate::stream::block_refresh::mirror_block(&block, &ctx.registry, &ctx.mirror);
+                if pass.vault_updates > 0 {
+                    stats.record_update();
+                }
+                if !pass.touched.is_empty() {
+                    let ctx = Arc::clone(ctx);
+                    tokio::spawn(async move {
+                        let (states, ticks) = crate::stream::block_refresh::refresh_touched(&ctx, pass.touched).await;
+                        debug!(states, ticks, "block refresh");
+                    });
                 }
             }
 
@@ -457,11 +624,24 @@ async fn run_block_subscribe(
                     let stats = Arc::clone(stats);
                     let pool_db = Arc::clone(pool_db);
                     let sem = Arc::clone(&fetch_sem);
+                    let mirror = refresh.map(|r| Arc::clone(&r.mirror));
 
                     tokio::spawn(async move {
                         let _permit = sem.acquire().await;
                         match crate::pool::fetcher::fetch_pool_state(&rpc, pool_type, &pool_address).await {
                             Ok(state) => {
+                                if let Some(m) = &mirror {
+                                    for vault in crate::stream::geyser::extract_vault_pubkeys(&state) {
+                                        m.register_vault(vault, pool_address);
+                                    }
+                                }
+                                if crate::pool::fetcher::is_state_priced(pool_type) {
+                                    let _ = crate::pool::ticks::load_clmm_ticks(&rpc, &state).await;
+                                }
+                                if let Some((mint_a, mint_b)) = extract_mints_from_state(&state) {
+                                    // token program + Token-2022 transfer fee, once per mint
+                                    crate::pool::mints::ensure_mint_info(&rpc, &[mint_a, mint_b]).await;
+                                }
                                 if let Some((mint_a, mint_b)) = extract_mints_from_state(&state) {
                                     let entry = PoolEntry {
                                         address: pool_address,
@@ -475,9 +655,12 @@ async fn run_block_subscribe(
                                     stats.record_update();
                                 }
                             }
-                            Err(_) => {
-                                // Not a valid pool — remove placeholder
+                            Err(e) => {
+                                // Not a valid pool (or a transient RPC error) — drop the
+                                // placeholder and stop re-discovering it for a while.
+                                debug!(pool = %pool_address, ?pool_type, error = %e, "candidate fetch failed");
                                 registry.remove(&pool_address);
+                                note_failed_candidate(pool_address);
                             }
                         }
                     });
@@ -490,6 +673,10 @@ async fn run_block_subscribe(
         if last_summary.elapsed().as_secs() >= SUMMARY_INTERVAL_SECS {
             if *summary_slots > 0 || *summary_pools > 0 {
                 info!(
+                    refresh_vaults = crate::stream::block_refresh::REFRESH_STATS.vault_updates.load(std::sync::atomic::Ordering::Relaxed),
+                    refresh_touched = crate::stream::block_refresh::REFRESH_STATS.touched.load(std::sync::atomic::Ordering::Relaxed),
+                    refresh_states = crate::stream::block_refresh::REFRESH_STATS.refreshed.load(std::sync::atomic::Ordering::Relaxed),
+                    refresh_ticks = crate::stream::block_refresh::REFRESH_STATS.ticks.load(std::sync::atomic::Ordering::Relaxed),
                     slots = *summary_slots,
                     discovered = *summary_pools,
                     errors = *summary_errors,
@@ -554,31 +741,52 @@ mod tests {
     #[test]
     fn test_extract_pool_index_accounts_1() {
         // DEXes where pool address is at accounts[1]
-        assert_eq!(extract_pool_index(PoolType::RaydiumV4), 1);
-        assert_eq!(extract_pool_index(PoolType::RaydiumCpmm), 1);
-        assert_eq!(extract_pool_index(PoolType::RaydiumLp), 1);
-        assert_eq!(extract_pool_index(PoolType::Meteora), 1);
-        assert_eq!(extract_pool_index(PoolType::MeteoraDlmm), 1);
-        assert_eq!(extract_pool_index(PoolType::FluxBeam), 1);
-        assert_eq!(extract_pool_index(PoolType::Saros), 1);
-        assert_eq!(extract_pool_index(PoolType::Dooar), 1);
+        use crate::execution::amms::pumpfun_amm::{BUY_DISC, SELL_DISC};
+        let anchor_swap = [248u8, 198, 158, 145, 225, 117, 135, 200];
+        let anchor_swap_v2 = [43u8, 4, 237, 11, 26, 201, 30, 98];
+        let cpmm_in = [143u8, 190, 90, 218, 196, 30, 51, 222];
+        let lp_buy_in = [250u8, 234, 13, 123, 213, 156, 19, 236];
+        let f = |pid: &Pubkey, data: &[u8]| swap_pool_index(pid, data);
+        assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[9, 0, 0]), Some((PoolType::RaydiumV4, 1)));
+        assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[11]), Some((PoolType::RaydiumV4, 1)));
+        assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[3]), None, "V4 deposit is not a swap");
+        assert_eq!(f(&RAYDIUM_CPMM_PROG_ID, &cpmm_in), Some((PoolType::RaydiumCpmm, 3)));
+        assert_eq!(f(&RAYDIUM_LP_PROG_ID, &lp_buy_in), Some((PoolType::RaydiumLp, 4)));
+        assert_eq!(f(&RAYDIUM_CL_PROG_ID, &anchor_swap_v2), Some((PoolType::RaydiumCl, 2)));
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &BUY_DISC), Some((PoolType::PumpFun, 3)), "bonding curve, not the mint at [2]");
+        assert_eq!(f(&PUMP_FUN_AMM_PROG_ID, &SELL_DISC), Some((PoolType::PumpFunAmm, 0)));
+        assert_eq!(f(&METEORA_PROG_ID, &anchor_swap), Some((PoolType::Meteora, 0)));
+        assert_eq!(f(&METEORA_DLMM_PROG_ID, &anchor_swap), Some((PoolType::MeteoraDlmm, 0)));
+        assert_eq!(f(&METEORA_DAMM_PROG_ID, &anchor_swap), Some((PoolType::MeteoraDamm, 1)));
+        assert_eq!(f(&ORCA_PROG_ID, &anchor_swap), Some((PoolType::Orca, 2)));
+        assert_eq!(f(&ORCA_PROG_ID, &anchor_swap_v2), Some((PoolType::Orca, 4)), "swapV2 moves the whirlpool to [4]");
+        assert_eq!(f(&ORCA_PROG_ID, &[1, 2, 3, 4, 5, 6, 7, 8]), None, "unknown Orca ix is not a swap");
+        assert_eq!(f(&FLUXBEAM_PROG_ID, &[1, 0]), Some((PoolType::FluxBeam, 0)));
+        assert_eq!(f(&FLUXBEAM_PROG_ID, &[2, 0]), None, "token-swap deposit is not a swap");
+        assert_eq!(f(&Pubkey::new_unique(), &anchor_swap), None, "unknown program");
+        // the legacy per-program default still exists for callers without data
+        assert_eq!(extract_pool_index(PoolType::PumpFunAmm), 0, "pAMM buy/sell: [0] pool ([3] is the base mint)");
     }
 
     #[test]
-    fn test_extract_pool_index_accounts_2() {
-        // DEXes where pool address is at accounts[2]
-        assert_eq!(extract_pool_index(PoolType::RaydiumCl), 2);
-        assert_eq!(extract_pool_index(PoolType::PumpFun), 2);
-        assert_eq!(extract_pool_index(PoolType::MeteoraDamm), 2);
-        assert_eq!(extract_pool_index(PoolType::MeteoraDbc), 2);
-        assert_eq!(extract_pool_index(PoolType::Orca), 2);
-        assert_eq!(extract_pool_index(PoolType::PancakeSwap), 2);
-    }
-
-    #[test]
-    fn test_extract_pool_index_accounts_3() {
-        // DEXes where pool address is at accounts[3]
-        assert_eq!(extract_pool_index(PoolType::PumpFunAmm), 3);
+    fn pamm_only_buy_and_sell_are_swaps() {
+        use crate::execution::amms::pumpfun_amm::{BUY_DISC, BUY_EXACT_QUOTE_IN_DISC, SELL_DISC};
+        let mut buy = BUY_DISC.to_vec(); buy.extend([0u8; 17]);
+        let mut sell = SELL_DISC.to_vec(); sell.extend([0u8; 16]);
+        let mut beqi = BUY_EXACT_QUOTE_IN_DISC.to_vec(); beqi.extend([0u8; 17]);
+        assert_eq!(refine_pool_type(PoolType::PumpFunAmm, &buy), Some(PoolType::PumpFunAmm));
+        assert_eq!(refine_pool_type(PoolType::PumpFunAmm, &beqi), Some(PoolType::PumpFunAmm));
+        assert_eq!(refine_pool_type(PoolType::PumpFunAmm, &sell), Some(PoolType::PumpFunAmm));
+        // Anchor event self-CPI: `e445a52e51cb9a1d` + event bytes
+        let event = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d, 1, 2, 3];
+        assert_eq!(refine_pool_type(PoolType::PumpFunAmm, &event), None);
+        assert_eq!(refine_pool_type(PoolType::PumpFunAmm, &[1, 2]), None, "short data");
+        // other venues pass through untouched
+        assert_eq!(refine_pool_type(PoolType::RaydiumCpmm, &event), Some(PoolType::RaydiumCpmm));
+        let b58 = bs58::encode(&buy).into_string();
+        assert_eq!(pool_type_for_ix_b58(&PUMP_FUN_AMM_PROG_ID, &b58), Some(PoolType::PumpFunAmm));
+        let b58e = bs58::encode(&event).into_string();
+        assert_eq!(pool_type_for_ix_b58(&PUMP_FUN_AMM_PROG_ID, &b58e), None);
     }
 
     #[test]
@@ -625,6 +833,12 @@ mod tests {
             token_0_mint: mint_a,
             token_1_mint: mint_b,
             observation: Pubkey::new_unique(),
+            trade_fee_bps: 0,
+            protocol_fees_0: 0,
+            protocol_fees_1: 0,
+            fund_fees_0: 0,
+            fund_fees_1: 0,
+            creator_fee_ppm: 0, enable_creator_fee: false, creator_fee_on: 0,
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
@@ -643,6 +857,10 @@ mod tests {
             coin_creator: Pubkey::new_unique(),
             base_reserve: 1000,
             quote_reserve: 2000,
+            protocol_fee_recipient: Pubkey::default(),
+            buyback_accounts: Vec::new(),
+            base_supply: 0,
+            virtual_quote_reserve: 0,
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base, quote)));
@@ -679,6 +897,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
@@ -760,7 +979,13 @@ mod tests {
                 pool: pk(), authority: pk(), config: pk(),
                 token_0_vault: pk(), token_1_vault: pk(),
                 token_0_mint: pk(), token_1_mint: pk(), observation: pk(),
-            },
+            trade_fee_bps: 0,
+            protocol_fees_0: 0,
+            protocol_fees_1: 0,
+            fund_fees_0: 0,
+            fund_fees_1: 0,
+            creator_fee_ppm: 0, enable_creator_fee: false, creator_fee_on: 0,
+        },
             crate::pool::types::PoolState::RaydiumClmm {
                 pool: pk(), amm_config: pk(), observation: pk(),
                 token_vault_0: pk(), token_vault_1: pk(),
@@ -778,6 +1003,7 @@ mod tests {
             crate::pool::types::PoolState::MeteoraDamm {
                 pool: pk(), token_a_vault: pk(), token_b_vault: pk(),
                 token_a_mint: pk(), token_b_mint: pk(),
+                liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
             },
         ];
 
@@ -845,6 +1071,7 @@ mod tests {
             config_id: Pubkey::new_unique(),
             platform_id: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base_mint, quote_mint)));
@@ -881,6 +1108,7 @@ mod tests {
             token_a_mint: mint_a,
             token_b_mint: mint_b,
             pool_token_program: Pubkey::new_unique(),
+            fees: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
@@ -899,6 +1127,7 @@ mod tests {
             fee_account: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
+            fees: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
@@ -917,6 +1146,7 @@ mod tests {
             fee_account: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
+            fees: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));

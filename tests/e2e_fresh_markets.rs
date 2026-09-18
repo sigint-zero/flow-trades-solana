@@ -248,11 +248,10 @@ async fn discover_fresh_pool(
             Ok(s) => s,
             Err(_) => continue,
         };
-        let cfg = solana_client::rpc_config::RpcTransactionConfig {
-            encoding: Some(UiTransactionEncoding::Json),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-        };
+        let cfg = flow_trades::stream::tx_version::transaction_config(
+            UiTransactionEncoding::Json,
+            CommitmentConfig::confirmed(),
+        );
         let tx = match rpc.get_transaction_with_config(&sig, cfg).await {
             Ok(t) => t,
             Err(_) => continue,

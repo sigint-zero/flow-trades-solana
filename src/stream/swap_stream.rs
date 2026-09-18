@@ -31,10 +31,10 @@ use yellowstone_grpc_proto::solana::storage::confirmed_block::{
     Transaction as YsTransaction, TransactionStatusMeta as YsMeta,
 };
 
-use crate::constants::{PYUSD_MINT, SOL_NATIVE_MINT, USDC_MINT, USDT_MINT};
+use crate::constants::{ONCHAIN_LABS_DEX_V2_PROG_ID, PYUSD_MINT, SOL_NATIVE_MINT, USDC_MINT, USDT_MINT};
 use crate::enrichment::PriceOracle;
 use crate::stream::block_scanner::{
-    dex_program_to_type, extract_pool_index, pumpup_pool_type_from_ix_data,
+    swap_pool_index_b58,
 };
 use crate::quote::router::label_for_pool_type;
 use crate::pool::types::PoolType;
@@ -156,6 +156,10 @@ struct TxFacts<'a> {
     fee_payer: Pubkey,
     /// Pre-computed per-mint signed atomic deltas for the fee payer.
     deltas: Deltas,
+    /// Every token-balance observation in the tx (vaults included).
+    obs: Vec<BalanceObs>,
+    /// Signed lamport delta per account index (native SOL legs of bonding curves).
+    lamport_deltas: Vec<i128>,
     /// (program_id, accounts indices, ix_data_b58) for every ix
     /// (top-level first, then inner) — bytes already converted.
     ixs: Vec<IxView<'a>>,
@@ -272,12 +276,20 @@ pub fn parse_swaps_from_block(
             }
         }
 
+        let lamport_deltas: Vec<i128> = meta
+            .pre_balances
+            .iter()
+            .zip(meta.post_balances.iter())
+            .map(|(a, b)| *b as i128 - *a as i128)
+            .collect();
         let facts = TxFacts {
             sig,
             block_time,
             keys: &keys,
             fee_payer,
             deltas,
+            obs,
+            lamport_deltas,
             ixs,
         };
         emitted += parse_one_tx(&facts, slot, oracle, out);
@@ -383,12 +395,20 @@ pub fn parse_swaps_from_yellowstone_block(
             }
         }
 
+        let lamport_deltas: Vec<i128> = meta
+            .pre_balances
+            .iter()
+            .zip(meta.post_balances.iter())
+            .map(|(a, b)| *b as i128 - *a as i128)
+            .collect();
         let facts = TxFacts {
             sig,
             block_time,
             keys: &keys,
             fee_payer,
             deltas,
+            obs,
+            lamport_deltas,
             ixs,
         };
         emitted += parse_one_tx(&facts, slot, oracle, out);
@@ -397,7 +417,13 @@ pub fn parse_swaps_from_yellowstone_block(
     emitted
 }
 
-/// Shared core: dispatch every IxView, dedupe by pool, emit one Swap per pool.
+/// Shared core: dispatch every IxView and emit one Swap per pool.
+///
+/// Amounts come from the pool's own vault balance deltas when the instruction's
+/// accounts let us identify them (leg-accurate, so a 2-hop route yields two
+/// swaps with their real legs). When they cannot be identified the fee payer's
+/// net deltas are used — once per transaction, never again for a second pool
+/// (otherwise a routed swap is counted once per pool it touches).
 fn parse_one_tx(
     facts: &TxFacts,
     slot: u64,
@@ -406,28 +432,225 @@ fn parse_one_tx(
 ) -> usize {
     let mut seen_pools: std::collections::HashSet<Pubkey> = std::collections::HashSet::new();
     let mut emitted = 0usize;
+    let mut fallback_used = false;
+
+    // How many recognised swap instructions this tx carries: with exactly one,
+    // the fee payer's input delta is what the trader paid in total, which is
+    // the right base for the observed-fee estimate.
+    let n_swaps = facts
+        .ixs
+        .iter()
+        .filter(|ix| swap_pool_index_b58(&ix.program_id, &ix.data_b58).is_some() || ix.program_id == ONCHAIN_LABS_DEX_V2_PROG_ID)
+        .count();
 
     for ix in &facts.ixs {
-        let pt = match resolve_pool_type(ix.program_id, &ix.data_b58) {
-            Some(pt) => pt,
+        // OnChain Labs DEX V2: an aggregator into private venues — no pool to
+        // quote, but the trade is real. Streamed under the program id with the
+        // fee payer's net legs.
+        if ix.program_id == ONCHAIN_LABS_DEX_V2_PROG_ID {
+            if fallback_used || !seen_pools.insert(ONCHAIN_LABS_DEX_V2_PROG_ID) {
+                continue;
+            }
+            if let Some(swap) = build_swap_from_deltas(
+                &facts.sig, slot, facts.block_time, "OnChain Labs DEX V2", ONCHAIN_LABS_DEX_V2_PROG_ID, facts.fee_payer, &facts.deltas, oracle,
+            ) {
+                fallback_used = true;
+                if out.send(Arc::new(swap)).is_ok() {
+                    emitted += 1;
+                }
+            }
+            continue;
+        }
+        let (pt, pool_idx) = match swap_pool_index_b58(&ix.program_id, &ix.data_b58) {
+            Some(x) => x,
             None => continue,
         };
-        let pool = match resolve_pool_address(pt, ix.accounts, facts.keys) {
-            Some(p) => p,
+        let pool = match ix.accounts.get(pool_idx).and_then(|i| facts.keys.get(*i as usize)) {
+            Some(p) => *p,
             None => continue,
         };
         if !seen_pools.insert(pool) {
             continue;
         }
-        if let Some(swap) = build_swap_from_deltas(
-            &facts.sig, slot, facts.block_time, pt, pool, facts.fee_payer, &facts.deltas, oracle,
-        ) {
+        let dex = label_for_pool_type(pt);
+        let swap = match vault_legs(pool, ix.accounts, facts) {
+            Some(legs) => {
+                if is_cp_for_fee_estimate(pt) {
+                    // The trader's total input when this is the only swap in the
+                    // tx (fees skimmed before the vault count), else what reached
+                    // the vault (a lower bound).
+                    let paid_in = if n_swaps == 1 {
+                        facts
+                            .deltas
+                            .entries
+                            .iter()
+                            .find(|(m, d, _)| *m == legs.in_mint && *d < 0)
+                            .map(|(_, d, _)| d.unsigned_abs())
+                            .filter(|p| *p >= legs.in_amount as u128)
+                            .unwrap_or(legs.in_amount as u128)
+                    } else {
+                        legs.in_amount as u128
+                    };
+                    if let Some(bps) = crate::stream::observed_fees::implied_fee_bps(
+                        paid_in, legs.out_amount as u128, legs.r_in_pre, legs.r_out_pre,
+                    ) {
+                        crate::stream::observed_fees::record(pool, bps);
+                    }
+                }
+                build_swap(&facts.sig, slot, facts.block_time, dex, pool, facts.fee_payer,
+                    legs.in_mint, legs.in_amount, legs.in_dec, legs.out_mint, legs.out_amount, legs.out_dec, oracle)
+            }
+            None => {
+                if fallback_used {
+                    continue;
+                }
+                match build_swap_from_deltas(&facts.sig, slot, facts.block_time, dex, pool, facts.fee_payer, &facts.deltas, oracle) {
+                    Some(sw) => {
+                        fallback_used = true;
+                        Some(sw)
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(swap) = swap {
             if out.send(Arc::new(swap)).is_ok() {
                 emitted += 1;
             }
         }
     }
     emitted
+}
+
+/// Venues whose swap is x·y=k on the two vault balances, so an observed swap
+/// yields an effective fee the quoter can reuse.
+fn is_cp_for_fee_estimate(pt: PoolType) -> bool {
+    matches!(
+        pt,
+        PoolType::PumpFunAmm
+            | PoolType::RaydiumCpmm
+            | PoolType::MeteoraDamm
+            | PoolType::Meteora
+            | PoolType::FluxBeam
+            | PoolType::Saros
+            | PoolType::Dooar
+            | PoolType::Pumpup
+    )
+}
+
+/// The two legs of one pool's swap, read from its own vault balances.
+struct VaultLegs {
+    in_mint: Pubkey,
+    in_amount: u64,
+    in_dec: u8,
+    /// Vault balance BEFORE the swap on the input side.
+    r_in_pre: u128,
+    out_mint: Pubkey,
+    out_amount: u64,
+    out_dec: u8,
+    r_out_pre: u128,
+}
+
+/// Identify the pool's vaults among the instruction's accounts: token accounts
+/// whose owner is the pool itself, or (Raydium CPMM/LP, Meteora DAMM/DBC, the
+/// SPL token-swap forks) an authority that is itself one of the instruction's
+/// accounts — never the fee payer. Exactly one vault must have gained and one
+/// lost, on different mints. A bonding curve's native-SOL side is taken from
+/// the pool account's lamport delta when only the token vault is found.
+fn vault_legs(pool: Pubkey, ix_accounts: &[u8], facts: &TxFacts) -> Option<VaultLegs> {
+    let idx_set: std::collections::HashSet<u32> = ix_accounts.iter().map(|i| *i as u32).collect();
+    let key_set: std::collections::HashSet<Pubkey> =
+        ix_accounts.iter().filter_map(|i| facts.keys.get(*i as usize).copied()).collect();
+    let pick = |owned_by_pool_only: bool| -> Vec<&BalanceObs> {
+        facts
+            .obs
+            .iter()
+            .filter(|o| idx_set.contains(&o.account_index))
+            .filter(|o| o.owner != facts.fee_payer)
+            .filter(|o| if owned_by_pool_only { o.owner == pool } else { key_set.contains(&o.owner) })
+            .filter(|o| o.post_atom != o.pre_atom)
+            .collect()
+    };
+    let mut cands = pick(true);
+    if cands.len() != 2 {
+        cands = pick(false);
+    }
+    let gained: Vec<&&BalanceObs> = cands.iter().filter(|o| o.post_atom > o.pre_atom).collect();
+    let lost: Vec<&&BalanceObs> = cands.iter().filter(|o| o.post_atom < o.pre_atom).collect();
+    match (gained.as_slice(), lost.as_slice()) {
+        ([g], [l]) if g.mint != l.mint => Some(VaultLegs {
+            in_mint: g.mint,
+            in_amount: (g.post_atom - g.pre_atom).min(u64::MAX as u128) as u64,
+            in_dec: g.decimals,
+            r_in_pre: g.pre_atom,
+            out_mint: l.mint,
+            out_amount: (l.pre_atom - l.post_atom).min(u64::MAX as u128) as u64,
+            out_dec: l.decimals,
+            r_out_pre: l.pre_atom,
+        }),
+        // Bonding curves (pump.fun, Pumpup): one token vault + native SOL on the pool account.
+        ([g], []) | ([], [g]) => {
+            let pool_idx = facts.keys.iter().position(|k| *k == pool)?;
+            let lam = *facts.lamport_deltas.get(pool_idx)?;
+            if lam == 0 {
+                return None;
+            }
+            let token_gained = g.post_atom > g.pre_atom;
+            if token_gained == (lam > 0) {
+                return None; // both sides moved the same way — not a swap
+            }
+            let tok_amt = g.post_atom.abs_diff(g.pre_atom).min(u64::MAX as u128) as u64;
+            let sol_amt = lam.unsigned_abs().min(u64::MAX as u128) as u64;
+            Some(if token_gained {
+                VaultLegs { in_mint: g.mint, in_amount: tok_amt, in_dec: g.decimals, r_in_pre: g.pre_atom,
+                            out_mint: SOL_NATIVE_MINT, out_amount: sol_amt, out_dec: 9, r_out_pre: 0 }
+            } else {
+                VaultLegs { in_mint: SOL_NATIVE_MINT, in_amount: sol_amt, in_dec: 9, r_in_pre: 0,
+                            out_mint: g.mint, out_amount: tok_amt, out_dec: g.decimals, r_out_pre: g.pre_atom }
+            })
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_swap(
+    sig: &str,
+    slot: u64,
+    block_time: Option<i64>,
+    dex: &str,
+    pool: Pubkey,
+    user: Pubkey,
+    input_mint: Pubkey,
+    input_amount: u64,
+    input_dec: u8,
+    output_mint: Pubkey,
+    output_amount: u64,
+    output_dec: u8,
+    oracle: &PriceOracle,
+) -> Option<Swap> {
+    if input_mint == output_mint || input_amount == 0 || output_amount == 0 {
+        return None;
+    }
+    let input = SwapSide::new(input_mint, input_amount, input_dec);
+    let output = SwapSide::new(output_mint, output_amount, output_dec);
+    let (price_native, price_native_inverted) = native_price(input_amount, input_dec, output_amount, output_dec);
+    let (price_usd, amount_usd) = usd_price(&input_mint, &output_mint, input_amount, input_dec, output_amount, output_dec, oracle);
+    Some(Swap {
+        kind: "swap",
+        signature: sig.to_string(),
+        slot,
+        block_time,
+        dex: dex.to_string(),
+        pool: pool.to_string(),
+        user: user.to_string(),
+        input,
+        output,
+        price_native,
+        price_native_inverted,
+        price_usd,
+        amount_usd,
+    })
 }
 
 /// Pre/post token-balance observation, normalized across both block formats.
@@ -572,7 +795,7 @@ fn build_swap_from_deltas(
     sig: &str,
     slot: u64,
     block_time: Option<i64>,
-    pool_type: PoolType,
+    dex: &str,
     pool: Pubkey,
     fee_payer: Pubkey,
     deltas: &Deltas,
@@ -581,48 +804,9 @@ fn build_swap_from_deltas(
     // Pick most-negative as input, most-positive as output.
     let (input_mint, input_amount, input_dec) = deltas.most_negative()?;
     let (output_mint, output_amount, output_dec) = deltas.most_positive()?;
-    if input_mint == output_mint {
-        return None;
-    }
-
-    let dex = label_for_pool_type(pool_type);
-    let input = SwapSide::new(input_mint, input_amount, input_dec);
-    let output = SwapSide::new(output_mint, output_amount, output_dec);
-
-    let (price_native, price_native_inverted) = native_price(input_amount, input_dec, output_amount, output_dec);
-    let (price_usd, amount_usd) = usd_price(&input_mint, &output_mint, input_amount, input_dec, output_amount, output_dec, oracle);
-
-    Some(Swap {
-        kind: "swap",
-        signature: sig.to_string(),
-        slot,
-        block_time,
-        dex: dex.to_string(),
-        pool: pool.to_string(),
-        user: fee_payer.to_string(),
-        input,
-        output,
-        price_native,
-        price_native_inverted,
-        price_usd,
-        amount_usd,
-    })
+    build_swap(sig, slot, block_time, dex, pool, fee_payer, input_mint, input_amount, input_dec, output_mint, output_amount, output_dec, oracle)
 }
 
-fn resolve_pool_type(program_id: Pubkey, ix_data_b58: &str) -> Option<PoolType> {
-    let pt = dex_program_to_type(&program_id)?;
-    if program_id == crate::constants::PUMPUP_PROG_ID {
-        pumpup_pool_type_from_ix_data(ix_data_b58)
-    } else {
-        Some(pt)
-    }
-}
-
-fn resolve_pool_address(pt: PoolType, accs: &[u8], keys: &[Pubkey]) -> Option<Pubkey> {
-    let idx = extract_pool_index(pt);
-    let acc_idx = *accs.get(idx)? as usize;
-    keys.get(acc_idx).copied()
-}
 
 /// Per-mint signed deltas for the fee payer.
 #[derive(Debug, Default)]

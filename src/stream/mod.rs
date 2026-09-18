@@ -1,8 +1,11 @@
 pub mod account_mirror;
+pub mod block_refresh;
 pub mod block_scanner;
 pub mod blockhash;
 pub mod geyser;
+pub mod observed_fees;
 pub mod swap_stream;
+pub mod tx_version;
 pub mod types;
 
 use std::sync::Arc;
@@ -13,6 +16,18 @@ use crate::pool::cache::PoolCache;
 use crate::pool::registry::PoolRegistry;
 
 pub use types::{StreamConfig, StreamStats};
+
+/// Highest slot seen on any stream (Geyser block/account updates or the RPC
+/// blockSubscribe fallback). Read by slot-activated fee schedules (DAMM v2).
+pub static LATEST_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_slot(slot: u64) {
+    LATEST_SLOT.fetch_max(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn latest_slot() -> u64 {
+    LATEST_SLOT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Optional swap-stream context. When present on `StreamManager`, every
 /// block update fed by Yellowstone is also passed through the swap parser

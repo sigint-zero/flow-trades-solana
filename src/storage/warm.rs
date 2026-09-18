@@ -118,6 +118,7 @@ mod tests {
                 token_b_vault: Pubkey::new_unique(),
                 token_a_mint: Pubkey::new_unique(),
                 token_b_mint: Pubkey::new_unique(),
+                liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
             },
         )
     }

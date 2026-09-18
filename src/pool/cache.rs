@@ -32,6 +32,10 @@ impl PoolCache {
         }
     }
 
+    pub fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
     /// Get a cached pool state. Returns None if not present or expired.
     /// TTL ensures stale reserves are re-fetched on the next quote.
     pub fn get(&self, address: &Pubkey) -> Option<PoolState> {
@@ -41,6 +45,19 @@ impl PoolCache {
         } else {
             Some(entry.state.clone())
         }
+    }
+
+    /// Run `f` against the cached state WITHOUT cloning it (the hot quote path
+    /// evaluates hundreds of pools per request; a `PoolState` clone allocates
+    /// for every variant that carries a `Vec`). The map shard stays read-locked
+    /// for the duration of `f`, so `f` must be short and must not touch the cache.
+    pub fn with_state<R>(&self, address: &Pubkey, f: impl FnOnce(&PoolState, std::time::Duration) -> R) -> Option<R> {
+        let entry = self.inner.get(address)?;
+        let age = entry.fetched_at.elapsed();
+        if age > self.ttl {
+            return None;
+        }
+        Some(f(&entry.state, age))
     }
 
     /// Get the age of a cached entry (time since last fetch). Returns None if not cached.
@@ -135,6 +152,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         }
     }
 
@@ -186,6 +204,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let expected_pool = match &state1 {
             PoolState::MeteoraDamm { pool, .. } => *pool,

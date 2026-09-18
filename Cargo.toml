@@ -1,6 +1,6 @@
 [package]
 name = "flow-trades"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Self-hosted Solana swap API. Direct AMM execution across 21 pool types via Yellowstone Geyser gRPC."
@@ -40,6 +40,7 @@ clap = { version = "4", features = ["derive", "env"] }
 borsh = "1.0"
 
 # Concurrency
+uint = { version = "0.9", default-features = false }
 dashmap = "6"
 
 # Logging
@@ -68,6 +69,12 @@ tonic = "0.14"
 [dev-dependencies]
 sha2 = "0.10"
 tokio-tungstenite = "0.24"
+criterion = { version = "0.5", features = ["async_tokio"] }
+pprof = { version = "0.14", features = ["flamegraph", "criterion"] }
+
+[[bench]]
+name = "quote_hot_path"
+harness = false
 
 [profile.release]
 opt-level = 3
@@ -75,3 +82,7 @@ lto = "thin"
 # Strip symbols + debug info from the release binary (~7 MB smaller,
 # no Rust module paths or source filenames in the symbol table).
 strip = "symbols"
+
+[profile.bench]
+debug = 1
+strip = "none"

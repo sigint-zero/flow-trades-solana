@@ -35,6 +35,7 @@ pub async fn handle_health(
         "blockhashCacheAgeMs": blockhash_age_ms,
         "streamUpdates": stream_updates,
         "streamErrors": stream_errors,
+        "observedFeePools": crate::stream::observed_fees::len(),
         "lastStreamUpdateMs": last_stream_update_ms,
         "altTablesLoaded": state.alt_cache.len(),
         "altAddressesTotal": state.alt_cache.total_addresses(),

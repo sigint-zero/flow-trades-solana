@@ -129,12 +129,20 @@ async fn main() {
     }
 
     // Create quoter (with mirror for zero-RPC vault balance lookups)
-    let quoter = Arc::new(Quoter::with_mirror(
+    let mut quoter = Quoter::with_mirror(
         Arc::clone(&registry),
         Arc::clone(&cache),
         Arc::clone(&rpc),
         Arc::clone(&account_mirror),
-    ));
+    );
+    if config.geyser_endpoint.is_none() {
+        // No account stream: the block-driven refresher keeps every TRADED pool
+        // one block fresh; a quiet pool older than this is re-read in the
+        // background while the quote answers from memory (never on the quote path).
+        quoter.revalidate_after = Some(Duration::from_secs(10));
+        info!("quoter: no Geyser — block-driven refresh + background revalidation of pools older than 10s");
+    }
+    let quoter = Arc::new(quoter);
 
     // Create blockhash cache (2s max age, refreshed via Geyser gRPC)
     let blockhash_cache = Arc::new(BlockhashCache::new(2000));
@@ -268,6 +276,7 @@ async fn main() {
         let cache_for_scanner = Arc::clone(&cache);
         let stats_for_scanner = Arc::clone(&stream_stats);
         let pool_db_for_scanner = Arc::clone(&pool_db);
+        let mirror_for_scanner = Arc::clone(&account_mirror);
         let interval_ms = config.block_scan_interval_ms;
         let scanner_swap_ctx = match (swap_broadcast.as_ref(), price_oracle.as_ref()) {
             (Some(tx), Some(oracle)) => Some(flow_trades::stream::block_scanner::SwapStreamCtx {
@@ -285,19 +294,31 @@ async fn main() {
                 pool_db_for_scanner,
                 interval_ms,
                 scanner_swap_ctx,
+                Some(mirror_for_scanner),
             )
             .await;
         });
         info!("block scanner active — RPC blockSubscribe fallback for pool discovery + swap stream");
     }
 
-    // Blockhash refresh via Geyser gRPC (zero RPC)
-    Arc::clone(&blockhash_cache).spawn_geyser_refresh(
-        config.geyser_endpoint.clone().unwrap_or_default(),
-        config.geyser_token.clone(),
-        Duration::from_millis(400),
-    );
-    info!("blockhash: refreshing via Geyser gRPC");
+    // Blockhash refresh: via Geyser gRPC (zero RPC) when configured, otherwise
+    // the RPC poller — without it the no-Geyser deployment would run a Geyser
+    // reconnect loop against an empty endpoint and every /swap would take the
+    // cache-miss RPC fallback.
+    match config.geyser_endpoint.clone() {
+        Some(endpoint) => {
+            Arc::clone(&blockhash_cache).spawn_geyser_refresh(
+                endpoint,
+                config.geyser_token.clone(),
+                Duration::from_millis(400),
+            );
+            info!("blockhash: refreshing via Geyser gRPC");
+        }
+        None => {
+            Arc::clone(&blockhash_cache).spawn_refresh(Arc::clone(&rpc), Duration::from_millis(400));
+            info!("blockhash: refreshing via RPC (no Geyser endpoint)");
+        }
+    }
 
     // Spawn dormant pool retry task (every 1 hour, retry pools that have been demoted)
     {
@@ -359,30 +380,49 @@ async fn main() {
         config.snapshot_interval_secs,
     );
 
+    // pump.fun AMM fee tiers (market-cap keyed) — read from the fee program's
+    // config so quotes carry the fee each pool actually charges.
+    match flow_trades::execution::amms::pumpfun_amm::load_fee_tiers(&rpc).await {
+        Ok(n) => info!(tiers = n, "pump.fun AMM fee tiers loaded from chain"),
+        Err(e) => tracing::warn!(error = %e, "pump.fun AMM fee tiers: using built-in table"),
+    }
+
+    // Mint facts (token program, Token-2022 transfer fee) for every known pool
+    // mint, off the quote path; new pools get theirs at discovery.
+    {
+        let rpc = Arc::clone(&rpc);
+        let mints: Vec<Pubkey> = registry.entries().iter().flat_map(|e| [e.mint_a, e.mint_b]).filter(|m| *m != Pubkey::default()).collect();
+        tokio::spawn(async move {
+            let n = flow_trades::pool::mints::ensure_mint_info(&rpc, &mints).await;
+            info!(mints = n, "mint info loaded (token program + transfer fees)");
+        });
+    }
+
     // Build router config — reads config PDA from on-chain program.
     // Fee ATAs are auto-created idempotently on first swap per mint.
     let router_config = {
-        use flow_trades::constants::FLOW_ROUTER_PROGRAM_ID;
         use flow_trades::execution::router::RouterConfig;
         let referral_account = config.referral_account.as_ref().map(|a| {
             Pubkey::from_str(a).expect("Invalid REFERRAL_ACCOUNT")
         });
-        // Read treasury_wallet from the on-chain config PDA
-        let config_pda = {
-            let (pda, _) = Pubkey::find_program_address(&[b"config"], &FLOW_ROUTER_PROGRAM_ID);
-            pda
+        let router_program_id = match config.router_program_id.as_deref() {
+            Some(s) => Pubkey::from_str(s).expect("Invalid ROUTER_PROGRAM_ID"),
+            None => flow_trades::constants::FLOW_ROUTER_PROGRAM_ID,
         };
+        // Read treasury_wallet from the on-chain config PDA
+        let config_pda = flow_trades::execution::router::config_pda(&router_program_id);
         match rpc.get_account(&config_pda).await {
             Ok(acct) if acct.data.len() >= 74 => {
                 let treasury_wallet = Pubkey::new_from_array(acct.data[42..74].try_into().unwrap());
                 let rc = RouterConfig {
-                    program_id: FLOW_ROUTER_PROGRAM_ID,
+                    program_id: router_program_id,
                     treasury_wallet,
                     referral_wallet: referral_account,
                 };
                 info!(
-                    program = %FLOW_ROUTER_PROGRAM_ID,
-                    config_pda = %flow_trades::execution::router::config_pda(&FLOW_ROUTER_PROGRAM_ID),
+                    program = %router_program_id,
+                    layout = ?rc.layout(),
+                    config_pda = %config_pda,
                     referral = ?referral_account,
                     "on-chain router active (all swaps routed through fee wrapper)"
                 );

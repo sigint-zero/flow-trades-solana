@@ -18,7 +18,7 @@ impl AmmExecutor for MeteoraDammExecutor {
     ) -> TradeResult<SwapInstructions> {
         let (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint) = match pool_state {
             PoolState::MeteoraDamm {
-                pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint,
+                pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint, ..
             } => (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint),
             _ => return Err(TradeError::Execution("expected MeteoraDamm pool state".into())),
         };
