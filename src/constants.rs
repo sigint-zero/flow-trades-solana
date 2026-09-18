@@ -49,7 +49,7 @@ pub const ONCHAIN_LABS_DEX_V2_PROG_ID: Pubkey = pubkey!("proVF4pMXVaYqmy4NjniPh4
 // ── Flow Router Program (hardcoded — cannot be bypassed) ──
 
 pub const FLOW_ROUTER_PROGRAM_ID: Pubkey = pubkey!("FLoWxxKoBrZtNj5NTPuy1tZcSU6Nnjtz7v5snrrUsNqm");
-// Fee rate is enforced by the on-chain config PDA (no longer hardcoded client-side).
+// Fee rate is enforced by the on-chain config PDA, not client-side.
 
 // ── Token Programs ──
 

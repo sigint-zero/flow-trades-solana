@@ -239,6 +239,7 @@ mod tests {
             fee_account: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
+            fees: Default::default(),
         };
         assert!(PumpupExecutor.build_swap_ix(&order, &bad_state).is_err());
     }

@@ -25,7 +25,7 @@ impl AmmExecutor for RaydiumCpmmExecutor {
                 pool, authority, config,
                 token_0_vault, token_1_vault,
                 token_0_mint, token_1_mint,
-                observation,
+                observation, ..
             } => (
                 pool, authority, config,
                 token_0_vault, token_1_vault,

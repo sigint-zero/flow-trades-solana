@@ -41,7 +41,7 @@ use tokio::time::Duration;
 use tracing::{debug, warn};
 
 use super::AppState;
-use crate::stream::swap_stream::{Swap, SwapFilter};
+use crate::stream::swap_stream::SwapFilter;
 
 /// How long to wait for the optional subscribe message before
 /// defaulting to no-filter "subscribe to all" mode.
@@ -219,6 +219,7 @@ async fn send_text(socket: &mut WebSocket, body: &str) -> Result<(), axum::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::swap_stream::Swap;
 
     #[test]
     fn test_subscribe_msg_parses() {

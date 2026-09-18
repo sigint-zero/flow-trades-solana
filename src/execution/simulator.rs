@@ -30,6 +30,39 @@ pub fn cu_with_headroom(units_consumed: u64) -> u32 {
     with_flat.min(1_400_000) as u32
 }
 
+/// Simulate already-serialized transaction bytes (any version, including v1,
+/// which `solana_sdk` cannot represent). Same semantics as [`simulate_versioned`].
+pub async fn simulate_raw(rpc: &RpcClient, tx_bytes: &[u8]) -> TradeResult<SimulationResult> {
+    use solana_client::rpc_request::RpcRequest;
+    use solana_client::rpc_response::{Response, RpcSimulateTransactionResult};
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tx_bytes);
+    let params = serde_json::json!([
+        b64,
+        {
+            "sigVerify": false,
+            "replaceRecentBlockhash": true,
+            "commitment": "confirmed",
+            "encoding": "base64",
+        }
+    ]);
+    let response: Response<RpcSimulateTransactionResult> = rpc
+        .send(RpcRequest::SimulateTransaction, params)
+        .await
+        .map_err(|e| TradeError::Rpc(format!("simulate_transaction: {e}")))?;
+    let result = response.value;
+    let logs = result.logs.unwrap_or_default();
+    let units_consumed = result.units_consumed.unwrap_or(0);
+    let amount_out = parse_amount_from_logs(&logs);
+    Ok(SimulationResult {
+        success: result.err.is_none(),
+        amount_out,
+        slot: response.context.slot,
+        units_consumed,
+        error: result.err.map(|e| format!("{e:?}")),
+        logs,
+    })
+}
+
 /// Simulate a versioned transaction via RPC.
 /// Returns the simulation result regardless of success/failure (caller decides).
 pub async fn simulate_versioned(

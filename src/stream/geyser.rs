@@ -336,6 +336,7 @@ async fn run_session(
         // Dispatch: account updates, transaction updates, or skip
         let account_info = match update.update_oneof {
             Some(UpdateOneof::Block(block_update)) => {
+                crate::stream::note_slot(block_update.slot);
                 raw_tx_updates.fetch_add(block_update.transactions.len() as u64, Ordering::Relaxed);
 
                 // Swap stream: parse + broadcast every confirmed DEX swap.
@@ -376,16 +377,18 @@ async fn run_session(
                             // Helper: process a single instruction (top-level or inner).
                             // Registers the pool IMMEDIATELY from block data — no waiting
                             // for Geyser account delivery. Account stream fills in state later.
-                            let process_ix = |prog_id_index: usize, accounts: &[u8]| {
+                            let process_ix = |prog_id_index: usize, accounts: &[u8], data: &[u8]| {
                                 if prog_id_index >= all_keys.len() { return; }
                                 let prog_id = all_keys[prog_id_index];
 
-                                let pool_type = match program_to_pool_type(&prog_id) {
-                                    Some(pt) => pt,
-                                    None => return,
-                                };
-
-                                let pool_idx = crate::stream::block_scanner::extract_pool_index(pool_type);
+                                // Program id + discriminator (Pumpup AMM vs bonding;
+                                // pump.fun AMM event self-CPI is not a swap).
+                                if program_to_pool_type(&prog_id).is_none() { return; }
+                                let (pool_type, pool_idx) =
+                                    match crate::stream::block_scanner::swap_pool_index(&prog_id, data) {
+                                        Some(x) => x,
+                                        None => return,
+                                    };
                                 if pool_idx >= accounts.len() { return; }
                                 let acct_idx = accounts[pool_idx] as usize;
                                 if acct_idx >= all_keys.len() { return; }
@@ -437,7 +440,7 @@ async fn run_session(
                             // Process top-level instructions
                             for ix in &msg.instructions {
                                 let accounts: Vec<u8> = ix.accounts.iter().copied().collect();
-                                process_ix(ix.program_id_index as usize, &accounts);
+                                process_ix(ix.program_id_index as usize, &accounts, &ix.data);
                             }
 
                             // Process inner instructions (CPI calls — Jupiter routes, etc.)
@@ -447,6 +450,7 @@ async fn run_session(
                                         process_ix(
                                             inner_ix.program_id_index as usize,
                                             &inner_ix.accounts,
+                                            &inner_ix.data,
                                         );
                                     }
                                 }
@@ -491,6 +495,7 @@ async fn run_session(
                 continue;
             }
             Some(UpdateOneof::Account(acct)) => {
+                crate::stream::note_slot(acct.slot);
                 match acct.account {
                     Some(info) => info,
                     None => continue,
@@ -588,6 +593,14 @@ async fn run_session(
                 // Register vaults for this pool (buffers for subscription update)
                 register_pool_vaults(manager, &pool_address, &state, &pending_vaults);
 
+                // A raw-bytes re-parse cannot see the pump.fun AMM buyback accounts
+                // resolved earlier from a swap — keep them across the refresh.
+                let mut state = state;
+                if state.needs_pamm_fee_accounts() {
+                    if let Some(prev) = manager.cache.get(&pool_address) {
+                        state.carry_over_pamm_fee_accounts(&prev);
+                    }
+                }
                 manager.cache.insert(pool_address, state);
                 manager.stats.record_update();
                 updated.fetch_add(1, Ordering::Relaxed);
@@ -643,6 +656,12 @@ async fn run_session(
                             }
                             manager.registry.add(entry);
                             discovered.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let mut state = state;
+                    if state.needs_pamm_fee_accounts() {
+                        if let Some(prev) = manager.cache.get(&pool_address) {
+                            state.carry_over_pamm_fee_accounts(&prev);
                         }
                     }
                     manager.cache.insert(pool_address, state);
@@ -723,6 +742,12 @@ mod tests {
             token_0_mint: Pubkey::new_unique(),
             token_1_mint: Pubkey::new_unique(),
             observation: Pubkey::new_unique(),
+            trade_fee_bps: 0,
+            protocol_fees_0: 0,
+            protocol_fees_1: 0,
+            fund_fees_0: 0,
+            fund_fees_1: 0,
+            creator_fee_ppm: 0, enable_creator_fee: false, creator_fee_on: 0,
         };
         let vaults = extract_vault_pubkeys(&state);
         assert_eq!(vaults, vec![v0, v1]);

@@ -21,7 +21,7 @@ impl AmmExecutor for RaydiumLpExecutor {
             match pool_state {
                 PoolState::RaydiumLp {
                     pool_state, authority, base_vault, quote_vault,
-                    base_mint, quote_mint, config_id, platform_id, creator,
+                    base_mint, quote_mint, config_id, platform_id, creator, ..
                 } => (pool_state, authority, base_vault, quote_vault,
                       base_mint, quote_mint, config_id, platform_id, creator),
                 _ => return Err(TradeError::Execution("expected RaydiumLp pool state".into())),

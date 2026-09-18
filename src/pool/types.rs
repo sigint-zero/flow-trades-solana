@@ -122,6 +122,46 @@ impl<'de> Deserialize<'de> for PoolType {
 
 /// On-chain pool state fetched before building instructions.
 /// One variant per AMM -- contains all account addresses needed for the swap instruction.
+/// SPL token-swap fee schedule (Dooar, Saros, FluxBeam forks): `trade` and
+/// `owner_trade` fees are both taken from the input (floor, minimum 1 when the
+/// numerator is non-zero), then x·y=k. `curve_type` 0 = constant product; other
+/// curves (offset, stable) are not quoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SplSwapFees {
+    pub trade_num: u64,
+    pub trade_den: u64,
+    pub owner_num: u64,
+    pub owner_den: u64,
+    pub curve_type: u8,
+}
+
+impl SplSwapFees {
+    /// Layout: fees at 227 (8×u64), curve_type at 291.
+    pub fn parse(d: &[u8]) -> Option<Self> {
+        if d.len() < 292 {
+            return None;
+        }
+        let rd = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        Some(Self { trade_num: rd(227), trade_den: rd(235), owner_num: rd(243), owner_den: rd(251), curve_type: d[291] })
+    }
+
+    fn fee(amount: u64, num: u64, den: u64) -> Option<u64> {
+        if num == 0 || den == 0 {
+            return Some(0);
+        }
+        let f = u64::try_from((amount as u128 * num as u128) / den as u128).ok()?;
+        Some(f.max(1))
+    }
+
+    /// Total fee taken from `amount_in`, or None if the schedule is unknown.
+    pub fn total_fee(&self, amount_in: u64) -> Option<u64> {
+        if self.trade_den == 0 && self.owner_den == 0 {
+            return None;
+        }
+        Some(Self::fee(amount_in, self.trade_num, self.trade_den)? + Self::fee(amount_in, self.owner_num, self.owner_den)?)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolState {
     RaydiumV4 {
@@ -149,6 +189,26 @@ pub enum PoolState {
         token_0_mint: Pubkey,
         token_1_mint: Pubkey,
         observation: Pubkey,
+        /// Trade fee from the pool's `AmmConfig` (`trade_fee_rate` / 100; the
+        /// program's tiers are 25, 30, 40, 50, 100, 400 bps). 0 = not read yet →
+        /// the quoter falls back to an observed fee or the 25 bps default.
+        trade_fee_bps: u16,
+        /// Accrued protocol/fund fees sitting in the vaults but outside the
+        /// curve (`PoolState` offsets 341/349/357/365).
+        protocol_fees_0: u64,
+        protocol_fees_1: u64,
+        fund_fees_0: u64,
+        fund_fees_1: u64,
+        /// `AmmConfig.creator_fee_rate` (u64 @108, /1e6) — charged on top of the
+        /// trade fee when `enable_creator_fee` (pool byte 389) is set.
+        #[serde(default)]
+        creator_fee_ppm: u32,
+        #[serde(default)]
+        enable_creator_fee: bool,
+        /// 0 = fee taken from the INPUT token; 1 = only token 0; 2 = only token 1
+        /// (input side when that token is the input, output side otherwise).
+        #[serde(default)]
+        creator_fee_on: u8,
     },
     RaydiumClmm {
         pool: Pubkey,
@@ -180,6 +240,9 @@ pub enum PoolState {
         config_id: Pubkey,
         platform_id: Pubkey,
         creator: Pubkey,
+        /// Bonding curve + fee rates (GlobalConfig / PlatformConfig).
+        #[serde(default)]
+        curve: crate::quote::launchlab::LaunchLabCurve,
     },
     PumpFun {
         global: Pubkey,
@@ -202,6 +265,33 @@ pub enum PoolState {
         base_reserve: u64,
         /// Token balance in pool_quote_vault (for swap amount computation)
         quote_reserve: u64,
+        /// Currently valid `protocol_fee_recipient` (account[9]; pump.fun rotates
+        /// among several). Resolved from a recent on-chain swap on this pool.
+        /// `Pubkey::default()` = unresolved → the executor falls back to the
+        /// static constant.
+        protocol_fee_recipient: Pubkey,
+        /// The pump_fees "buyback" remaining accounts (mid-2026 update): every
+        /// account AFTER the fee program in a recent swap on this pool, with its
+        /// on-chain writability. Per-pool/creator buyback vault(s) + ATAs, count
+        /// varies (2–3+), some Token-2022 — NOT derivable PDAs, so they are copied
+        /// verbatim from chain (`fetcher::resolve_pamm_fee_accounts`). The program
+        /// rejects a swap without them (error 6058) or with an incomplete set
+        /// (6023). Empty = unresolved; the executor refuses to build.
+        ///
+        /// The Geyser account stream re-parses this pool from raw bytes on every
+        /// update, which cannot see these — `carry_over_pamm_fee_accounts` keeps
+        /// the resolved set across those refreshes.
+        buyback_accounts: Vec<(Pubkey, bool)>,
+        /// Total supply of `base_mint` (atoms), read once per pool. pump.fun's
+        /// swap fee is a market-cap tier (`quote_reserve × supply / base_reserve`),
+        /// so the quote engine needs it; 0 = unknown → the most expensive tier is
+        /// assumed (a conservative quote, never a spurious revert).
+        base_supply: u64,
+        /// Virtual quote reserve (u64 at pool offset 245, mid-2026 update): the
+        /// curve prices on `quote_reserve + virtual_quote_reserve`, not on the
+        /// vault balance alone (verified byte-exact on live Buy/Sell events).
+        #[serde(default)]
+        virtual_quote_reserve: u64,
     },
     Meteora {
         pool: Pubkey,
@@ -218,6 +308,9 @@ pub enum PoolState {
         admin_token_a_fee: Pubkey,
         admin_token_b_fee: Pubkey,
         vault_program: Pubkey,
+        /// Pool's share of each dynamic vault + fee (see `quote::meteora_std`).
+        #[serde(default)]
+        reserves: crate::quote::meteora_std::MeteoraStdReserves,
     },
     MeteoraDlmm {
         lb_pair: Pubkey,
@@ -238,6 +331,26 @@ pub enum PoolState {
         token_b_vault: Pubkey,
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
+        /// Curve: liquidity is stored ×2^64; prices are Q64.64 sqrt prices.
+        #[serde(default)]
+        liquidity: u128,
+        #[serde(default)]
+        sqrt_price: u128,
+        #[serde(default)]
+        sqrt_min_price: u128,
+        #[serde(default)]
+        sqrt_max_price: u128,
+        #[serde(default)]
+        fees: crate::quote::damm_v2::DammFees,
+        #[serde(default)]
+        activation_point: u64,
+        /// 0 = slot, 1 = unix timestamp
+        #[serde(default)]
+        activation_type: u8,
+        #[serde(default)]
+        collect_fee_mode: u8,
+        #[serde(default)]
+        pool_status: u8,
     },
     MeteoraDbc {
         pool: Pubkey,
@@ -274,6 +387,8 @@ pub enum PoolState {
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
         pool_token_program: Pubkey,
+        #[serde(default)]
+        fees: SplSwapFees,
     },
     FlashTrade {
         pool: Pubkey,
@@ -326,6 +441,8 @@ pub enum PoolState {
         fee_account: Pubkey,
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
+        #[serde(default)]
+        fees: SplSwapFees,
     },
     PancakeSwap {
         pool: Pubkey,
@@ -353,6 +470,8 @@ pub enum PoolState {
         fee_account: Pubkey,
         token_a_mint: Pubkey,
         token_b_mint: Pubkey,
+        #[serde(default)]
+        fees: SplSwapFees,
     },
     /// Pumpup post-graduation AMM pool. Layout sourced from on-chain Anchor IDL
     /// at `BzBmXJiz9H88PAZomvWn8UvmdmeucWZg7N1cygN5po61`. Reserves are stored
@@ -417,6 +536,59 @@ pub struct SwapInstructions {
     pub setup: Vec<Instruction>,
     pub swap: Vec<Instruction>,
     pub cleanup: Vec<Instruction>,
+}
+
+
+impl PoolState {
+    /// Preserve the pump.fun AMM fee/buyback accounts resolved on `prev` when
+    /// `self` is a fresh re-parse of the same pool from raw account bytes (which
+    /// carry no such information). No-op for every other variant, and when
+    /// `self` already has a resolved set.
+    pub fn carry_over_pamm_fee_accounts(&mut self, prev: &PoolState) {
+        if let (
+            PoolState::PumpFunAmm {
+                protocol_fee_recipient,
+                buyback_accounts,
+                base_supply,
+                ..
+            },
+            PoolState::PumpFunAmm {
+                protocol_fee_recipient: prev_recipient,
+                buyback_accounts: prev_buyback,
+                base_supply: prev_supply,
+                ..
+            },
+        ) = (self, prev)
+        {
+            if buyback_accounts.is_empty() && !prev_buyback.is_empty() {
+                *buyback_accounts = prev_buyback.clone();
+            }
+            if *protocol_fee_recipient == Pubkey::default() {
+                *protocol_fee_recipient = *prev_recipient;
+            }
+            if *base_supply == 0 {
+                *base_supply = *prev_supply;
+            }
+        }
+    }
+
+    /// True for a pump.fun AMM pool whose buyback remaining-accounts have not
+    /// been resolved yet (a swap cannot be built until they are).
+    /// Copy of a pAMM state with fresher vault balances (mirror) for pricing.
+    /// Clones the small buyback-account Vec (2–4 entries) — the exact fee
+    /// model needs the whole state (tier from supply/creator/virtual reserve).
+    pub fn clone_shallow_pamm(&self, base_reserve: u64, quote_reserve: u64) -> PoolState {
+        let mut st = self.clone();
+        if let PoolState::PumpFunAmm { base_reserve: b, quote_reserve: q, .. } = &mut st {
+            *b = base_reserve;
+            *q = quote_reserve;
+        }
+        st
+    }
+
+    pub fn needs_pamm_fee_accounts(&self) -> bool {
+        matches!(self, PoolState::PumpFunAmm { buyback_accounts, .. } if buyback_accounts.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +725,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();

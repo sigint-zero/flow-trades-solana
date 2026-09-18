@@ -24,7 +24,7 @@ impl AmmExecutor for FluxBeamExecutor {
                 PoolState::FluxBeam {
                     pool, authority, token_a_vault, token_b_vault,
                     pool_mint, fee_account, token_a_mint, token_b_mint,
-                    pool_token_program,
+                    pool_token_program, ..
                 } => (pool, authority, token_a_vault, token_b_vault, pool_mint,
                       fee_account, token_a_mint, token_b_mint, pool_token_program),
                 _ => return Err(TradeError::Execution("expected FluxBeam pool state".into())),

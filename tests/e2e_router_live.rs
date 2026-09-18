@@ -145,7 +145,7 @@ async fn test_router_swap(test: &RouterSwapTest) -> Result<String, String> {
 
     let router_ix = wrap_swap(
         &router, &user, &[user_input_ata, user_output_ata],
-        &protocol_fee_acct, None, &[dex_ix.clone()], 1_000_000, 0, &TOKEN_PROGRAM_ID,
+        &protocol_fee_acct, None, &[dex_ix.clone()], 1_000_000, 0, &TOKEN_PROGRAM_ID, &output_mint,
     ).map_err(|e| format!("wrap: {e}"))?;
 
     // 5. Assemble full TX: compute budget + setup + router_swap + cleanup

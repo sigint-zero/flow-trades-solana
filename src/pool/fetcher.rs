@@ -45,9 +45,44 @@ pub async fn fetch_pool_state(
 
     match pool_type {
         PoolType::RaydiumV4 => parse_raydium_v4(rpc, pool_address, &pool_data).await,
-        PoolType::RaydiumCpmm => parse_raydium_cpmm(pool_address, &pool_data),
-        PoolType::RaydiumCl => parse_raydium_clmm(pool_address, &pool_data),
-        PoolType::RaydiumLp => parse_raydium_lp(pool_address, &pool_data),
+        PoolType::RaydiumCpmm => {
+            let mut st = parse_raydium_cpmm(pool_address, &pool_data)?;
+            if let PoolState::RaydiumCpmm { config, trade_fee_bps, creator_fee_ppm, .. } = &mut st {
+                match cpmm_config_fees(rpc, config).await {
+                    Ok((trade_bps, creator_ppm)) => {
+                        *trade_fee_bps = trade_bps;
+                        *creator_fee_ppm = creator_ppm;
+                    }
+                    Err(e) => debug!(pool = %pool_address, error = %e, "cpmm amm_config unreadable"),
+                }
+            }
+            Ok(st)
+        }
+        PoolType::RaydiumCl => {
+            let mut st = parse_raydium_clmm(pool_address, &pool_data)?;
+            if let PoolState::RaydiumClmm { amm_config, tick_spacing, fee_rate, .. } = &mut st {
+                *fee_rate = clmm_fee_rate_u16(rpc, amm_config, *tick_spacing, *fee_rate).await;
+            }
+            Ok(st)
+        }
+        PoolType::RaydiumLp => {
+            let mut st = parse_raydium_lp(pool_address, &pool_data)?;
+            if let PoolState::RaydiumLp { config_id, platform_id, curve, .. } = &mut st {
+                match launchlab_fee_rates(rpc, config_id, platform_id).await {
+                    Ok((ct, prot, plat, cre)) => {
+                        curve.curve_type = ct;
+                        curve.protocol_fee_rate = prot;
+                        curve.platform_fee_rate = plat;
+                        curve.creator_fee_rate = cre;
+                    }
+                    Err(e) => {
+                        debug!(pool = %pool_address, error = %e, "launchlab fee rates unreadable; pool not quotable");
+                        curve.curve_type = 255;
+                    }
+                }
+            }
+            Ok(st)
+        }
         PoolType::PumpFun => parse_pumpfun(rpc, pool_address, &pool_data).await,
         PoolType::PumpFunAmm => parse_pumpfun_amm(rpc, pool_address, &pool_data).await,
         PoolType::Meteora => parse_meteora(rpc, pool_address, &pool_data).await,
@@ -61,7 +96,13 @@ pub async fn fetch_pool_state(
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, &pool_data),
         PoolType::DefiTunaPools => parse_defituna_pools(pool_address, &pool_data),
         PoolType::Saros => parse_saros(pool_address, &pool_data),
-        PoolType::PancakeSwap => parse_pancakeswap(pool_address, &pool_data),
+        PoolType::PancakeSwap => {
+            let mut st = parse_pancakeswap(pool_address, &pool_data)?;
+            if let PoolState::PancakeSwap { amm_config, tick_spacing, fee_rate, .. } = &mut st {
+                *fee_rate = clmm_fee_rate_u16(rpc, amm_config, *tick_spacing, *fee_rate).await;
+            }
+            Ok(st)
+        }
         PoolType::Dooar => parse_dooar(pool_address, &pool_data),
         PoolType::Pumpup => parse_pumpup(pool_address, &pool_data),
         PoolType::PumpupBonding => parse_pumpup_bonding(rpc, pool_address, &pool_data).await,
@@ -142,6 +183,7 @@ pub async fn get_mint_token_program(rpc: &RpcClient, mint: &Pubkey) -> TradeResu
     }
     let account = fetch_account(rpc, mint).await?;
     if account.owner == TOKEN_PROGRAM_ID || account.owner == TOKEN_2022_PROGRAM_ID {
+        super::mints::record(*mint, account.owner, &account.data);
         Ok(account.owner)
     } else {
         Err(TradeError::Execution(format!(
@@ -250,6 +292,13 @@ fn parse_raydium_cpmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     let token_0_mint = read_pubkey(data, off + 160)?;
     let token_1_mint = read_pubkey(data, off + 192)?;
     let observation = read_pubkey(data, off + 288)?;
+    let u64_at = |o: usize| -> u64 {
+        data.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0)
+    };
+    let (protocol_fees_0, protocol_fees_1, fund_fees_0, fund_fees_1) = (u64_at(341), u64_at(349), u64_at(357), u64_at(365));
+    // creator fee flags (2025 cp-swap): enable_creator_fee u8 @389, creator_fee_on u8 @390
+    let enable_creator_fee = data.get(389).copied().unwrap_or(0) != 0;
+    let creator_fee_on = data.get(390).copied().unwrap_or(0);
 
     let authority = *RAYDIUM_CPMM_AUTHORITY;
 
@@ -262,6 +311,14 @@ fn parse_raydium_cpmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         token_0_mint,
         token_1_mint,
         observation,
+        trade_fee_bps: 0,
+        protocol_fees_0,
+        protocol_fees_1,
+        fund_fees_0,
+        fund_fees_1,
+        creator_fee_ppm: 0,
+        enable_creator_fee,
+        creator_fee_on,
     })
 }
 
@@ -312,9 +369,9 @@ fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         0
     };
 
-    // Fee rate is stored in the amm_config account, not pool data.
-    // Default to 25 bps (2500 hundredths-of-bps). Common values: 100 (1bp), 2500 (25bp), 10000 (100bp).
-    let fee_rate: u16 = 25;
+    // Fee rate lives in the amm_config account (read by `fetch_pool_state`);
+    // hundredths of a basis point, default 25 bps until read.
+    let fee_rate: u16 = 2500;
 
     // Tick arrays are PDAs: seeds = ["tick_array", pool, start_tick_index]
     let tick_array_0 = derive_tick_array(&RAYDIUM_CL_PROG_ID, pool_address, tick_current, tick_spacing, 0);
@@ -384,6 +441,25 @@ fn parse_raydium_lp(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<P
 
     let authority = *RAYDIUM_LP_AUTHORITY;
 
+    // Curve (verified on mainnet, 429-byte account): status u8@17,
+    // total_base_sell u64@29, virtual_base@37, virtual_quote@45, real_base@53,
+    // real_quote@61, total_quote_fund_raising@69. Fee rates come from the
+    // configs (`launchlab_fee_rates`).
+    let rd = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    let curve = crate::quote::launchlab::LaunchLabCurve {
+        status: data[17],
+        curve_type: 0,
+        virtual_base: rd(37),
+        virtual_quote: rd(45),
+        real_base: rd(53),
+        real_quote: rd(61),
+        total_base_sell: rd(29),
+        total_quote_fund_raising: rd(69),
+        protocol_fee_rate: 0,
+        platform_fee_rate: 0,
+        creator_fee_rate: 0,
+    };
+
     Ok(PoolState::RaydiumLp {
         pool_state: *pool_address,
         authority,
@@ -394,7 +470,42 @@ fn parse_raydium_lp(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<P
         config_id,
         platform_id,
         creator,
+        curve,
     })
+}
+
+/// LaunchLab GlobalConfig (371 B: curve_type u8@16, trade_fee_rate u64@27) and
+/// PlatformConfig (944 B: fee_rate u64@104, creator_fee_rate u64@720), cached
+/// per config account. Returns (curve_type, protocol, platform, creator).
+static LAUNCHLAB_CONFIGS: LazyLock<dashmap::DashMap<Pubkey, (u8, u64, u64, u64)>> = LazyLock::new(dashmap::DashMap::new);
+
+pub async fn launchlab_fee_rates(rpc: &RpcClient, global: &Pubkey, platform: &Pubkey) -> TradeResult<(u8, u64, u64, u64)> {
+    let key = Pubkey::new_from_array({
+        let mut k = [0u8; 32];
+        for (i, b) in global.to_bytes().iter().zip(platform.to_bytes().iter()).enumerate() {
+            k[i] = b.0 ^ b.1;
+        }
+        k
+    });
+    if let Some(v) = LAUNCHLAB_CONFIGS.get(&key) {
+        return Ok(*v);
+    }
+    let accts = rpc.get_multiple_accounts(&[*global, *platform]).await.map_err(|e| TradeError::Rpc(format!("launchlab configs: {e}")))?;
+    let g = accts[0].as_ref().ok_or_else(|| TradeError::Execution("launchlab global config missing".into()))?;
+    let p = accts[1].as_ref().ok_or_else(|| TradeError::Execution("launchlab platform config missing".into()))?;
+    if g.data.len() < 35 || p.data.len() < 728 {
+        return Err(TradeError::Execution("launchlab config layout".into()));
+    }
+    let curve_type = g.data[16];
+    let protocol = u64::from_le_bytes(g.data[27..35].try_into().unwrap());
+    let platform_rate = u64::from_le_bytes(p.data[104..112].try_into().unwrap());
+    let creator = u64::from_le_bytes(p.data[720..728].try_into().unwrap());
+    if protocol > 100_000 || platform_rate > 100_000 || creator > 100_000 {
+        return Err(TradeError::Execution(format!("launchlab fee rates implausible: {protocol}/{platform_rate}/{creator}")));
+    }
+    let v = (curve_type, protocol, platform_rate, creator);
+    LAUNCHLAB_CONFIGS.insert(key, v);
+    Ok(v)
 }
 
 // -- PumpFun (Bonding Curve) --
@@ -515,26 +626,306 @@ fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> Trade
         coin_creator,
         base_reserve: 0,
         quote_reserve: 0,
+        protocol_fee_recipient: Pubkey::default(),
+        buyback_accounts: Vec::new(),
+        base_supply: 0,
+            virtual_quote_reserve: if data.len() >= 253 { u64::from_le_bytes(data[245..253].try_into().unwrap()) } else { 0 },
     })
 }
 
+/// Resolve, from a RECENT pAMM swap on this pool, (a) the currently valid
+/// `protocol_fee_recipient` (account[9] — pump.fun rotates it) and (b) the
+/// pump_fees buyback "remaining accounts": every account AFTER the fee program
+/// (`pfeeUxB…`) in that swap, with its writability. They are per-pool/creator
+/// buyback vault(s) + ATAs (count varies, some Token-2022), not derivable PDAs,
+/// so on-chain truth is copied verbatim. Returns `(zero, empty)` if none found.
+///
+/// Reads at CONFIRMED commitment: a fresh pool's recent swaps are confirmed but
+/// not yet finalized, and `getTransaction` at finalized returns null for all of
+/// them. Prefers a successful swap but falls back to a failed one — the
+/// buyback set is valid regardless of why a swap reverted (usually slippage),
+/// and a fresh pool often has only errored recent txs. Retries with backoff:
+/// a transient `getSignatures`/`getTransaction` error must not leave the pool
+/// unresolved.
+pub async fn resolve_pamm_fee_accounts(rpc: &RpcClient, pool: &Pubkey) -> (Pubkey, Vec<(Pubkey, bool)>) {
+    use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_transaction_status_client_types::{
+        EncodedTransaction, UiInstruction, UiMessage, UiParsedInstruction, UiTransactionEncoding,
+    };
+    use std::str::FromStr;
+
+    let commit = CommitmentConfig::confirmed();
+    let pamm = PUMP_FUN_AMM_PROG_ID.to_string();
+    let fee_prog = crate::execution::amms::pumpfun_amm::FEE_PROGRAM.to_string();
+    let empty = (Pubkey::default(), Vec::new());
+
+    for attempt in 0..4u32 {
+        let sigs = match rpc
+            .get_signatures_for_address_with_config(
+                pool,
+                GetConfirmedSignaturesForAddress2Config {
+                    limit: Some(25),
+                    commitment: Some(commit),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                continue;
+            }
+        };
+        let mut fallback: Option<(Pubkey, Vec<(Pubkey, bool)>)> = None;
+        let mut fetched = 0u32;
+        for si in sigs {
+            let errored = si.err.is_some();
+            let sig = match solana_sdk::signature::Signature::from_str(&si.signature) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Other traders' swaps: any transaction version can turn up, so the
+            // request declares the crate-wide maximum (see stream::tx_version).
+            let cfg = crate::stream::tx_version::transaction_config(UiTransactionEncoding::JsonParsed, commit);
+            let tx = match rpc.get_transaction_with_config(&sig, cfg).await {
+                Ok(t) => t,
+                Err(e) => {
+                    if crate::stream::tx_version::is_version_refusal(&e) {
+                        tracing::warn!(pool = %pool, signature = %sig, error = %e,
+                            "getTransaction refused the transaction version — raise MAX_SUPPORTED_TX_VERSION");
+                    }
+                    continue;
+                }
+            };
+            fetched += 1;
+            let parsed = match tx.transaction.transaction {
+                EncodedTransaction::Json(u) => match u.message {
+                    UiMessage::Parsed(p) => p,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let writable: std::collections::HashMap<String, bool> = parsed
+                .account_keys
+                .iter()
+                .map(|k| (k.pubkey.clone(), k.writable))
+                .collect();
+            let mut all = parsed.instructions.clone();
+            if let Some(meta) = tx.transaction.meta {
+                if let solana_transaction_status_client_types::option_serializer::OptionSerializer::Some(inner) =
+                    meta.inner_instructions
+                {
+                    for ii in inner {
+                        all.extend(ii.instructions);
+                    }
+                }
+            }
+            for ix in &all {
+                let UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(p)) = ix else { continue };
+                if p.program_id != pamm || p.accounts.len() < 23 {
+                    continue;
+                }
+                let Some(fp_idx) = p.accounts.iter().position(|a| *a == fee_prog) else { continue };
+                if fp_idx + 1 >= p.accounts.len() {
+                    continue;
+                }
+                let recipient = Pubkey::from_str(&p.accounts[9]).unwrap_or_default();
+                let remaining: Vec<(Pubkey, bool)> = p.accounts[fp_idx + 1..]
+                    .iter()
+                    .filter_map(|a| Pubkey::from_str(a).ok().map(|pk| (pk, *writable.get(a).unwrap_or(&true))))
+                    .collect();
+                if remaining.is_empty() {
+                    continue;
+                }
+                if !errored {
+                    return (recipient, remaining);
+                }
+                if fallback.is_none() {
+                    fallback = Some((recipient, remaining));
+                }
+            }
+            if fallback.is_some() && fetched >= 6 {
+                break; // have valid (failed-tx) accounts; cap RPC load
+            }
+        }
+        if let Some(fb) = fallback {
+            return fb;
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    }
+    empty
+}
+
+/// Fill in the pump.fun AMM fee/buyback accounts on `state` if they are still
+/// unresolved. Returns true when the state now carries a buyback set. No-op
+/// (returns true) for every other variant and for an already-resolved pool.
+pub async fn ensure_pamm_fee_accounts(rpc: &RpcClient, state: &mut PoolState) -> bool {
+    if !state.needs_pamm_fee_accounts() {
+        return true;
+    }
+    let PoolState::PumpFunAmm { pool, base_mint, protocol_fee_recipient, buyback_accounts, base_supply, .. } = state else {
+        return true;
+    };
+    let (fee, supply) = tokio::join!(resolve_pamm_fee_accounts(rpc, pool), fetch_mint_supply(rpc, base_mint));
+    if *base_supply == 0 {
+        *base_supply = supply.unwrap_or(0);
+    }
+    let (recipient, remaining) = fee;
+    if remaining.is_empty() {
+        debug!(pool = %pool, "pumpfun amm: buyback accounts unresolved (no recent swap on the pool)");
+        return false;
+    }
+    *protocol_fee_recipient = recipient;
+    *buyback_accounts = remaining;
+    true
+}
+
+/// Re-read a pump.fun AMM pool's vault balances into `state` (2 parallel RPC
+/// calls). Everything else — mints, vaults, the resolved fee/buyback accounts —
+/// is kept. Used on the swap path when the cached state is older than a few
+/// seconds: without Geyser nothing refreshes reserves after discovery, and a
+/// pAMM buy is exact-output, so stale reserves turn into `ExceededSlippage`
+/// (6004) on a moving pool. No-op for other variants.
+pub async fn refresh_pamm_reserves(rpc: &RpcClient, state: &mut PoolState) -> TradeResult<()> {
+    let PoolState::PumpFunAmm { pool_base_vault, pool_quote_vault, base_reserve, quote_reserve, .. } = state else {
+        return Ok(());
+    };
+    let (b, q) = tokio::try_join!(
+        fetch_token_balance(rpc, pool_base_vault),
+        fetch_token_balance(rpc, pool_quote_vault),
+    )?;
+    *base_reserve = b;
+    *quote_reserve = q;
+    Ok(())
+}
+
+/// Venues whose price lives in the pool account itself (not in vault
+/// balances): a block that touches them needs the account re-read.
+pub fn is_state_priced(pool_type: PoolType) -> bool {
+    matches!(
+        pool_type,
+        PoolType::RaydiumCl | PoolType::Orca | PoolType::PancakeSwap | PoolType::Byreal | PoolType::DefiTunaFusion | PoolType::MeteoraDamm | PoolType::RaydiumLp
+    )
+}
+
+/// Re-parse a state-priced pool from an account already fetched in a batch
+/// (`getMultipleAccounts`). Fee rates come from the per-config cache filled by
+/// the first full fetch; `prev` supplies them if the cache is cold.
+pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &Account, prev: Option<&PoolState>) -> TradeResult<PoolState> {
+    let mut st = match pool_type {
+        PoolType::RaydiumCl => parse_raydium_clmm(pool_address, account)?,
+        PoolType::Orca => parse_orca(pool_address, account)?,
+        PoolType::PancakeSwap => parse_pancakeswap(pool_address, account)?,
+        PoolType::Byreal => parse_byreal(pool_address, account)?,
+        PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, account)?,
+        PoolType::MeteoraDamm => parse_meteora_damm(pool_address, account)?,
+        PoolType::RaydiumLp => parse_raydium_lp(pool_address, account)?,
+        other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
+    };
+    match (&mut st, prev) {
+        (PoolState::RaydiumLp { curve, .. }, Some(PoolState::RaydiumLp { curve: prev_curve, .. })) => {
+            curve.curve_type = prev_curve.curve_type;
+            curve.protocol_fee_rate = prev_curve.protocol_fee_rate;
+            curve.platform_fee_rate = prev_curve.platform_fee_rate;
+            curve.creator_fee_rate = prev_curve.creator_fee_rate;
+        }
+        (PoolState::RaydiumClmm { fee_rate, .. }, Some(PoolState::RaydiumClmm { fee_rate: prev_fee, .. }))
+        | (PoolState::PancakeSwap { fee_rate, .. }, Some(PoolState::PancakeSwap { fee_rate: prev_fee, .. })) => *fee_rate = *prev_fee,
+        _ => {}
+    }
+    Ok(st)
+}
+
+/// Raydium-style CLMM `AmmConfig.trade_fee_rate` as hundredths of a basis
+/// point (ppm) in the pool state's `fee_rate: u16`; keeps `fallback` (also
+/// ppm) if the config cannot be read.
+async fn clmm_fee_rate_u16(rpc: &RpcClient, config: &Pubkey, tick_spacing: i32, fallback: u16) -> u16 {
+    match super::ticks::clmm_config_fee_ppm(rpc, config, tick_spacing).await {
+        Ok(ppm) => u16::try_from(ppm).unwrap_or(u16::MAX),
+        Err(e) => {
+            debug!(%config, error = %e, "clmm amm_config fee unreadable; using fallback");
+            fallback
+        }
+    }
+}
+
+/// Raydium CPMM `AmmConfig.trade_fee_rate` (offset 12, u64, 1e6 denominator)
+/// as bps. Configs are few (~21) and immutable in practice, so they are cached
+/// for the process lifetime.
+static CPMM_CONFIG_FEES: std::sync::LazyLock<dashmap::DashMap<Pubkey, (u16, u32)>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// `(trade_fee_bps, creator_fee_ppm)` from a CPMM `AmmConfig` (trade_fee_rate
+/// u64 @12, creator_fee_rate u64 @108 — 1e6 denominator), cached per config.
+pub async fn cpmm_config_fees(rpc: &RpcClient, config: &Pubkey) -> TradeResult<(u16, u32)> {
+    if let Some(f) = CPMM_CONFIG_FEES.get(config) {
+        return Ok(*f);
+    }
+    let acct = fetch_account(rpc, config).await?;
+    let d = &acct.data;
+    if d.len() < 20 {
+        return Err(TradeError::Execution("cpmm amm_config too small".into()));
+    }
+    let rate = u64::from_le_bytes(d[12..20].try_into().unwrap());
+    let bps = u16::try_from(rate / 100).map_err(|_| TradeError::Execution("cpmm fee out of range".into()))?;
+    if bps == 0 || bps > 5_000 {
+        return Err(TradeError::Execution(format!("cpmm trade_fee_rate implausible: {rate}")));
+    }
+    let creator = if d.len() >= 116 { u64::from_le_bytes(d[108..116].try_into().unwrap()) } else { 0 };
+    let creator = u32::try_from(creator).ok().filter(|c| *c <= 100_000).unwrap_or(0);
+    CPMM_CONFIG_FEES.insert(*config, (bps, creator));
+    Ok((bps, creator))
+}
+
+pub async fn cpmm_config_fee_bps(rpc: &RpcClient, config: &Pubkey) -> TradeResult<u16> {
+    cpmm_config_fees(rpc, config).await.map(|(b, _)| b)
+}
+
 /// Parse PumpFun AMM pool and fetch vault reserves for swap computation.
+/// The fee/buyback accounts are resolved in parallel with the reserve fetch.
 async fn parse_pumpfun_amm(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let mut state = parse_pumpfun_amm_layout(pool_address, pool_data)?;
-    // Enrich with vault token balances
     if let PoolState::PumpFunAmm {
-        ref pool_base_vault, ref pool_quote_vault,
-        ref mut base_reserve, ref mut quote_reserve, ..
+        ref base_mint, ref pool_base_vault, ref pool_quote_vault,
+        ref mut base_reserve, ref mut quote_reserve,
+        ref mut protocol_fee_recipient, ref mut buyback_accounts, ref mut base_supply, ..
     } = state {
-        if let Ok((b, q)) = tokio::try_join!(
-            fetch_token_balance(rpc, pool_base_vault),
-            fetch_token_balance(rpc, pool_quote_vault),
-        ) {
+        let (bal, (recipient, remaining), supply) = tokio::join!(
+            async {
+                tokio::try_join!(
+                    fetch_token_balance(rpc, pool_base_vault),
+                    fetch_token_balance(rpc, pool_quote_vault),
+                )
+            },
+            resolve_pamm_fee_accounts(rpc, pool_address),
+            fetch_mint_supply(rpc, base_mint),
+        );
+        if let Ok((b, q)) = bal {
             *base_reserve = b;
             *quote_reserve = q;
         }
+        *protocol_fee_recipient = recipient;
+        *buyback_accounts = remaining;
+        // The fee tier is keyed by market cap = price × supply; 0 = unknown →
+        // the quoter assumes the most expensive tier (see pumpfun_amm).
+        *base_supply = supply.unwrap_or_else(|e| {
+            debug!(pool = %pool_address, error = %e, "pumpfun amm: base supply unavailable");
+            0
+        });
     }
     Ok(state)
+}
+
+/// Total supply of a mint in atoms.
+pub async fn fetch_mint_supply(rpc: &RpcClient, mint: &Pubkey) -> TradeResult<u64> {
+    let s = rpc
+        .get_token_supply(mint)
+        .await
+        .map_err(|e| TradeError::Execution(format!("get_token_supply {mint}: {e}")))?;
+    s.amount.parse::<u64>().map_err(|e| TradeError::Execution(format!("parse supply: {e}")))
 }
 
 /// Fetch the raw token balance of an SPL token account.
@@ -592,6 +983,19 @@ async fn parse_meteora(
 
     let vault_program = *METEORA_VAULT_PROGRAM;
 
+    // Reserves = the pool's LP share of each vault (2 lp mints + 2 lp accounts).
+    let (trade_fee_numerator, trade_fee_denominator, constant_product) = crate::quote::meteora_std::parse_pool_fees(data).unwrap_or((0, 0, false));
+    let mut reserves = crate::quote::meteora_std::MeteoraStdReserves { trade_fee_numerator, trade_fee_denominator, constant_product, ..Default::default() };
+    if constant_product {
+        let extra = rpc.get_multiple_accounts(&[a_vault_lp_mint, b_vault_lp_mint, a_vault_lp, b_vault_lp]).await
+            .map_err(|e| TradeError::Rpc(format!("meteora vault lp accounts: {e}")))?;
+        if let Some((a, b)) = meteora_std_amounts(&a_vault_data.data, &b_vault_data.data, &extra) {
+            reserves.token_a_amount = a;
+            reserves.token_b_amount = b;
+            reserves.computed_at = unix_now();
+        }
+    }
+
     Ok(PoolState::Meteora {
         pool: *pool_address,
         token_a_mint,
@@ -607,7 +1011,56 @@ async fn parse_meteora(
         admin_token_a_fee,
         admin_token_b_fee,
         vault_program,
+        reserves,
     })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// (token_a_amount, token_b_amount) from vault a/b data and
+/// `[lp_mint_a, lp_mint_b, pool_lp_a, pool_lp_b]` accounts.
+fn meteora_std_amounts(vault_a: &[u8], vault_b: &[u8], extra: &[Option<Account>]) -> Option<(u64, u64)> {
+    use crate::quote::meteora_std::VaultView;
+    if extra.len() < 4 {
+        return None;
+    }
+    let supply = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(36..44)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let bal = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(64..72)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let (va, vb) = (VaultView::parse(vault_a)?, VaultView::parse(vault_b)?);
+    let now = unix_now();
+    Some((va.amount_by_share(bal(2)?, supply(0)?, now), vb.amount_by_share(bal(3)?, supply(1)?, now)))
+}
+
+/// Keys to batch-read for a Meteora Standard reserve refresh, in the order
+/// `refresh_meteora_std_from` expects: [a_vault, b_vault, lp_mint_a, lp_mint_b, pool_lp_a, pool_lp_b].
+pub fn meteora_std_refresh_keys(state: &PoolState) -> Option<[Pubkey; 6]> {
+    match state {
+        PoolState::Meteora { a_vault, b_vault, a_vault_lp_mint, b_vault_lp_mint, a_vault_lp, b_vault_lp, .. } => {
+            Some([*a_vault, *b_vault, *a_vault_lp_mint, *b_vault_lp_mint, *a_vault_lp, *b_vault_lp])
+        }
+        _ => None,
+    }
+}
+
+/// Recompute a Meteora Standard pool's reserves from freshly fetched accounts
+/// (same order as `meteora_std_refresh_keys`).
+pub fn refresh_meteora_std_from(state: &mut PoolState, accounts: &[Option<Account>]) -> bool {
+    let PoolState::Meteora { reserves, .. } = state else { return false };
+    if accounts.len() < 6 {
+        return false;
+    }
+    let (Some(va), Some(vb)) = (&accounts[0], &accounts[1]) else { return false };
+    match meteora_std_amounts(&va.data, &vb.data, &accounts[2..6]) {
+        Some((a, b)) => {
+            reserves.token_a_amount = a;
+            reserves.token_b_amount = b;
+            reserves.computed_at = unix_now();
+            true
+        }
+        None => false,
+    }
 }
 
 // -- Meteora DLMM --
@@ -683,6 +1136,14 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     let token_b_mint = read_pubkey(data, 200)?;
     let token_a_vault = read_pubkey(data, 232)?;
     let token_b_vault = read_pubkey(data, 264)?;
+    // Curve (verified on mainnet): liquidity u128@360 (×2^64), sqrt_min@424,
+    // sqrt_max@440, sqrt_price@456, activation_point u64@472, activation_type
+    // u8@480, pool_status@481, collect_fee_mode@484.
+    let rd128 = |o: usize| if data.len() >= o + 16 { u128::from_le_bytes(data[o..o + 16].try_into().unwrap()) } else { 0 };
+    let (liquidity, sqrt_min_price, sqrt_max_price, sqrt_price) = (rd128(360), rd128(424), rd128(440), rd128(456));
+    let activation_point = if data.len() >= 480 { u64::from_le_bytes(data[472..480].try_into().unwrap()) } else { 0 };
+    let (activation_type, pool_status, collect_fee_mode) = if data.len() >= 485 { (data[480], data[481], data[484]) } else { (0, 0, 0) };
+    let fees = crate::quote::damm_v2::DammFees::parse(data).unwrap_or_default();
 
     Ok(PoolState::MeteoraDamm {
         pool: *pool_address,
@@ -690,6 +1151,15 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         token_b_vault,
         token_a_mint,
         token_b_mint,
+        liquidity,
+        sqrt_price,
+        sqrt_min_price,
+        sqrt_max_price,
+        fees,
+        activation_point,
+        activation_type,
+        collect_fee_mode,
+        pool_status,
     })
 }
 
@@ -872,6 +1342,7 @@ fn parse_fluxbeam(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<Poo
         token_b_vault: f.token_b_vault,
         pool_mint: f.pool_mint,
         fee_account: f.fee_account,
+        fees: super::types::SplSwapFees::parse(&pool_data.data).unwrap_or_default(),
         token_a_mint: f.token_a_mint,
         token_b_mint: f.token_b_mint,
         pool_token_program: f.pool_token_program.unwrap_or(TOKEN_PROGRAM_ID),
@@ -1042,6 +1513,7 @@ fn parse_saros(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolSt
         token_b_vault: f.token_b_vault,
         pool_mint: f.pool_mint,
         fee_account: f.fee_account,
+        fees: super::types::SplSwapFees::parse(&pool_data.data).unwrap_or_default(),
         token_a_mint: f.token_a_mint,
         token_b_mint: f.token_b_mint,
     })
@@ -1069,8 +1541,9 @@ fn parse_pancakeswap(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
     // sqrt_price_x64: u128 at 253
     let sqrt_price_x64 = u128::from_le_bytes(data[253..269].try_into().unwrap());
     let tick_current = i32::from_le_bytes(data[269..273].try_into().unwrap());
-    // Fee rate stored in amm_config account, default to 25 bps
-    let fee_rate: u16 = 25;
+    // Fee rate lives in the amm_config account (read by `fetch_pool_state`);
+    // hundredths of a basis point, default 25 bps until read.
+    let fee_rate: u16 = 2500;
 
     Ok(PoolState::PancakeSwap {
         pool: *pool_address,
@@ -1357,6 +1830,7 @@ fn parse_dooar(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolSt
         token_b_vault: f.token_b_vault,
         pool_mint: f.pool_mint,
         fee_account: f.fee_account,
+        fees: super::types::SplSwapFees::parse(&pool_data.data).unwrap_or_default(),
         token_a_mint: f.token_a_mint,
         token_b_mint: f.token_b_mint,
     })
@@ -1589,6 +2063,7 @@ pub fn parse_meteora_with_companion(
         admin_token_a_fee,
         admin_token_b_fee,
         vault_program,
+        reserves: Default::default(),
     })
 }
 
@@ -1759,6 +2234,7 @@ mod tests {
                 token_0_mint: m0,
                 token_1_mint: m1,
                 observation: obs,
+                ..
             } => {
                 assert_eq!(pool, pool_addr);
                 assert_eq!(cfg, config);
@@ -1869,6 +2345,7 @@ mod tests {
                 config_id: ci,
                 platform_id: pi,
                 creator: cr,
+                ..
             } => {
                 assert_eq!(pool_state, pool_addr);
                 assert_eq!(ci, config_id);
@@ -2016,6 +2493,7 @@ mod tests {
                 token_b_vault: vb,
                 token_a_mint: ma,
                 token_b_mint: mb,
+                ..
             } => {
                 assert_eq!(pool, pool_addr);
                 assert_eq!(va, token_a_vault);
@@ -2142,6 +2620,7 @@ mod tests {
                 token_a_mint: ma,
                 token_b_mint: mb,
                 pool_token_program: ptp,
+                ..
             } => {
                 assert_eq!(pool, pool_addr);
                 assert_eq!(va, token_a_vault);
@@ -2378,6 +2857,7 @@ mod tests {
                 fee_account: fa,
                 token_a_mint: ma,
                 token_b_mint: mb,
+                ..
             } => {
                 assert_eq!(pool, pool_addr);
                 assert_eq!(va, token_a_vault);
@@ -2488,6 +2968,7 @@ mod tests {
                 fee_account: fa,
                 token_a_mint: ma,
                 token_b_mint: mb,
+                ..
             } => {
                 assert_eq!(pool, pool_addr);
                 assert_eq!(va, token_a_vault);

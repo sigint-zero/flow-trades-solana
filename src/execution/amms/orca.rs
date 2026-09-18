@@ -146,7 +146,7 @@ impl AmmExecutor for OrcaExecutor {
                 AccountMeta::new(ta0, false),
                 AccountMeta::new(ta1, false),
                 AccountMeta::new(ta2, false),
-                AccountMeta::new_readonly(*oracle, false),
+                AccountMeta::new(*oracle, false) // writable: adaptive-fee oracle (ConstraintMut on Token-2022 pools otherwise),
             ]
         } else {
             // swap: 11 accounts
@@ -161,7 +161,7 @@ impl AmmExecutor for OrcaExecutor {
                 AccountMeta::new(ta0, false),
                 AccountMeta::new(ta1, false),
                 AccountMeta::new(ta2, false),
-                AccountMeta::new_readonly(*oracle, false),
+                AccountMeta::new(*oracle, false) // writable: adaptive-fee oracle (ConstraintMut on Token-2022 pools otherwise),
             ]
         };
 

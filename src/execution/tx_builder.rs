@@ -30,7 +30,7 @@ impl Default for TxBuildConfig {
 }
 
 /// Assemble the full instruction list from SwapInstructions + TxBuildConfig.
-fn assemble_instructions(
+pub fn assemble_instructions(
     swap_ixs: &SwapInstructions,
     config: &TxBuildConfig,
 ) -> TradeResult<Vec<solana_sdk::instruction::Instruction>> {

@@ -22,7 +22,7 @@ impl AmmExecutor for SarosExecutor {
             match pool_state {
                 PoolState::Saros {
                     pool, authority, token_a_vault, token_b_vault,
-                    pool_mint, fee_account, token_a_mint, token_b_mint,
+                    pool_mint, fee_account, token_a_mint, token_b_mint, ..
                 } => (pool, authority, token_a_vault, token_b_vault, pool_mint, fee_account, token_a_mint, token_b_mint),
                 _ => return Err(TradeError::Execution("expected Saros pool state".into())),
             };

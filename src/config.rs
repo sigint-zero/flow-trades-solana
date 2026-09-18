@@ -115,6 +115,12 @@ pub struct Config {
     /// Set this to earn revenue as an integrator. If not set, protocol gets 100%.
     #[arg(long, env = "REFERRAL_ACCOUNT")]
     pub referral_account: Option<String>,
+
+    /// flow-router program id. Defaults to the immutable legacy deployment;
+    /// any other id is assumed to be a `transfer_checked` router (new account
+    /// layout with `output_mint`).
+    #[arg(long, env = "ROUTER_PROGRAM_ID")]
+    pub router_program_id: Option<String>,
 }
 
 #[cfg(test)]

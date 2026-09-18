@@ -26,7 +26,23 @@ pub struct RouterConfig {
     pub referral_wallet: Option<Pubkey>,
 }
 
+/// Account layout the deployed router expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterLayout {
+    /// The immutable `FLoW…` deployment: fee paid with plain `Transfer` (fails
+    /// with `0x1f` on Token-2022 mints that carry extensions).
+    Legacy,
+    /// `transfer_checked` router: an `output_mint` account follows the token
+    /// program (index N+6); DEX accounts start at N+7.
+    TransferChecked,
+}
+
 impl RouterConfig {
+    /// Any program id other than the legacy deployment speaks the new layout.
+    pub fn layout(&self) -> RouterLayout {
+        if self.program_id == crate::constants::FLOW_ROUTER_PROGRAM_ID { RouterLayout::Legacy } else { RouterLayout::TransferChecked }
+    }
+
     pub fn fee_account_for_mint(&self, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
         spl_associated_token_account::get_associated_token_address_with_program_id(
             &self.treasury_wallet, mint, token_program,
@@ -57,10 +73,13 @@ pub fn config_pda(program_id: &Pubkey) -> Pubkey {
 ///   [N+3]          protocol_fee_acct  (writable)
 ///   [N+4]          referral_acct      (writable, or program_id to skip)
 ///   [N+5]          token_program      (read-only)
-///   [N+6..]        all DEX accounts   (concatenated from all hops)
+///   [N+6]          output_mint        (read-only; `RouterLayout::TransferChecked` only)
+///   [N+6..] / [N+7..]  all DEX accounts (concatenated from all hops)
 ///
 /// `token_accounts` must have N+1 entries: [input, intermediate_1..N-1, output]
 /// `dex_swap_ixs` must have N entries: one per hop
+/// `output_mint` is the mint of the last token account; ignored by the legacy layout.
+#[allow(clippy::too_many_arguments)]
 pub fn wrap_swap(
     config: &RouterConfig,
     payer: &Pubkey,
@@ -71,6 +90,7 @@ pub fn wrap_swap(
     amount_in: u64,
     min_amount_out: u64,
     token_program_id: &Pubkey,
+    output_mint: &Pubkey,
 ) -> TradeResult<Instruction> {
     let num_hops = dex_swap_ixs.len();
     if num_hops == 0 {
@@ -116,6 +136,9 @@ pub fn wrap_swap(
     accounts.push(AccountMeta::new(*protocol_fee_token_account, false));
     accounts.push(AccountMeta::new(referral_account, false));
     accounts.push(AccountMeta::new_readonly(*token_program_id, false));
+    if config.layout() == RouterLayout::TransferChecked {
+        accounts.push(AccountMeta::new_readonly(*output_mint, false));
+    }
 
     // All DEX accounts from all hops (concatenated)
     for ix in dex_swap_ixs {
@@ -167,9 +190,10 @@ mod tests {
         }
     }
 
+    /// The legacy layout (the deployed `FLoW…` program); the new layout has its own test.
     fn test_config() -> RouterConfig {
         RouterConfig {
-            program_id: Pubkey::new_unique(),
+            program_id: crate::constants::FLOW_ROUTER_PROGRAM_ID,
             treasury_wallet: Pubkey::new_unique(),
             referral_wallet: None,
         }
@@ -186,7 +210,7 @@ mod tests {
 
         let wrapped = wrap_swap(
             &config, &payer, &[input, output], &protocol_fee, None,
-            &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // 1 payer + 2 tokens + 4 fixed + 17 DEX + 1 DEX program = 25
@@ -206,7 +230,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
-            &protocol_fee, None, &[hop1, hop2], 1000, 500, &TOKEN_PROGRAM_ID,
+            &protocol_fee, None, &[hop1, hop2], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // 1 payer + 3 tokens + 4 fixed + 10 + 8 DEX + 2 DEX programs = 28
@@ -225,7 +249,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
-            &protocol_fee, None, &[hop1, hop2, hop3], 1000, 500, &TOKEN_PROGRAM_ID,
+            &protocol_fee, None, &[hop1, hop2, hop3], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // 1 payer + 4 tokens + 4 fixed + 15 DEX + 3 DEX programs = 27
@@ -242,7 +266,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique()],
-            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         assert!(wrapped.accounts[0].is_signer);
@@ -259,7 +283,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique()],
-            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // config_pda is at index 1 (payer) + 2 (tokens) = 3
@@ -283,11 +307,40 @@ mod tests {
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique()],
             &protocol_fee, Some(&referral_wallet),
-            &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // referral at index 5 (payer + 2 tokens + config + fee = 5)
         assert_eq!(wrapped.accounts[5].pubkey, referral_wallet);
+    }
+
+    #[test]
+    fn legacy_program_id_keeps_the_old_layout_and_any_other_adds_output_mint() {
+        let payer = Pubkey::new_unique();
+        let protocol_fee = Pubkey::new_unique();
+        let out_mint = Pubkey::new_unique();
+        let dex_ix = dummy_dex_ix(5);
+        let tas = [Pubkey::new_unique(), Pubkey::new_unique()];
+
+        let legacy = RouterConfig { program_id: crate::constants::FLOW_ROUTER_PROGRAM_ID, treasury_wallet: Pubkey::new_unique(), referral_wallet: None };
+        assert_eq!(legacy.layout(), RouterLayout::Legacy);
+        let w = wrap_swap(&legacy, &payer, &tas, &protocol_fee, None, &[dex_ix.clone()], 1000, 500, &TOKEN_PROGRAM_ID, &out_mint).unwrap();
+        // N=1: [payer, in, out, config, fee, referral, token_program, dex×5, dex_program]
+        assert_eq!(w.accounts.len(), 7 + 5 + 1);
+        assert_eq!(w.accounts[6].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(w.accounts[7].pubkey, dex_ix.accounts[0].pubkey);
+
+        let new = RouterConfig { program_id: Pubkey::new_unique(), treasury_wallet: Pubkey::new_unique(), referral_wallet: None };
+        assert_eq!(new.layout(), RouterLayout::TransferChecked);
+        let w = wrap_swap(&new, &payer, &tas, &protocol_fee, None, &[dex_ix.clone()], 1000, 500, &TOKEN_PROGRAM_ID, &out_mint).unwrap();
+        assert_eq!(w.accounts.len(), 8 + 5 + 1);
+        assert_eq!(w.accounts[6].pubkey, TOKEN_PROGRAM_ID);
+        assert_eq!(w.accounts[7].pubkey, out_mint, "output_mint at N+6");
+        assert!(!w.accounts[7].is_writable && !w.accounts[7].is_signer);
+        assert_eq!(w.accounts[8].pubkey, dex_ix.accounts[0].pubkey, "DEX accounts start at N+7");
+        // instruction data is byte-identical between layouts
+        let w0 = wrap_swap(&legacy, &payer, &tas, &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &out_mint).unwrap();
+        assert_eq!(w.data, w0.data);
     }
 
     #[test]
@@ -300,7 +353,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &payer,
             &[Pubkey::new_unique(), Pubkey::new_unique()],
-            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &protocol_fee, None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         assert_eq!(wrapped.accounts[5].pubkey, config.program_id);
@@ -312,7 +365,7 @@ mod tests {
         let result = wrap_swap(
             &config, &Pubkey::new_unique(),
             &[Pubkey::new_unique()],
-            &Pubkey::new_unique(), None, &[], 1000, 500, &TOKEN_PROGRAM_ID,
+            &Pubkey::new_unique(), None, &[], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         );
         assert!(result.is_err());
     }
@@ -325,7 +378,7 @@ mod tests {
         let result = wrap_swap(
             &config, &Pubkey::new_unique(),
             &[Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
-            &Pubkey::new_unique(), None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID,
+            &Pubkey::new_unique(), None, &[dex_ix], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         );
         assert!(result.is_err());
     }
@@ -339,7 +392,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &Pubkey::new_unique(),
             &[Pubkey::new_unique(), Pubkey::new_unique()],
-            &Pubkey::new_unique(), None, &[dex_ix], 1_000_000, min_out, &TOKEN_PROGRAM_ID,
+            &Pubkey::new_unique(), None, &[dex_ix], 1_000_000, min_out, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         let target = min_out.to_le_bytes();
@@ -365,7 +418,7 @@ mod tests {
         let wrapped = wrap_swap(
             &config, &Pubkey::new_unique(),
             &[Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique()],
-            &Pubkey::new_unique(), None, &[hop1, hop2], 1000, 500, &TOKEN_PROGRAM_ID,
+            &Pubkey::new_unique(), None, &[hop1, hop2], 1000, 500, &TOKEN_PROGRAM_ID, &Pubkey::default() /* output mint: ignored by the legacy layout */,
         ).unwrap();
 
         // 1 payer + 3 tokens + 4 fixed + 2 DEX accounts + 1 DEX program (deduped) = 11
