@@ -1,4 +1,4 @@
-# flow-trades
+# flow-trades-solana
 
 Self-hosted Solana swap API. Direct AMM execution across 21 pool types (20 unique DEX programs + Pumpup AMM/bonding split) powered by Yellowstone Geyser gRPC. **40µs quotes, zero RPC on hot path, all swaps routed through on-chain fee program.**
 
