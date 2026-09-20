@@ -273,7 +273,7 @@ Priority: CLI flags > env vars > `config.toml` > defaults.
 
 ## Fee Structure
 
-Every swap is wrapped in the on-chain [flow-router](https://github.com/trueoriginlabs/flow-router-solana),
+Every swap is wrapped in the on-chain [flow-router](https://github.com/sigint-zero/flow-router-solana),
 which enforces the route minimum and, when the router's config carries a non-zero `fee_bps`,
 collects that share of the output token. The fee
 rate, treasury and referral split are read from the router's config PDA at startup and reported by
@@ -282,7 +282,7 @@ rate, treasury and referral split are read from the router's config PDA at start
 | Property | Value |
 |----------|-------|
 | First-generation router | `FLoWxxKoBrZtNj5NTPuy1tZcSU6Nnjtz7v5snrrUsNqm`, immutable, 50 bps, plain SPL `Transfer` (Token-2022 mints with extensions fail with `0x1f`) |
-| Current generation | [flow-router-solana](https://github.com/trueoriginlabs/flow-router-solana): `TransferChecked` fee collection (extra `output_mint` account), upgradeable, configured via `ROUTER_PROGRAM_ID` |
+| Current generation | [flow-router-solana](https://github.com/sigint-zero/flow-router-solana): `TransferChecked` fee collection (extra `output_mint` account), upgradeable, configured via `ROUTER_PROGRAM_ID` |
 | Fee side | Output token, after all hops and the slippage check |
 
 ---
