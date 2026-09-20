@@ -85,7 +85,7 @@ fn pk(s: &str) -> Pubkey {
 }
 
 fn router_config() -> RouterConfig {
-    RouterConfig { program_id: pk(ROUTER), treasury_wallet: pk(TREASURY), referral_wallet: None }
+    RouterConfig { program_id: pk(ROUTER), treasury_wallet: pk(TREASURY), referral_wallet: None, fee_bps: 50 }
 }
 
 /// A SOL-quoted pool with a recent SUCCESSFUL direct buy, and that buyer.

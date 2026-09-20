@@ -44,6 +44,7 @@ fn router_config() -> RouterConfig {
         program_id: Pubkey::from_str(ROUTER_PROGRAM_ID).unwrap(),
         treasury_wallet: Pubkey::new_unique(),
         referral_wallet: None,
+        fee_bps: 50,
     }
 }
 
@@ -149,6 +150,7 @@ async fn test_router_wrap_with_protocol_fee_account() {
         program_id: Pubkey::from_str(ROUTER_PROGRAM_ID).unwrap(),
         treasury_wallet: Pubkey::new_unique(),
         referral_wallet: None,
+        fee_bps: 50,
     };
 
     // Simple dummy DEX instruction

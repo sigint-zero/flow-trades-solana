@@ -50,6 +50,7 @@ async fn test_real_swap_single_hop() {
         program_id: pk(ROUTER),
         treasury_wallet: pk(TREASURY),
         referral_wallet: None,
+        fee_bps: 50,
     };
 
     let input_mint = SOL_NATIVE_MINT;

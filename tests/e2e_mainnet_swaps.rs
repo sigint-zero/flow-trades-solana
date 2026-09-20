@@ -49,6 +49,7 @@ fn router_config() -> RouterConfig {
         treasury_wallet: pk("HS5LEc5nuzdm1n2wKHT95YY5trQL85Viro5QaFdaaxfC"),
         // Referral WSOL ATA — receives 70% of the 0.5% fee
         referral_wallet: Some(pk("5XiTECUnCF8ZR9JG6unZPsVMxBtaJSGmEniu42SmtQq2")),
+        fee_bps: 50,
     }
 }
 

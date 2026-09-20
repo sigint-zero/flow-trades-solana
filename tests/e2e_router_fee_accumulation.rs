@@ -36,7 +36,7 @@ fn load_keypair() -> Keypair {
 fn pk(s: &str) -> Pubkey { Pubkey::from_str(s).unwrap() }
 
 fn router_config() -> RouterConfig {
-    RouterConfig { program_id: pk(ROUTER), treasury_wallet: pk(TREASURY), referral_wallet: None }
+    RouterConfig { program_id: pk(ROUTER), treasury_wallet: pk(TREASURY), referral_wallet: None, fee_bps: 50 }
 }
 
 struct SwapDef {

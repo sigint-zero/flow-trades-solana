@@ -357,8 +357,12 @@ async fn wrap_in_router(
         user, &output_mint, &output_tp,
     );
 
-    let protocol_fee_acct = router.fee_account_for_mint(fee_mint, &fee_tp);
-    let referral_ata = router.referral_account_for_mint(fee_mint, &fee_tp);
+    // Zero-fee router: it never reads the fee-account slots, so pass the
+    // treasury wallet itself and create nothing (saves the rent and the
+    // existence check per mint).
+    let zero_fee = router.fee_bps == 0;
+    let protocol_fee_acct = if zero_fee { router.treasury_wallet } else { router.fee_account_for_mint(fee_mint, &fee_tp) };
+    let referral_ata = if zero_fee { None } else { router.referral_account_for_mint(fee_mint, &fee_tp) };
 
     // Auto-create treasury + referral ATAs unless they are KNOWN to exist
     // on-chain. `known_fee_atas` is a positive cache filled only after an RPC
@@ -368,7 +372,7 @@ async fn wrap_in_router(
     // later swap on that mint without the create, and the router then failed
     // with `protocol fee account data too short` (InvalidAccount, 6).
     let mut fee_setup = Vec::new();
-    if !fee_ata_exists(state, &protocol_fee_acct).await {
+    if !zero_fee && !fee_ata_exists(state, &protocol_fee_acct).await {
         fee_setup.push(
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 user, &router.treasury_wallet, fee_mint, &fee_tp,

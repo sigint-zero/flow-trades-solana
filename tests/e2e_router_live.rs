@@ -56,6 +56,7 @@ fn router_config() -> RouterConfig {
         program_id: pk(STAGING_ROUTER),
         treasury_wallet: pk("EnE9FuHM9HtEx7wTFVMgwaK2jKRS2TthdKcsgvwKerXN"),
         referral_wallet: None,
+        fee_bps: 50,
     }
 }
 

@@ -147,6 +147,7 @@ async fn test_single_hop_router_swap() {
         program_id,
         treasury_wallet: user,
         referral_wallet: None,
+        fee_bps: 50,
     };
 
     let pool_addr = pk("6cPfRuSp8L7f1TMt3vtKhqYYuHDoHZTHGNzQ6hRABtx6");
@@ -221,6 +222,7 @@ async fn test_two_hop_router_swap() {
         program_id,
         treasury_wallet: user,
         referral_wallet: None,
+        fee_bps: 50,
     };
 
     // Hop 1: 25fFY token → SOL via RaydiumCpmm

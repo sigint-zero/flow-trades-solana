@@ -23,7 +23,8 @@ pub async fn handle_health(
         "programId": r.program_id.to_string(),
         "configPda": crate::execution::router::config_pda(&r.program_id).to_string(),
         "referralAccount": r.referral_wallet.map(|a| a.to_string()),
-        "feeEnforcement": "on-chain config PDA (admin-controlled)",
+        "feeBps": r.fee_bps,
+        "layout": format!("{:?}", r.layout()),
     }));
 
     Json(json!({

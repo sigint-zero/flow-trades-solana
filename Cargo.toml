@@ -4,7 +4,7 @@ version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Self-hosted Solana swap API. Direct AMM execution across 21 pool types via Yellowstone Geyser gRPC."
-repository = "https://github.com/trueoriginlabs/flow-trades-solana-source"
+repository = "https://github.com/trueoriginlabs/flow-trades-solana"
 
 [lib]
 name = "flow_trades"

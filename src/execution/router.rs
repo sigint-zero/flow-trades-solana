@@ -24,6 +24,9 @@ pub struct RouterConfig {
     pub program_id: Pubkey,
     pub treasury_wallet: Pubkey,
     pub referral_wallet: Option<Pubkey>,
+    /// `fee_bps` from the on-chain config PDA. 0 = the router collects nothing
+    /// and never reads the fee-account slots.
+    pub fee_bps: u16,
 }
 
 /// Account layout the deployed router expects.
@@ -196,6 +199,7 @@ mod tests {
             program_id: crate::constants::FLOW_ROUTER_PROGRAM_ID,
             treasury_wallet: Pubkey::new_unique(),
             referral_wallet: None,
+            fee_bps: 50,
         }
     }
 
@@ -298,6 +302,7 @@ mod tests {
             program_id: Pubkey::new_unique(),
             treasury_wallet: Pubkey::new_unique(),
             referral_wallet: Some(referral_wallet),
+            fee_bps: 50,
         };
         let payer = Pubkey::new_unique();
         let protocol_fee = Pubkey::new_unique();
@@ -322,7 +327,7 @@ mod tests {
         let dex_ix = dummy_dex_ix(5);
         let tas = [Pubkey::new_unique(), Pubkey::new_unique()];
 
-        let legacy = RouterConfig { program_id: crate::constants::FLOW_ROUTER_PROGRAM_ID, treasury_wallet: Pubkey::new_unique(), referral_wallet: None };
+        let legacy = RouterConfig { program_id: crate::constants::FLOW_ROUTER_PROGRAM_ID, treasury_wallet: Pubkey::new_unique(), referral_wallet: None, fee_bps: 50 };
         assert_eq!(legacy.layout(), RouterLayout::Legacy);
         let w = wrap_swap(&legacy, &payer, &tas, &protocol_fee, None, &[dex_ix.clone()], 1000, 500, &TOKEN_PROGRAM_ID, &out_mint).unwrap();
         // N=1: [payer, in, out, config, fee, referral, token_program, dex×5, dex_program]
@@ -330,7 +335,7 @@ mod tests {
         assert_eq!(w.accounts[6].pubkey, TOKEN_PROGRAM_ID);
         assert_eq!(w.accounts[7].pubkey, dex_ix.accounts[0].pubkey);
 
-        let new = RouterConfig { program_id: Pubkey::new_unique(), treasury_wallet: Pubkey::new_unique(), referral_wallet: None };
+        let new = RouterConfig { program_id: Pubkey::new_unique(), treasury_wallet: Pubkey::new_unique(), referral_wallet: None, fee_bps: 50 };
         assert_eq!(new.layout(), RouterLayout::TransferChecked);
         let w = wrap_swap(&new, &payer, &tas, &protocol_fee, None, &[dex_ix.clone()], 1000, 500, &TOKEN_PROGRAM_ID, &out_mint).unwrap();
         assert_eq!(w.accounts.len(), 8 + 5 + 1);

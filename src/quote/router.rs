@@ -21,18 +21,28 @@ use super::types::{
 /// Default fee in basis points for constant-product AMMs that don't expose their fee on-chain.
 const DEFAULT_FEE_BPS: u16 = 25;
 
-/// Platform fee in basis points (0.5%).
-const PLATFORM_FEE_BPS: u16 = 50;
+/// Platform fee in basis points, as the on-chain router config states it.
+/// Set once at startup from the config PDA (`set_platform_fee_bps`); 50 until then.
+static PLATFORM_FEE_BPS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(50);
+
+pub fn set_platform_fee_bps(bps: u16) {
+    PLATFORM_FEE_BPS.store(bps.min(10_000), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn platform_fee_bps() -> u16 {
+    PLATFORM_FEE_BPS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Compute the platform fee for a quote. Always taken from the output token.
 fn compute_platform_fee(
     amount_out: u64,
     output_mint: &Pubkey,
 ) -> PlatformFee {
-    let fee_amount = (amount_out as u128 * PLATFORM_FEE_BPS as u128 / 10_000) as u64;
+    let bps = platform_fee_bps();
+    let fee_amount = (amount_out as u128 * bps as u128 / 10_000) as u64;
     PlatformFee {
         amount: fee_amount.to_string(),
-        fee_bps: PLATFORM_FEE_BPS,
+        fee_bps: bps,
         fee_token: output_mint.to_string(),
         side: "output".to_string(),
     }
@@ -3212,10 +3222,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_platform_fee_reports_zero_amount() {
+        let prev = platform_fee_bps();
+        set_platform_fee_bps(0);
+        let pf = compute_platform_fee(1_000_000_000, &Pubkey::new_unique());
+        assert_eq!(pf.amount, "0");
+        assert_eq!(pf.fee_bps, 0);
+        set_platform_fee_bps(prev);
+    }
+
+    #[test]
     fn test_platform_fee_bps_is_constant() {
         let pf = compute_platform_fee(1000, &SOL_NATIVE_MINT);
         assert_eq!(pf.fee_bps, 50);
-        assert_eq!(pf.fee_bps, PLATFORM_FEE_BPS);
+        assert_eq!(pf.fee_bps, platform_fee_bps());
     }
 
     // ── Slippage enforcement: minimum_out in build_direct_response ──

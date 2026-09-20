@@ -412,19 +412,23 @@ async fn main() {
         // Read treasury_wallet from the on-chain config PDA
         let config_pda = flow_trades::execution::router::config_pda(&router_program_id);
         match rpc.get_account(&config_pda).await {
-            Ok(acct) if acct.data.len() >= 74 => {
+            Ok(acct) if acct.data.len() >= 76 => {
+                let fee_bps = u16::from_le_bytes(acct.data[40..42].try_into().unwrap());
                 let treasury_wallet = Pubkey::new_from_array(acct.data[42..74].try_into().unwrap());
+                flow_trades::quote::router::set_platform_fee_bps(fee_bps);
                 let rc = RouterConfig {
                     program_id: router_program_id,
                     treasury_wallet,
                     referral_wallet: referral_account,
+                    fee_bps,
                 };
                 info!(
                     program = %router_program_id,
                     layout = ?rc.layout(),
                     config_pda = %config_pda,
+                    fee_bps,
                     referral = ?referral_account,
-                    "on-chain router active (all swaps routed through fee wrapper)"
+                    "on-chain router active (all swaps routed through the router)"
                 );
                 Some(rc)
             }

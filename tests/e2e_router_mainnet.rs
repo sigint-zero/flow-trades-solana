@@ -55,6 +55,7 @@ fn router_config() -> RouterConfig {
         program_id: pk(TEST_ROUTER),
         treasury_wallet: pk(TREASURY),
         referral_wallet: None,
+        fee_bps: 50,
     }
 }
 
