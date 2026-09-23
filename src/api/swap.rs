@@ -38,10 +38,11 @@ pub struct SwapRequest {
     /// Optional tip: appended as the last instruction (SOL transfer to the given address).
     /// Used for Jito bundles, MEV tips, or any destination. Must be last instruction.
     pub tip: Option<TipRequest>,
-    /// Transaction format: `0` (default) = v0 with lookup tables, legacy fallback,
+    /// Transaction format: `0` = v0 with lookup tables, legacy fallback,
     /// 1,232-byte limit; `1` = SIMD-0385 v1 — 4,096 bytes, every account inline
-    /// (no lookup tables), compute budget in the header. Use 1 for multi-hop
-    /// routes that do not fit v0. The signer must support v1 (first byte 0x81).
+    /// (no lookup tables), compute budget in the header. Omitted: v0, or v1 when
+    /// the route does not fit v0 (the response's `tx_version` says which). The
+    /// signer must support v1 (first byte 0x81).
     pub tx_version: Option<u8>,
 }
 
@@ -118,6 +119,18 @@ pub async fn handle_swap(
         &alt_tables,
     )?;
 
+    // Multi-hop routes through accounts the lookup tables do not cover exceed
+    // the 1,232-byte packet limit. When the caller did not pin a version, the
+    // same instructions go out as a v1 transaction (4,096 bytes, no tables);
+    // an explicit `tx_version: 0` gets the error below instead.
+    let v0_len = bincode::serialized_size(&vtx).map_err(|e| TradeError::Internal(format!("serialize tx: {e}")))? as usize;
+    if v0_len > MAX_TX_BYTES {
+        if req.tx_version.is_none() {
+            return handle_swap_v1(&state, &req, swap_ixs, tx_config, &user_pubkey, blockhash, last_valid_block_height, should_simulate).await;
+        }
+        return Err(oversize_v0(v0_len));
+    }
+
     // Optionally simulate the transaction
     let simulation = if should_simulate {
         match simulate_versioned(&state.rpc, &vtx).await {
@@ -166,12 +179,7 @@ pub async fn handle_swap(
     let tx_bytes = bincode::serialize(&final_vtx)
         .map_err(|e| TradeError::Internal(format!("serialize tx: {e}")))?;
     if tx_bytes.len() > MAX_TX_BYTES {
-        return Err(TradeError::Validation(format!(
-            "transaction is {} bytes, over the {MAX_TX_BYTES}-byte limit — the route's accounts are not \
-             covered by the configured lookup tables; quote with direct_only=true, or request \
-             tx_version=1 (4096-byte v1 transactions, no lookup tables)",
-            tx_bytes.len()
-        )));
+        return Err(oversize_v0(tx_bytes.len()));
     }
     let tx_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
@@ -183,6 +191,14 @@ pub async fn handle_swap(
         priority_fee: tx_config.priority_fee_lamports,
         simulation,
     }))
+}
+
+fn oversize_v0(len: usize) -> TradeError {
+    TradeError::Validation(format!(
+        "transaction is {len} bytes, over the {MAX_TX_BYTES}-byte limit — the route's accounts are not \
+         covered by the configured lookup tables; quote with direct_only=true, or request \
+         tx_version=1 (4096-byte v1 transactions, no lookup tables)"
+    ))
 }
 
 /// `/swap` with `tx_version: 1`: the same instructions encoded as a v1
@@ -631,16 +647,13 @@ fn tidy_multihop(setup: Vec<Instruction>, later_hop_setups: Vec<Vec<Instruction>
 /// The amount a hop can rely on receiving from the previous one.
 use crate::quote::router::guaranteed;
 
-/// pump.fun bonding pays NATIVE SOL; as the first hop of a route its executor
-/// wraps `min_amount_out` into WSOL for the next hop, which spends exactly the
-/// guaranteed amount — so that is the floor it gets. 0 (no per-hop floor) for
-/// every other hop.
-fn native_sol_hop_floor(pool_type: PoolType, output_mint: &Pubkey, quoted_out: u64, slippage_bps: u16) -> u64 {
-    if pool_type == PoolType::PumpFun && *output_mint == SOL_NATIVE_MINT {
-        guaranteed(quoted_out, slippage_bps)
-    } else {
-        0
-    }
+/// DEX-level floor of an intermediate hop: exactly what the next hop spends,
+/// so a short hop fails here with the venue's slippage error instead of as
+/// "insufficient funds" one hop later. Never 0 — pump.fun AMM rejects a zero
+/// minimum on `buy_exact_quote_in` (6001 ZeroBaseAmount), which is also the
+/// instruction a sell into a SOL-base pool uses.
+fn hop_floor(hop_out: u64, slippage_bps: u16) -> u64 {
+    guaranteed(hop_out, slippage_bps).max(1)
 }
 
 /// pump.fun bonding spends NATIVE SOL; as a later hop the SOL arrives as WSOL
@@ -759,8 +772,7 @@ async fn build_two_hop_ixs(
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_in: {}", hop1.amount_in)))?;
     let hop1_out: u64 = hop1.amount_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_out: {}", hop1.amount_out)))?;
-    // Validated here; enforced by the router on the route's total output.
-    let _route_floor: u64 = quote.minimum_out.parse()
+    let route_floor: u64 = quote.minimum_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid minimum_out: {}", quote.minimum_out)))?;
 
     let pool1_type = pool_type_from_label(&hop1.dex)?;
@@ -776,15 +788,13 @@ async fn build_two_hop_ixs(
     let output_token_program = get_token_program(state, &output_mint).await?;
 
     // Build swap 1: input -> bridge
-    // For hop1, min_amount_out is 0 (we only enforce the final threshold)
     let order1 = SwapOrder {
         pool_address: pool1_address,
         pool_type: pool1_type,
         input_mint,
         output_mint: bridge_mint,
         amount_in,
-        // intermediate — no slippage enforcement, except a native-SOL hop's wrap
-        min_amount_out: native_sol_hop_floor(pool1_type, &bridge_mint, hop1_out, quote.slippage_bps),
+        min_amount_out: hop_floor(hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge_token_program,
@@ -805,10 +815,9 @@ async fn build_two_hop_ixs(
         // "insufficient funds" whenever hop 1 lands a hair short; the surplus
         // WSOL/bridge tokens stay with the user.
         amount_in: guaranteed(hop1_out, quote.slippage_bps),
-        // The DEX-level floor is off for the last hop too: its input was scaled
-        // down to the guaranteed amount, so the quoted minimum no longer applies
-        // per hop. The router checks `minimum_out` on the route's total output.
-        min_amount_out: 0,
+        // Hop 2's quote was already priced on that guaranteed input, so the
+        // route's minimum is also this hop's floor (the router re-checks it).
+        min_amount_out: route_floor.max(1),
         user: *user_pubkey,
         input_token_program: bridge_token_program,
         output_token_program,
@@ -886,8 +895,7 @@ async fn build_three_hop_ixs(
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_out: {}", hop1.amount_out)))?;
     let hop2_out: u64 = hop2.amount_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid hop2 amount_out: {}", hop2.amount_out)))?;
-    // Validated here; enforced by the router on the route's total output.
-    let _route_floor: u64 = quote.minimum_out.parse()
+    let route_floor: u64 = quote.minimum_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid minimum_out: {}", quote.minimum_out)))?;
 
     let pool1_type = pool_type_from_label(&hop1.dex)?;
@@ -912,8 +920,7 @@ async fn build_three_hop_ixs(
         input_mint,
         output_mint: bridge1_mint,
         amount_in,
-        // intermediate — no slippage enforcement, except a native-SOL hop's wrap
-        min_amount_out: native_sol_hop_floor(pool1_type, &bridge1_mint, hop1_out, quote.slippage_bps),
+        min_amount_out: hop_floor(hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge1_token_program,
@@ -930,7 +937,7 @@ async fn build_three_hop_ixs(
         input_mint: bridge1_mint,
         output_mint: bridge2_mint,
         amount_in: guaranteed(hop1_out, quote.slippage_bps),
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        min_amount_out: hop_floor(hop2_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program: bridge1_token_program,
         output_token_program: bridge2_token_program,
@@ -947,7 +954,7 @@ async fn build_three_hop_ixs(
         input_mint: bridge2_mint,
         output_mint,
         amount_in: guaranteed(hop2_out, quote.slippage_bps),
-        min_amount_out: 0, // router enforces the route floor
+        min_amount_out: route_floor.max(1),
         user: *user_pubkey,
         input_token_program: bridge2_token_program,
         output_token_program,
@@ -1055,10 +1062,9 @@ mod tests {
     fn native_sol_hops_wrap_the_guaranteed_amount_and_unwrap_before_a_buy() {
         let user = Pubkey::new_unique();
         let token = Pubkey::new_unique();
-        // pump.fun selling into the SOL bridge wraps what hop 2 will spend
-        assert_eq!(native_sol_hop_floor(PoolType::PumpFun, &SOL_NATIVE_MINT, 1_000_000, 300), 970_000);
-        assert_eq!(native_sol_hop_floor(PoolType::Orca, &SOL_NATIVE_MINT, 1_000_000, 300), 0);
-        assert_eq!(native_sol_hop_floor(PoolType::PumpFun, &token, 1_000_000, 300), 0);
+        // pump.fun selling into the SOL bridge wraps its floor: what hop 2 will spend
+        assert_eq!(hop_floor(1_000_000, 300), 970_000);
+        let _ = token;
         // pump.fun buying from the SOL bridge: WSOL unwrapped first, inside the router
         let buy = Instruction { program_id: crate::constants::PUMP_FUN_PROG_ID, accounts: vec![], data: vec![1] };
         let mut ixs = SwapInstructions { setup: vec![], swap: vec![buy], cleanup: vec![] };

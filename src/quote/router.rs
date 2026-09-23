@@ -296,7 +296,8 @@ impl Quoter {
         let best_two_hop = two_hop_routes.iter().max_by_key(|r| r.final_amount_out);
         let best_three_hop = three_hop_routes.iter().max_by_key(|r| r.final_amount_out);
 
-        let context_slot: u64 = 0;
+        // Last block the stream has seen (0 until the first one arrives).
+        let context_slot = crate::stream::latest_slot();
         let elapsed = start.elapsed().as_secs_f64() * 1000.0; // milliseconds
 
         // Find the overall best output amount
@@ -314,15 +315,17 @@ impl Quoter {
             });
         }
 
-        if max_out == split_out {
-            if let Some(ref split) = best_split {
-                return Ok(self.build_split_response(req, split, context_slot, elapsed));
+        // On equal output the route with fewer hops wins: fewer accounts,
+        // compute units and pools that can move before it lands.
+        if max_out == direct_out {
+            if let Some(direct) = best_direct {
+                return Ok(self.build_direct_response(req, direct, context_slot, elapsed));
             }
         }
 
-        if max_out == three_hop_out {
-            if let Some(three_hop) = best_three_hop {
-                return Ok(self.build_three_hop_response(req, three_hop, context_slot, elapsed));
+        if max_out == split_out {
+            if let Some(ref split) = best_split {
+                return Ok(self.build_split_response(req, split, context_slot, elapsed));
             }
         }
 
@@ -332,8 +335,10 @@ impl Quoter {
             }
         }
 
-        if let Some(direct) = best_direct {
-            return Ok(self.build_direct_response(req, direct, context_slot, elapsed));
+        if max_out == three_hop_out {
+            if let Some(three_hop) = best_three_hop {
+                return Ok(self.build_three_hop_response(req, three_hop, context_slot, elapsed));
+            }
         }
 
         Err(TradeError::NoRoute {
@@ -618,6 +623,12 @@ impl Quoter {
 
         if let PoolState::Meteora { token_a_mint, token_b_mint, reserves, .. } = state {
             let a_to_b = if input_mint == token_a_mint { true } else if input_mint == token_b_mint { false } else { return Eval::Quoted(None) };
+            // A parsed stable-swap pool is not quoted: answer now rather than
+            // paying a cold vault read on every quote (its reserves are never
+            // computed, so it would look unloaded forever).
+            if !reserves.constant_product && reserves.trade_fee_denominator != 0 {
+                return Eval::Quoted(None);
+            }
             if reserves.computed_at == 0 {
                 return Eval::Cold; // reserves never computed (old warm file)
             }
@@ -1594,8 +1605,10 @@ async fn fetch_reserves(
     // Return in (input_reserve, output_reserve) order
     if *input_mint == mint_a {
         Some((ra, rb))
-    } else {
+    } else if *input_mint == mint_b {
         Some((rb, ra))
+    } else {
+        None
     }
 }
 
@@ -1954,6 +1967,30 @@ mod tests {
         assert_eq!(v_b, vb);
         assert_eq!(m_a, ma);
         assert_eq!(m_b, mb);
+    }
+
+    #[test]
+    fn test_stable_meteora_pool_is_answered_without_a_cold_read() {
+        let (ma, mb, pool) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let state = |constant_product: bool, trade_fee_denominator: u64| PoolState::Meteora {
+            pool, token_a_mint: ma, token_b_mint: mb,
+            a_vault: Pubkey::new_unique(), b_vault: Pubkey::new_unique(),
+            a_token_vault: Pubkey::new_unique(), b_token_vault: Pubkey::new_unique(),
+            a_vault_lp_mint: Pubkey::new_unique(), b_vault_lp_mint: Pubkey::new_unique(),
+            a_vault_lp: Pubkey::new_unique(), b_vault_lp: Pubkey::new_unique(),
+            admin_token_a_fee: Pubkey::new_unique(), admin_token_b_fee: Pubkey::new_unique(),
+            vault_program: Pubkey::new_unique(),
+            reserves: crate::quote::meteora_std::MeteoraStdReserves { constant_product, trade_fee_denominator, trade_fee_numerator: 25, ..Default::default() },
+        };
+        let quoter = Quoter::new(
+            Arc::new(PoolRegistry::new()),
+            Arc::new(crate::pool::cache::PoolCache::new(2000)),
+            Arc::new(RpcClient::new("http://localhost:8899".to_string())),
+        );
+        let entry = PoolEntry { address: pool, pool_type: PoolType::Meteora, mint_a: ma, mint_b: mb };
+        assert!(matches!(quoter.quote_state(&state(false, 10_000), &entry, &ma, 1_000), Eval::Quoted(None)), "stable curve: not quotable, no RPC");
+        assert!(matches!(quoter.quote_state(&state(true, 10_000), &entry, &ma, 1_000), Eval::Cold), "CP pool whose reserves were never read");
+        assert!(matches!(quoter.quote_state(&state(false, 0), &entry, &ma, 1_000), Eval::Cold), "unparsed (old warm file): read it");
     }
 
     #[test]
