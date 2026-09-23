@@ -681,6 +681,30 @@ impl TickData {
         v.truncate(max);
         v
     }
+
+    /// The farthest tick a swap instruction's tick arrays cover in the swap
+    /// direction, per venue executor: Raydium-layout venues pass the first
+    /// three initialised arrays ([`Self::arrays_for_swap`]); Orca three
+    /// sequential arrays from the one holding the current tick (shifted one
+    /// spacing up for b→a, as Orca's SDK does); DefiTuna Fusion the current
+    /// array and one neighbour. `None`: no narrower than the loaded range.
+    pub fn swap_tick_bound(&self, layout: TickLayout, tick_current: i32, tick_spacing: i32, a_to_b: bool) -> Option<i32> {
+        let span = layout.ticks_per_array() * tick_spacing.max(1);
+        match layout {
+            TickLayout::Raydium => {
+                let starts = self.arrays_for_swap(layout, tick_current, tick_spacing, a_to_b, 3);
+                (starts.len() == 3).then(|| if a_to_b { starts[2] } else { starts[2] + span - 1 })
+            }
+            TickLayout::Orca => {
+                let first = layout.array_start(tick_current + if a_to_b { 0 } else { tick_spacing }, tick_spacing);
+                Some(if a_to_b { first - 2 * span } else { first + 3 * span - 1 })
+            }
+            TickLayout::Fusion => {
+                let cur = layout.array_start(tick_current, tick_spacing);
+                Some(if a_to_b { cur - span } else { cur + 2 * span - 1 })
+            }
+        }
+    }
 }
 
 /// Discriminator of Byreal's sparse ("dynamic") tick array account, which a
@@ -835,6 +859,8 @@ pub struct WalkResult {
     pub amount_out: u64,
     pub ticks_crossed: u32,
     pub end_sqrt_price_x64: u128,
+    /// Swap steps the program computes (one per fee period or tick range).
+    pub steps: u32,
 }
 
 /// Pool-side inputs of an exact-input swap.
@@ -877,6 +903,14 @@ pub fn swap_exact_in(
 /// covered tick range, liquidity runs out, or the program would error —
 /// never an optimistic number.
 pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amount_in: u64) -> Option<WalkResult> {
+    swap_exact_in_pool_within(pool, ticks, a_to_b, amount_in, None)
+}
+
+/// [`swap_exact_in_pool`] limited to the tick arrays the swap instruction
+/// carries: `bound` is the farthest tick they cover in the swap direction (the
+/// lowest for a→b, the highest for b→a). A swap that would need an array past
+/// it fails on-chain (`NotEnoughTickArrayAccount`), so it is `None` here too.
+pub fn swap_exact_in_pool_within(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amount_in: u64, bound: Option<i32>) -> Option<WalkResult> {
     if amount_in == 0 || pool.sqrt_price_x64 == 0 || pool.fee_ppm as u128 >= FEE_DENOMINATOR_PPM || pool.tick_spacing <= 0 {
         return None;
     }
@@ -891,12 +925,20 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
         (_, false) => ORCA_MAX_SQRT_PRICE_X64,
     };
 
+    // The edge of what the walk may use: the loaded range, narrowed to `bound`.
+    let (edge_lo, edge_hi) = match bound {
+        Some(b) if a_to_b => (ticks.covered_lo.max(b), ticks.covered_hi),
+        Some(b) => (ticks.covered_lo, ticks.covered_hi.min(b)),
+        None => (ticks.covered_lo, ticks.covered_hi),
+    };
+
     let mut remaining = amount_in as u128;
     let mut sqrt_p = pool.sqrt_price_x64;
     let mut tick = pool.tick_current;
     let mut liq = pool.liquidity;
     let mut out: u128 = 0;
     let mut crossed = 0u32;
+    let mut steps = 0u32;
 
     // Index of the next tick to cross in the swap direction.
     let mut idx: isize = if a_to_b {
@@ -909,12 +951,15 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
         if remaining == 0 || sqrt_p == limit {
             break;
         }
-        let next_tick = (idx >= 0 && (idx as usize) < ticks.ticks.len()).then(|| ticks.ticks[idx as usize]);
-        // The next initialised tick, or the edge of what we know (a pseudo
-        // tick the walk must not pass with input left).
+        let next_tick = (idx >= 0 && (idx as usize) < ticks.ticks.len())
+            .then(|| ticks.ticks[idx as usize])
+            .filter(|(t, _)| if a_to_b { *t >= edge_lo } else { *t <= edge_hi });
+        // The next initialised tick, or the edge of the known range / of what
+        // the swap's accounts cover (a pseudo tick the walk must not pass with
+        // input left).
         let (target_tick, net) = match next_tick {
             Some((t, n)) => (t, Some(n)),
-            None => (if a_to_b { ticks.covered_lo } else { ticks.covered_hi.saturating_add(1) }, None),
+            None => (if a_to_b { edge_lo } else { edge_hi.saturating_add(1) }, None),
         };
         let target_tick = target_tick.clamp(MIN_TICK, MAX_TICK);
         let tick_price = layout.sqrt_price_at_tick(target_tick);
@@ -928,6 +973,7 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
             // without one, a single step to the tick.
             let (fee, bounded, skipped) = step_fee.step(pool.fee_ppm, target, liq, spacing, layout, a_to_b);
             let next = if sqrt_p != bounded {
+                steps += 1;
                 if liq == 0 {
                     bounded // no liquidity in this range: the price jumps for free
                 } else {
@@ -985,7 +1031,7 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
     if remaining != 0 {
         return None;
     }
-    Some(WalkResult { amount_out: u64::try_from(out).ok()?, ticks_crossed: crossed, end_sqrt_price_x64: sqrt_p })
+    Some(WalkResult { amount_out: u64::try_from(out).ok()?, ticks_crossed: crossed, end_sqrt_price_x64: sqrt_p, steps })
 }
 
 #[cfg(test)]
@@ -1383,5 +1429,38 @@ mod tests {
         // a slot holding a tick that does not belong at its index is corrupt
         d[48 + 5] = 10;
         assert!(TickLayout::Raydium.parse_array(&d, 10).is_none());
+    }
+
+    #[test]
+    fn walk_stops_at_the_tick_arrays_the_swap_carries() {
+        // price 1, liquidity only up to tick 6_000; a big b→a swap walks far
+        let (l, p) = (1_000_000_000_000u128, Q64);
+        let td = flat(-36_000, 35_999, vec![(-6_000, l as i128), (6_000, -(l as i128))]);
+        let pool = ClmmPool { layout: TickLayout::Raydium, sqrt_price_x64: p, liquidity: l, tick_current: 0, tick_spacing: 60, fee_ppm: 3_000, fee_ext: RaydiumFeeExt::default(), adaptive_fee: None, now: 0 };
+        let small = 1_000_000;
+        let big = 200_000_000_000; // needs the price past tick 3_600
+        assert!(swap_exact_in_pool(&pool, &td, false, big).is_some());
+        // accounts covering only up to tick 3_599: the big swap is refused, a small one is not
+        assert!(swap_exact_in_pool_within(&pool, &td, false, big, Some(3_599)).is_none());
+        assert_eq!(swap_exact_in_pool_within(&pool, &td, false, small, Some(3_599)), swap_exact_in_pool(&pool, &td, false, small));
+        // the bound is directional: an a→b swap is unaffected by an upper one
+        assert!(swap_exact_in_pool_within(&pool, &td, true, small, Some(-3_600)).is_some());
+    }
+
+    #[test]
+    fn swap_tick_bound_follows_each_executor() {
+        let mut td = flat(-60_000, 60_000, vec![]);
+        // Raydium, spacing 10 → span 600; initialised arrays around tick 30
+        td.initialized_arrays = vec![-1_800, -1_200, -600, 0, 1_200, 1_800, 3_000];
+        assert_eq!(td.swap_tick_bound(TickLayout::Raydium, 30, 10, true), Some(-1_200), "0, -600, -1200");
+        assert_eq!(td.swap_tick_bound(TickLayout::Raydium, 30, 10, false), Some(1_800 + 599), "0, 1200, 1800");
+        td.initialized_arrays = vec![0, 1_200];
+        assert_eq!(td.swap_tick_bound(TickLayout::Raydium, 30, 10, false), None, "fewer than 3: the loaded range bounds it");
+        // Orca, spacing 4 → span 352; b→a starts one spacing up
+        assert_eq!(td.swap_tick_bound(TickLayout::Orca, 100, 4, true), Some(0 - 2 * 352));
+        assert_eq!(td.swap_tick_bound(TickLayout::Orca, 350, 4, false), Some(352 + 3 * 352 - 1), "tick 350 + 4 lives in the next array");
+        // Fusion: current array and one neighbour
+        assert_eq!(td.swap_tick_bound(TickLayout::Fusion, 100, 4, true), Some(-352));
+        assert_eq!(td.swap_tick_bound(TickLayout::Fusion, 100, 4, false), Some(2 * 352 - 1));
     }
 }

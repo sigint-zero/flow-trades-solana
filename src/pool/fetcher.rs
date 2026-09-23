@@ -308,6 +308,7 @@ fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     if data.len() < 8 + 1 + 7 * 32 {
         return Err(TradeError::Execution("raydium clmm account too small".into()));
     }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
     let off = 8;
     // bump at off, skip 2 bytes (bump + padding)
     let amm_config = read_pubkey(data, off + 1)?;
@@ -1493,6 +1494,7 @@ fn parse_byreal(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolS
     if data[..8] != BYREAL_POOL_DISCRIMINATOR {
         return Err(TradeError::Execution(format!("byreal: {pool_address} is not a pool state")));
     }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
     let amm_config = read_pubkey(data, 9)?;
     let token_mint_a = read_pubkey(data, 73)?;
     let token_mint_b = read_pubkey(data, 105)?;
@@ -1629,6 +1631,7 @@ fn parse_pancakeswap(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
     if data.len() < 273 {
         return Err(TradeError::Execution("pancakeswap pool too small".into()));
     }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
     let amm_config = read_pubkey(data, 9)?;
     let token_mint_a = read_pubkey(data, 73)?;
     let token_mint_b = read_pubkey(data, 105)?;

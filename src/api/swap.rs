@@ -131,9 +131,17 @@ pub async fn handle_swap(
         return Err(oversize_v0(v0_len));
     }
 
-    // Optionally simulate the transaction
+    // Optionally simulate the transaction. Without a caller-set limit the
+    // simulation runs at the transaction maximum, so it measures what the swap
+    // needs (sized below) instead of failing at the default.
     let simulation = if should_simulate {
-        match simulate_versioned(&state.rpc, &vtx).await {
+        let sim_vtx = if req.compute_limit.is_none() {
+            let max = TxBuildConfig { compute_unit_limit: MAX_COMPUTE_UNITS, ..tx_config.clone() };
+            build_unsigned_versioned_tx(&swap_ixs, &user_pubkey, &max, blockhash, &alt_tables)?
+        } else {
+            vtx.clone()
+        };
+        match simulate_versioned(&state.rpc, &sim_vtx).await {
             Ok(sim) => {
                 // If user didn't set an explicit compute_limit, use simulated CU + headroom
                 if req.compute_limit.is_none() && sim.success && sim.units_consumed > 0 {
@@ -227,7 +235,14 @@ async fn handle_swap_v1(
     let mut tx_bytes = encode_unsigned_v1(&instructions, user_pubkey, blockhash, budget(&tx_config))?;
 
     let simulation = if should_simulate {
-        match simulate_raw(&state.rpc, &tx_bytes).await {
+        // at the transaction maximum unless the caller set a limit (see v0)
+        let sim_bytes = if req.compute_limit.is_none() {
+            let max = TxBuildConfig { compute_unit_limit: MAX_COMPUTE_UNITS, ..tx_config.clone() };
+            encode_unsigned_v1(&instructions, user_pubkey, blockhash, budget(&max))?
+        } else {
+            tx_bytes.clone()
+        };
+        match simulate_raw(&state.rpc, &sim_bytes).await {
             Ok(sim) => {
                 if req.compute_limit.is_none() && sim.success && sim.units_consumed > 0 {
                     tx_config.compute_unit_limit = cu_with_headroom(sim.units_consumed);
@@ -310,9 +325,10 @@ pub(crate) async fn build_swap_from_quote(
     } else {
         400_000
     };
-    // A Meteora DLMM hop's cost grows with the bins it walks (a full array is
-    // ≈ 0.5M CU): budget the walk its quote made.
-    let compute_limit = if req.compute_limit.is_none() { compute_limit.max(dlmm_route_compute_units(quote)) } else { compute_limit };
+    // A Meteora DLMM or CLMM hop's cost grows with the bins / tick ranges it
+    // walks (half a million CU and more on a long walk): budget the walk its
+    // quote made.
+    let compute_limit = if req.compute_limit.is_none() { compute_limit.max(walk_route_compute_units(state, quote)) } else { compute_limit };
 
     let tx_config = TxBuildConfig {
         compute_unit_limit: compute_limit,
@@ -337,24 +353,28 @@ pub(crate) async fn build_swap_from_quote(
     Ok((swap_ixs, tx_config, user_pubkey))
 }
 
-/// Compute units for a route with Meteora DLMM hops: each DLMM hop's own
-/// estimate (`quote::dlmm::estimate_compute_units`) plus 200k per other hop,
-/// capped at the 1.4M transaction maximum. 0 when no hop is DLMM.
-fn dlmm_route_compute_units(quote: &QuoteResponse) -> u32 {
+/// Compute units for a route with Meteora DLMM or CLMM hops: each such hop's
+/// estimate from its own walk (`quote::dlmm::estimate_compute_units`,
+/// `Quoter::clmm_compute_units`) plus 200k per other hop, capped at the 1.4M
+/// transaction maximum. 0 when no hop walks.
+fn walk_route_compute_units(state: &AppState, quote: &QuoteResponse) -> u32 {
     let mut total: u32 = 0;
     let mut any = false;
     for r in &quote.routes {
-        let est = (r.pool.dex == "Meteora DLMM")
-            .then(|| {
-                let pool = Pubkey::from_str(&r.pool.pool_address).ok()?;
-                let input = Pubkey::from_str(&r.pool.input_token).ok()?;
-                crate::quote::dlmm::estimate_compute_units(&pool, &input, r.pool.amount_in.parse().ok()?)
-            })
-            .flatten();
+        let est = (|| {
+            let pool = Pubkey::from_str(&r.pool.pool_address).ok()?;
+            let input = Pubkey::from_str(&r.pool.input_token).ok()?;
+            let amount: u64 = r.pool.amount_in.parse().ok()?;
+            match r.pool.dex.as_str() {
+                "Meteora DLMM" => crate::quote::dlmm::estimate_compute_units(&pool, &input, amount),
+                "Raydium CLMM" | "PancakeSwap" | "Orca" | "Byreal" | "DefiTuna Fusion" => state.quoter.clmm_compute_units(&pool, &input, amount),
+                _ => None,
+            }
+        })();
         any |= est.is_some();
         total = total.saturating_add(est.unwrap_or(200_000));
     }
-    if any { total.min(1_400_000) } else { 0 }
+    if any { total.min(MAX_COMPUTE_UNITS) } else { 0 }
 }
 
 /// Wrap ALL swap instructions in the flow-router CPI for on-chain fee enforcement.
@@ -515,6 +535,9 @@ async fn fee_ata_exists(state: &AppState, ata: &Pubkey) -> bool {
 
 /// Solana's transaction size limit (one IPv6 MTU packet).
 pub const MAX_TX_BYTES: usize = 1232;
+
+/// Compute-unit ceiling of one transaction.
+const MAX_COMPUTE_UNITS: u32 = 1_400_000;
 
 /// Pool state for swap building: cache hit, else RPC fetch + cache. For a
 /// pump.fun AMM pool whose buyback remaining-accounts are still unresolved

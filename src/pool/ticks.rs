@@ -47,8 +47,55 @@ pub struct TickFetchPlan {
     pub keys: Vec<Pubkey>,
     pub extension: Option<Pubkey>,
     pub oracle: Option<Pubkey>,
+    /// The tick range the fetched arrays make fully known, when it is wider
+    /// than `starts` (bitmap plans: unset arrays in between are empty).
+    pub covered: Option<(i32, i32)>,
     /// The pool state, when its fee needs the Byreal accounts above.
     pub dyn_fee_state: Option<PoolState>,
+}
+
+/// Raydium-layout pools' `tick_array_bitmap` ([u64; 16] at pool offset 904:
+/// bit i ↔ tick array index i − 512), recorded by the pool parsers. Lets tick
+/// loading go straight to the initialised arrays, however far from the price
+/// they are (a sparse pool may have none within ±3 arrays).
+pub static TICK_BITMAPS: std::sync::LazyLock<dashmap::DashMap<Pubkey, [u64; 16]>> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+pub fn record_tick_bitmap(pool: &Pubkey, data: &[u8]) {
+    if let Some(b) = data.get(904..1032) {
+        let mut words = [0u64; 16];
+        for (w, c) in words.iter_mut().zip(b.chunks_exact(8)) {
+            *w = u64::from_le_bytes(c.try_into().unwrap());
+        }
+        TICK_BITMAPS.insert(*pool, words);
+    }
+}
+
+/// From the bitmap: the start indices of up to `ARRAYS_EACH_SIDE` initialised
+/// arrays at or below / at or above the current one, and the tick range they
+/// make fully known (arrays whose bit is clear are empty). `None` when the
+/// current array lies outside the bitmap (its extension covers it) or nothing
+/// is initialised.
+fn bitmap_plan(bitmap: &[u64; 16], cur: i32, span: i32) -> Option<(Vec<i32>, i32, i32)> {
+    let cur_idx = cur.div_euclid(span);
+    if !(-512..512).contains(&cur_idx) {
+        return None;
+    }
+    let set = |i: i32| {
+        let b = (i + 512) as usize;
+        bitmap[b / 64] >> (b % 64) & 1 == 1
+    };
+    let n = ARRAYS_EACH_SIDE as usize;
+    let below: Vec<i32> = (-512..=cur_idx).rev().filter(|i| set(*i)).take(n).collect();
+    let above: Vec<i32> = (cur_idx..512).filter(|i| set(*i)).take(n).collect();
+    if below.is_empty() && above.is_empty() {
+        return None;
+    }
+    let lo_idx = if below.len() == n { *below.last().unwrap() } else { -512 };
+    let hi_idx = if above.len() == n { *above.last().unwrap() } else { 511 };
+    let mut starts: Vec<i32> = below.iter().chain(above.iter()).map(|i| i * span).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    Some((starts, lo_idx * span, hi_idx * span + span - 1))
 }
 
 pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
@@ -56,7 +103,17 @@ pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
     let spacing = tick_spacing.max(1);
     let span = layout.ticks_per_array() * spacing;
     let cur = layout.array_start(tick_current, spacing);
-    let starts: Vec<i32> = (-ARRAYS_EACH_SIDE..=ARRAYS_EACH_SIDE).map(|k| cur + k * span).collect();
+    // Raydium layout: the initialised arrays the program will walk, from the
+    // pool's bitmap; otherwise (Orca layouts, price beyond the bitmap) the
+    // window of ±ARRAYS_EACH_SIDE arrays around the price.
+    let from_bitmap = match layout {
+        TickLayout::Raydium => TICK_BITMAPS.get(&pool).and_then(|b| bitmap_plan(&b, cur, span)),
+        _ => None,
+    };
+    let (starts, covered) = match from_bitmap {
+        Some((starts, lo, hi)) => (starts, Some((lo, hi))),
+        None => ((-ARRAYS_EACH_SIDE..=ARRAYS_EACH_SIDE).map(|k| cur + k * span).collect(), None),
+    };
     let mut keys: Vec<Pubkey> = starts.iter().map(|s| layout.array_pda(&program, &pool, *s)).collect();
     let extension = matches!(layout, TickLayout::Raydium).then(|| bitmap_extension_pda(&program, &pool));
     if let Some(e) = extension {
@@ -71,7 +128,7 @@ pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
     if let Some(k) = dyn_keys {
         keys.extend(k);
     }
-    Some(TickFetchPlan { layout, pool, span, spacing, starts, keys, extension, oracle, dyn_fee_state: dyn_keys.map(|_| state.clone()) })
+    Some(TickFetchPlan { layout, pool, span, spacing, starts, covered, keys, extension, oracle, dyn_fee_state: dyn_keys.map(|_| state.clone()) })
 }
 
 /// Build `TickData` from the accounts fetched for `plan.keys` (same order) and
@@ -115,8 +172,8 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
     }
     let data = Arc::new(TickData {
         ticks,
-        covered_lo: plan.starts[0],
-        covered_hi: plan.starts[plan.starts.len() - 1] + plan.span - 1,
+        covered_lo: plan.covered.map_or(plan.starts[0], |c| c.0),
+        covered_hi: plan.covered.map_or(plan.starts[plan.starts.len() - 1] + plan.span - 1, |c| c.1),
         initialized_arrays,
         bitmap_extension,
         limit_orders,
@@ -196,6 +253,30 @@ pub async fn clmm_config_fee_ppm(rpc: &RpcClient, config: &Pubkey, expect_tick_s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_plan_reaches_far_initialised_arrays() {
+        // Raydium, spacing 10 → span 600; array index i ↔ bit i + 512
+        let span = 600;
+        let mut bm = [0u64; 16];
+        let mut set = |i: i32| {
+            let b = (i + 512) as usize;
+            bm[b / 64] |= 1 << (b % 64);
+        };
+        // sparse pool: nothing within ±3 arrays of index 0, arrays far out both ways
+        for i in [-40, -25, -10, 12, 30, 300] {
+            set(i);
+        }
+        let (starts, lo, hi) = bitmap_plan(&bm, 0, span).unwrap();
+        assert_eq!(starts, vec![-40 * span, -25 * span, -10 * span, 12 * span, 30 * span, 300 * span]);
+        assert_eq!((lo, hi), (-40 * span, 300 * span + span - 1), "three initialised each way; the gaps are known empty");
+        // fewer than three below: the known range runs to the bitmap's edge
+        let (_, lo, _) = bitmap_plan(&bm, -30 * span, span).unwrap();
+        assert_eq!(lo, -512 * span);
+        // beyond the bitmap (extension range) or nothing set: the window plan instead
+        assert!(bitmap_plan(&bm, 600 * span, span).is_none());
+        assert!(bitmap_plan(&[0u64; 16], 0, span).is_none());
+    }
 
     #[test]
     fn raydium_style_pdas_match_the_known_derivation() {

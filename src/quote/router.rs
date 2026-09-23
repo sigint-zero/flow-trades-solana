@@ -70,6 +70,33 @@ fn is_constant_product(pool_type: PoolType) -> bool {
     )
 }
 
+/// Why a CLMM pool gave no exact walk.
+enum ClmmWalkError {
+    /// Its ticks are not in memory yet.
+    NotLoaded,
+    /// No swap of this size can execute (no liquidity, fee inputs missing,
+    /// beyond the tick arrays or the compute budget one transaction carries).
+    Unquotable,
+}
+
+/// A CLMM swap's compute units, whole transaction included (compute budget,
+/// account setup, the router): a fixed part plus the program's cost per swap
+/// step (one per tick range, or per fee period on dynamic / adaptive-fee
+/// pools), with a margin over the programs' costs: Raydium CLMM ≈ 96k + 10k
+/// per step, Byreal ≈ 114k + 19k, Orca ≈ 88k + 8.3k (adaptive fee).
+pub fn clmm_swap_compute_units(pool_type: PoolType, steps: u32) -> u32 {
+    let per_step = match pool_type {
+        PoolType::Byreal => 20_000,
+        PoolType::Orca => 9_000,
+        _ => 11_000,
+    };
+    150_000u32.saturating_add(per_step * steps.saturating_sub(1))
+}
+
+/// A single CLMM hop longer than this cannot share one transaction's 1.4M
+/// compute units with the router and account setup; it is not quoted.
+const CLMM_MAX_SWAP_CU: u32 = 1_200_000;
+
 /// Pool types that use CLMM (concentrated liquidity) math.
 fn is_clmm(pool_type: PoolType) -> bool {
     matches!(
@@ -553,52 +580,72 @@ impl Quoter {
         r.unwrap_or(Eval::Cold)
     }
 
+    /// Exact tick walk of a CLMM pool for an exact-input swap, over the tick
+    /// arrays in memory and no further than the swap instruction can carry.
+    /// `NotLoaded`: the ticks are not in memory (the cold path loads them).
+    fn clmm_walk(&self, state: &PoolState, pool_type: PoolType, address: &Pubkey, input_mint: &Pubkey, amount: u64) -> Result<(clmm::WalkResult, u32, crate::quote::math::ClmmParams), ClmmWalkError> {
+        let params = match extract_clmm_params(state, input_mint) {
+            Some(p) if p.sqrt_price_x64 > 0 => p,
+            _ => return Err(ClmmWalkError::Unquotable),
+        };
+        // Exact tick walk when the pool's tick arrays are in memory; without
+        // them the only honest answer is "not yet". The single-range
+        // approximation over-quotes as soon as a swap crosses into thinner
+        // liquidity, so it is never used.
+        let (layout, _, _, tick_current, tick_spacing) = crate::pool::ticks::tick_source(state).ok_or(ClmmWalkError::Unquotable)?;
+        let ticks = match clmm::TICKS.get(address) {
+            Some(t) if t.fetched_at.elapsed() <= self.cache.ttl() => Arc::clone(&t),
+            _ => return Err(ClmmWalkError::NotLoaded),
+        };
+        // Byreal dynamic-fee pools: a per-swap rate from vaults + oracle prices
+        let fee_ppm = match super::byreal_fee::swap_fee_ppm(state, address, params.a_to_b, amount, params.fee_ppm) {
+            super::byreal_fee::SwapFee::Base => params.fee_ppm,
+            super::byreal_fee::SwapFee::Rate(r) => r,
+            super::byreal_fee::SwapFee::Unavailable => return Err(ClmmWalkError::Unquotable),
+        };
+        let fee_ext = match state {
+            PoolState::RaydiumClmm { fee_ext, .. } => *fee_ext,
+            _ => Default::default(),
+        };
+        let pool = clmm::ClmmPool {
+            layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext,
+            adaptive_fee: ticks.adaptive_fee, now: crate::stream::chain_unix_time(),
+        };
+        // no further than the tick arrays the swap instruction will carry
+        let bound = ticks.swap_tick_bound(layout, tick_current, tick_spacing, params.a_to_b);
+        match clmm::swap_exact_in_pool_within(&pool, &ticks, params.a_to_b, amount, bound) {
+            // a walk too long to fit one transaction's compute budget fails on-chain
+            Some(r) if r.amount_out > 0 && clmm_swap_compute_units(pool_type, r.steps) <= CLMM_MAX_SWAP_CU => Ok((r, fee_ppm, params)),
+            _ => Err(ClmmWalkError::Unquotable),
+        }
+    }
+
+    /// Compute units the swap of `amount` on CLMM pool `address` will need,
+    /// from its walk over the ticks in memory. `None` when it cannot be walked.
+    pub fn clmm_compute_units(&self, address: &Pubkey, input_mint: &Pubkey, amount: u64) -> Option<u32> {
+        let pool_type = self.registry.get(address)?.pool_type;
+        self.cache
+            .with_state(address, |state, _| self.clmm_walk(state, pool_type, address, input_mint, amount).ok())
+            .flatten()
+            .map(|(walk, _, _)| clmm_swap_compute_units(pool_type, walk.steps))
+    }
+
     /// Pure pricing of a pool state. CLMM venues use their inline sqrt-price /
     /// liquidity; constant-product venues use mirrored vault balances (fed by
     /// every block) and fall back to the reserves inline in the state.
     fn quote_state(&self, state: &PoolState, entry: &PoolEntry, input_mint: &Pubkey, amount: u64) -> Eval {
         if is_clmm(entry.pool_type) {
-            let params = match extract_clmm_params(state, input_mint) {
-                Some(p) if p.sqrt_price_x64 > 0 => p,
-                _ => return Eval::Quoted(None),
-            };
-            // Exact tick walk when the pool's tick arrays are in memory;
-            // without them the only honest answer is "not yet" (the cold path
-            // loads them). The single-range approximation over-quotes as soon
-            // as a swap crosses into thinner liquidity, so it is never used.
-            let (layout, _, _, tick_current, tick_spacing) = match crate::pool::ticks::tick_source(state) {
-                Some(t) => t,
-                None => return Eval::Quoted(None),
-            };
-            let ticks = match clmm::TICKS.get(&entry.address) {
-                Some(t) if t.fetched_at.elapsed() <= self.cache.ttl() => Arc::clone(&t),
-                _ => return Eval::Cold,
-            };
-            // Byreal dynamic-fee pools: a per-swap rate from vaults + oracle prices
-            let fee_ppm = match super::byreal_fee::swap_fee_ppm(state, &entry.address, params.a_to_b, amount, params.fee_ppm) {
-                super::byreal_fee::SwapFee::Base => params.fee_ppm,
-                super::byreal_fee::SwapFee::Rate(r) => r,
-                super::byreal_fee::SwapFee::Unavailable => return Eval::Quoted(None),
-            };
-            let fee_ext = match state {
-                PoolState::RaydiumClmm { fee_ext, .. } => *fee_ext,
-                _ => Default::default(),
-            };
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let pool = clmm::ClmmPool {
-                layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext,
-                adaptive_fee: ticks.adaptive_fee, now,
-            };
-            let out = match clmm::swap_exact_in_pool(&pool, &ticks, params.a_to_b, amount) {
-                Some(r) if r.amount_out > 0 => r.amount_out,
-                _ => return Eval::Quoted(None),
+            let (walk, fee_ppm, params) = match self.clmm_walk(state, entry.pool_type, &entry.address, input_mint, amount) {
+                Ok(w) => w,
+                Err(ClmmWalkError::NotLoaded) => return Eval::Cold,
+                Err(ClmmWalkError::Unquotable) => return Eval::Quoted(None),
             };
             let fee_amount = (amount as u128 * fee_ppm as u128).div_ceil(clmm::FEE_DENOMINATOR_PPM) as u64;
             let q64: u128 = 1u128 << 64;
             let reserve_a = params.liquidity.saturating_mul(q64) / params.sqrt_price_x64.max(1);
             let reserve_b = params.liquidity.saturating_mul(params.sqrt_price_x64) / q64.max(1);
             let (reserve_in, reserve_out) = if params.a_to_b { (reserve_a, reserve_b) } else { (reserve_b, reserve_a) };
-            return Eval::Quoted(Some((out, fee_amount, reserve_in, reserve_out)));
+            return Eval::Quoted(Some((walk.amount_out, fee_amount, reserve_in, reserve_out)));
         }
 
         if let PoolState::PumpFunAmm { pool_base_vault, pool_quote_vault, base_reserve, quote_reserve, .. } = state {
@@ -1967,6 +2014,21 @@ mod tests {
         assert_eq!(v_b, vb);
         assert_eq!(m_a, ma);
         assert_eq!(m_b, mb);
+    }
+
+    #[test]
+    fn clmm_compute_estimate_covers_mainnet_swaps() {
+        // (venue, swap steps, compute units the whole routed transaction used), mainnet simulations
+        for (pt, steps, used) in [
+            (PoolType::RaydiumCl, 1, 110_199), (PoolType::RaydiumCl, 7, 155_095), (PoolType::RaydiumCl, 34, 425_906),
+            (PoolType::Byreal, 1, 146_945), (PoolType::Byreal, 4, 170_788), (PoolType::Byreal, 16, 395_808),
+            (PoolType::Orca, 3, 94_702), (PoolType::Orca, 13, 177_239), (PoolType::Orca, 55, 525_426), (PoolType::Orca, 37, 325_283),
+            (PoolType::PancakeSwap, 1, 129_046), (PoolType::DefiTunaFusion, 1, 114_420),
+        ] {
+            let est = clmm_swap_compute_units(pt, steps);
+            assert!(est >= used, "{pt:?} {steps} steps: {est} < {used}");
+            assert!(est < used * 2 + 50_000, "{pt:?} {steps} steps: {est} is far above {used}");
+        }
     }
 
     #[test]
