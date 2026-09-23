@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 
-use crate::constants::{SOL_NATIVE_MINT, TOKEN_PROGRAM_ID};
+use crate::constants::{SOL_NATIVE_MINT, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
 use crate::error::{TradeError, TradeResult};
 use crate::execution::amms::AmmExecutorType;
-use crate::execution::router::wrap_swap;
+use crate::execution::router::{wrap_swap, RouterConfig};
 use crate::execution::simulator::{simulate_versioned, cu_with_headroom};
 use crate::execution::tx_builder::{build_unsigned_versioned_tx, TxBuildConfig};
 use crate::pool::fetcher::{ensure_pamm_fee_accounts, fetch_pool_state, refresh_pamm_reserves};
@@ -372,6 +372,7 @@ async fn wrap_in_router(
     let input_tp = get_token_program(state, &input_mint).await?;
     let output_tp = get_token_program(state, &output_mint).await?;
     let fee_tp = output_tp;
+    check_fee_transferable(state, router, &output_mint, output_tp).await?;
 
     let user_input_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
         user, &input_mint, &input_tp,
@@ -459,6 +460,25 @@ async fn wrap_in_router(
         swap: vec![router_ix],
         cleanup: ixs.cleanup,
     })
+}
+
+/// The router moves its fee out of the user's output account after the swap
+/// and passes no transfer-hook accounts: an output mint whose transfer hook
+/// has a program set cannot pay that fee, so the route is refused up front.
+async fn check_fee_transferable(state: &AppState, router: &RouterConfig, output_mint: &Pubkey, output_tp: Pubkey) -> TradeResult<()> {
+    if router.fee_bps == 0 || output_tp != TOKEN_2022_PROGRAM_ID {
+        return Ok(());
+    }
+    if !crate::pool::mints::is_known(output_mint) {
+        crate::pool::mints::ensure_mint_info(&state.rpc, &[*output_mint]).await;
+    }
+    if crate::pool::mints::has_transfer_hook(output_mint) {
+        return Err(TradeError::Validation(format!(
+            "output mint {output_mint} has a Token-2022 transfer hook; the router cannot pass the hook's \
+             accounts when it collects its fee from the output"
+        )));
+    }
+    Ok(())
 }
 
 /// True when the fee ATA exists on-chain. Positive results are cached for the
