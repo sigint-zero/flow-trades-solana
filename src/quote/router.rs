@@ -59,15 +59,43 @@ fn is_constant_product(pool_type: PoolType) -> bool {
             | PoolType::Dooar
             | PoolType::PumpupBonding
             | PoolType::Pumpup
+            | PoolType::FluxBeam
         // NOT here, quoted with their own math in `quote_state`: Meteora DAMM v2
-        // (single-range sqrt-price curve, `quote::damm_v2`), Raydium LaunchLab
+        // (single-range sqrt-price curve, `quote::damm_v2`), Meteora DLMM (bin
+        // walk, `quote::dlmm`), Raydium LaunchLab
         // (virtual-reserve bonding curve, `quote::launchlab`), Meteora Standard
         // (LP share of dynamic vaults, `quote::meteora_std`), every CLMM venue
-        // (`quote::clmm` tick walk). FluxBeam (transfer-fee Token-2022 pairs)
-        // is streamed but not quoted: constant product on its vault balances
-        // over-quotes and the program reverts on its own slippage check.
+        // (`quote::clmm` tick walk), pump.fun bonding (`quote::pump_bonding`)
+        // and Meteora DBC (`quote::dbc`).
     )
 }
+
+/// Why a CLMM pool gave no exact walk.
+enum ClmmWalkError {
+    /// Its ticks are not in memory yet.
+    NotLoaded,
+    /// No swap of this size can execute (no liquidity, fee inputs missing,
+    /// beyond the tick arrays or the compute budget one transaction carries).
+    Unquotable,
+}
+
+/// A CLMM swap's compute units, whole transaction included (compute budget,
+/// account setup, the router): a fixed part plus the program's cost per swap
+/// step (one per tick range, or per fee period on dynamic / adaptive-fee
+/// pools), with a margin over the programs' costs: Raydium CLMM ≈ 96k + 10k
+/// per step, Byreal ≈ 114k + 19k, Orca ≈ 88k + 8.3k (adaptive fee).
+pub fn clmm_swap_compute_units(pool_type: PoolType, steps: u32) -> u32 {
+    let per_step = match pool_type {
+        PoolType::Byreal => 20_000,
+        PoolType::Orca => 9_000,
+        _ => 11_000,
+    };
+    150_000u32.saturating_add(per_step * steps.saturating_sub(1))
+}
+
+/// A single CLMM hop longer than this cannot share one transaction's 1.4M
+/// compute units with the router and account setup; it is not quoted.
+const CLMM_MAX_SWAP_CU: u32 = 1_200_000;
 
 /// Pool types that use CLMM (concentrated liquidity) math.
 fn is_clmm(pool_type: PoolType) -> bool {
@@ -83,7 +111,7 @@ fn is_clmm(pool_type: PoolType) -> bool {
 
 /// Check if a pool type is quotable (constant product or CLMM).
 fn is_quotable(pool_type: PoolType) -> bool {
-    is_constant_product(pool_type) || is_clmm(pool_type) || matches!(pool_type, PoolType::MeteoraDamm | PoolType::RaydiumLp | PoolType::Meteora)
+    is_constant_product(pool_type) || is_clmm(pool_type) || matches!(pool_type, PoolType::MeteoraDamm | PoolType::RaydiumLp | PoolType::Meteora | PoolType::MeteoraDlmm | PoolType::PumpFun | PoolType::MeteoraDbc)
 }
 
 /// Get the label for a pool type from the program_id_to_label mapping.
@@ -295,7 +323,8 @@ impl Quoter {
         let best_two_hop = two_hop_routes.iter().max_by_key(|r| r.final_amount_out);
         let best_three_hop = three_hop_routes.iter().max_by_key(|r| r.final_amount_out);
 
-        let context_slot: u64 = 0;
+        // Last block the stream has seen (0 until the first one arrives).
+        let context_slot = crate::stream::latest_slot();
         let elapsed = start.elapsed().as_secs_f64() * 1000.0; // milliseconds
 
         // Find the overall best output amount
@@ -313,15 +342,17 @@ impl Quoter {
             });
         }
 
-        if max_out == split_out {
-            if let Some(ref split) = best_split {
-                return Ok(self.build_split_response(req, split, context_slot, elapsed));
+        // On equal output the route with fewer hops wins: fewer accounts,
+        // compute units and pools that can move before it lands.
+        if max_out == direct_out {
+            if let Some(direct) = best_direct {
+                return Ok(self.build_direct_response(req, direct, context_slot, elapsed));
             }
         }
 
-        if max_out == three_hop_out {
-            if let Some(three_hop) = best_three_hop {
-                return Ok(self.build_three_hop_response(req, three_hop, context_slot, elapsed));
+        if max_out == split_out {
+            if let Some(ref split) = best_split {
+                return Ok(self.build_split_response(req, split, context_slot, elapsed));
             }
         }
 
@@ -331,8 +362,10 @@ impl Quoter {
             }
         }
 
-        if let Some(direct) = best_direct {
-            return Ok(self.build_direct_response(req, direct, context_slot, elapsed));
+        if max_out == three_hop_out {
+            if let Some(three_hop) = best_three_hop {
+                return Ok(self.build_three_hop_response(req, three_hop, context_slot, elapsed));
+            }
         }
 
         Err(TradeError::NoRoute {
@@ -547,37 +580,72 @@ impl Quoter {
         r.unwrap_or(Eval::Cold)
     }
 
+    /// Exact tick walk of a CLMM pool for an exact-input swap, over the tick
+    /// arrays in memory and no further than the swap instruction can carry.
+    /// `NotLoaded`: the ticks are not in memory (the cold path loads them).
+    fn clmm_walk(&self, state: &PoolState, pool_type: PoolType, address: &Pubkey, input_mint: &Pubkey, amount: u64) -> Result<(clmm::WalkResult, u32, crate::quote::math::ClmmParams), ClmmWalkError> {
+        let params = match extract_clmm_params(state, input_mint) {
+            Some(p) if p.sqrt_price_x64 > 0 => p,
+            _ => return Err(ClmmWalkError::Unquotable),
+        };
+        // Exact tick walk when the pool's tick arrays are in memory; without
+        // them the only honest answer is "not yet". The single-range
+        // approximation over-quotes as soon as a swap crosses into thinner
+        // liquidity, so it is never used.
+        let (layout, _, _, tick_current, tick_spacing) = crate::pool::ticks::tick_source(state).ok_or(ClmmWalkError::Unquotable)?;
+        let ticks = match clmm::TICKS.get(address) {
+            Some(t) if t.fetched_at.elapsed() <= self.cache.ttl() => Arc::clone(&t),
+            _ => return Err(ClmmWalkError::NotLoaded),
+        };
+        // Byreal dynamic-fee pools: a per-swap rate from vaults + oracle prices
+        let fee_ppm = match super::byreal_fee::swap_fee_ppm(state, address, params.a_to_b, amount, params.fee_ppm) {
+            super::byreal_fee::SwapFee::Base => params.fee_ppm,
+            super::byreal_fee::SwapFee::Rate(r) => r,
+            super::byreal_fee::SwapFee::Unavailable => return Err(ClmmWalkError::Unquotable),
+        };
+        let fee_ext = match state {
+            PoolState::RaydiumClmm { fee_ext, .. } => *fee_ext,
+            _ => Default::default(),
+        };
+        let pool = clmm::ClmmPool {
+            layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext,
+            adaptive_fee: ticks.adaptive_fee, now: crate::stream::chain_unix_time(),
+        };
+        // no further than the tick arrays the swap instruction will carry
+        let bound = ticks.swap_tick_bound(layout, tick_current, tick_spacing, params.a_to_b);
+        match clmm::swap_exact_in_pool_within(&pool, &ticks, params.a_to_b, amount, bound) {
+            // a walk too long to fit one transaction's compute budget fails on-chain
+            Some(r) if r.amount_out > 0 && clmm_swap_compute_units(pool_type, r.steps) <= CLMM_MAX_SWAP_CU => Ok((r, fee_ppm, params)),
+            _ => Err(ClmmWalkError::Unquotable),
+        }
+    }
+
+    /// Compute units the swap of `amount` on CLMM pool `address` will need,
+    /// from its walk over the ticks in memory. `None` when it cannot be walked.
+    pub fn clmm_compute_units(&self, address: &Pubkey, input_mint: &Pubkey, amount: u64) -> Option<u32> {
+        let pool_type = self.registry.get(address)?.pool_type;
+        self.cache
+            .with_state(address, |state, _| self.clmm_walk(state, pool_type, address, input_mint, amount).ok())
+            .flatten()
+            .map(|(walk, _, _)| clmm_swap_compute_units(pool_type, walk.steps))
+    }
+
     /// Pure pricing of a pool state. CLMM venues use their inline sqrt-price /
     /// liquidity; constant-product venues use mirrored vault balances (fed by
     /// every block) and fall back to the reserves inline in the state.
     fn quote_state(&self, state: &PoolState, entry: &PoolEntry, input_mint: &Pubkey, amount: u64) -> Eval {
         if is_clmm(entry.pool_type) {
-            let params = match extract_clmm_params(state, input_mint) {
-                Some(p) if p.sqrt_price_x64 > 0 => p,
-                _ => return Eval::Quoted(None),
+            let (walk, fee_ppm, params) = match self.clmm_walk(state, entry.pool_type, &entry.address, input_mint, amount) {
+                Ok(w) => w,
+                Err(ClmmWalkError::NotLoaded) => return Eval::Cold,
+                Err(ClmmWalkError::Unquotable) => return Eval::Quoted(None),
             };
-            // Exact tick walk when the pool's tick arrays are in memory;
-            // without them the only honest answer is "not yet" (the cold path
-            // loads them). The single-range approximation over-quotes as soon
-            // as a swap crosses into thinner liquidity, so it is never used.
-            let (tick_current, _tick_spacing) = match clmm_tick_pos(state) {
-                Some(t) => t,
-                None => return Eval::Quoted(None),
-            };
-            let ticks = match clmm::TICKS.get(&entry.address) {
-                Some(t) if t.fetched_at.elapsed() <= self.cache.ttl() => Arc::clone(&t),
-                _ => return Eval::Cold,
-            };
-            let out = match clmm::swap_exact_in(params.sqrt_price_x64, params.liquidity, tick_current, params.fee_ppm, &ticks, params.a_to_b, amount) {
-                Some(r) if r.amount_out > 0 => r.amount_out,
-                _ => return Eval::Quoted(None),
-            };
-            let fee_amount = (amount as u128 * params.fee_ppm as u128).div_ceil(clmm::FEE_DENOMINATOR_PPM) as u64;
+            let fee_amount = (amount as u128 * fee_ppm as u128).div_ceil(clmm::FEE_DENOMINATOR_PPM) as u64;
             let q64: u128 = 1u128 << 64;
             let reserve_a = params.liquidity.saturating_mul(q64) / params.sqrt_price_x64.max(1);
             let reserve_b = params.liquidity.saturating_mul(params.sqrt_price_x64) / q64.max(1);
             let (reserve_in, reserve_out) = if params.a_to_b { (reserve_a, reserve_b) } else { (reserve_b, reserve_a) };
-            return Eval::Quoted(Some((out, fee_amount, reserve_in, reserve_out)));
+            return Eval::Quoted(Some((walk.amount_out, fee_amount, reserve_in, reserve_out)));
         }
 
         if let PoolState::PumpFunAmm { pool_base_vault, pool_quote_vault, base_reserve, quote_reserve, .. } = state {
@@ -602,10 +670,17 @@ impl Quoter {
 
         if let PoolState::Meteora { token_a_mint, token_b_mint, reserves, .. } = state {
             let a_to_b = if input_mint == token_a_mint { true } else if input_mint == token_b_mint { false } else { return Eval::Quoted(None) };
+            // A parsed stable-swap pool is not quoted: answer now rather than
+            // paying a cold vault read on every quote (its reserves are never
+            // computed, so it would look unloaded forever).
+            if !reserves.constant_product && reserves.trade_fee_denominator != 0 {
+                return Eval::Quoted(None);
+            }
             if reserves.computed_at == 0 {
                 return Eval::Cold; // reserves never computed (old warm file)
             }
-            return Eval::Quoted(super::meteora_std::swap_exact_in(reserves, a_to_b, amount).map(|(out, fee)| {
+            let now = crate::stream::chain_unix_time();
+            return Eval::Quoted(super::meteora_std::swap_exact_in(reserves, a_to_b, amount, now).map(|(out, fee)| {
                 let (rin, rout) = if a_to_b { (reserves.token_a_amount, reserves.token_b_amount) } else { (reserves.token_b_amount, reserves.token_a_amount) };
                 (out, fee, rin as u128, rout as u128)
             }));
@@ -627,9 +702,49 @@ impl Quoter {
             }));
         }
 
-        if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
+        if let PoolState::MeteoraDlmm { lb_pair, token_x_mint, token_y_mint, pair, .. } = state {
+            // Exact bin walk over the pair's own snapshot (LbPair + bin arrays
+            // read together); without a fresh one the answer is "not yet".
+            let swap_for_y = if input_mint == token_x_mint { true } else if input_mint == token_y_mint { false } else { return Eval::Quoted(None) };
+            let bins = match super::dlmm::BINS.get(lb_pair) {
+                Some(b) if b.is_current(pair, self.cache.ttl()) => b,
+                _ => return Eval::Cold,
+            };
+            let slot = crate::stream::latest_slot().max(bins.slot);
+            return match super::dlmm::swap_exact_in(&bins, swap_for_y, amount, bins.chain_now(), slot, super::dlmm::SWAP_ARRAYS) {
+                Ok(q) if q.amount_out > 0 => {
+                    let (rin, rout) = bins.implied_reserves(swap_for_y);
+                    Eval::Quoted(Some((q.amount_out, q.fee, rin, rout)))
+                }
+                // an array the snapshot lacks (the pair moved since): re-read
+                Err(super::dlmm::WalkError::NotLoaded) => Eval::Cold,
+                // liquidity runs out within the arrays a swap can carry, or disabled
+                _ => Eval::Quoted(None),
+            };
+        }
+
+        if let PoolState::PumpFun { mint, curve, .. } = state {
+            let q = if *input_mint == crate::constants::SOL_NATIVE_MINT {
+                curve.buy_exact_in(amount)
+            } else if input_mint == mint {
+                curve.sell_exact_in(amount)
+            } else {
+                None
+            };
+            return Eval::Quoted(q.map(|q| {
+                let (sol, tok) = (curve.virtual_sol_reserves as u128, curve.virtual_token_reserves as u128);
+                let (rin, rout) = if input_mint == mint { (tok, sol) } else { (sol, tok) };
+                (q.amount_out, q.fee, rin, rout)
+            }));
+        }
+
+        if let PoolState::MeteoraDbc { base_mint, quote_mint, curve, .. } = state {
+            return Eval::Quoted(quote_dbc(input_mint, base_mint, quote_mint, curve, amount));
+        }
+
+        if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, token_a_amount, token_b_amount, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
             return Eval::Quoted(quote_damm_v2(
-                input_mint, token_a_mint, token_b_mint, *liquidity, *sqrt_price, *sqrt_min_price, *sqrt_max_price, fees, *activation_point, *activation_type, *collect_fee_mode, *pool_status, amount,
+                input_mint, token_a_mint, token_b_mint, *liquidity, *sqrt_price, *sqrt_min_price, *sqrt_max_price, (*token_a_amount, *token_b_amount), fees, *activation_point, *activation_type, *collect_fee_mode, *pool_status, amount,
             ));
         }
 
@@ -680,6 +795,18 @@ impl Quoter {
                 return Some((out, (trade_fee + creator_in) as u64, reserve_in, reserve_out));
             }
         }
+        // Raydium AMM v4: the program's own arithmetic on `vault − need_take_pnl`.
+        if let PoolState::RaydiumV4 { coin_mint, swap_fee_numerator, swap_fee_denominator, need_take_pnl_coin, need_take_pnl_pc, status, pool_open_time, .. } = state {
+            let now = crate::stream::chain_unix_time();
+            if !crate::execution::amms::raydium_v4::can_swap(*status, *pool_open_time, now) {
+                return None;
+            }
+            let (pnl_in, pnl_out) = if input_mint == coin_mint { (*need_take_pnl_coin, *need_take_pnl_pc) } else { (*need_take_pnl_pc, *need_take_pnl_coin) };
+            let reserve_in = reserve_in.checked_sub(pnl_in as u128)?;
+            let reserve_out = reserve_out.checked_sub(pnl_out as u128)?;
+            let (out, fee) = crate::execution::amms::raydium_v4::swap_base_in_out(reserve_in, reserve_out, amount, *swap_fee_numerator, *swap_fee_denominator)?;
+            return Some((out, fee, reserve_in, reserve_out));
+        }
         // SPL token-swap forks: the pool's own fee schedule (trade + owner
         // trade, off the input), constant-product curve only. Saros is not
         // here: its pools deliver ≈ curve(in − owner_fee); the trade fee in its
@@ -697,6 +824,13 @@ impl Quoter {
                 }
                 return Some((out, fee, reserve_in, reserve_out));
             }
+        }
+        // A fee measured from this pool's own recent swaps, at ppm resolution.
+        if let Some(ppm) = crate::stream::observed_fees::get_fresh_ppm(&entry.address, OBSERVED_FEE_MAX_AGE) {
+            let fee = (amount as u128 * ppm as u128).div_ceil(1_000_000);
+            let in_less = (amount as u128).checked_sub(fee)?;
+            let out = u64::try_from(reserve_out.checked_mul(in_less)? / reserve_in.checked_add(in_less)?).ok()?;
+            return (out > 0).then_some((out, fee as u64, reserve_in, reserve_out));
         }
         let fee_bps = venue_fee_bps(state, entry.pool_type, &entry.address);
         match leg_out(fee_bps, reserve_in, reserve_out, amount) {
@@ -741,6 +875,9 @@ impl Quoter {
                     // one getMultipleAccounts: the ±3 tick arrays + bitmap extension
                     let _ = crate::pool::ticks::load_clmm_ticks(&rpc, fresh).await;
                 }
+                if pool_type == PoolType::MeteoraDlmm {
+                    let _ = crate::pool::bins::load_dlmm_bins(&rpc, fresh).await;
+                }
             }
             if let Ok(fresh) = refreshed {
                 if let (Some(m), PoolState::PumpFunAmm { pool_base_vault, pool_quote_vault, base_reserve, quote_reserve, .. }) = (mirror.as_ref(), &fresh) {
@@ -774,10 +911,14 @@ impl Quoter {
             }
         }
         if !cold.is_empty() {
-            // Unknown mints are looked up once (transfer fee, token program).
+            // Unknown mints are looked up once (transfer fee, token program);
+            // the input's fee is only known after that.
+            let mut amount_eff = amount_eff;
             if !crate::pool::mints::is_known(input_mint) || !crate::pool::mints::is_known(output_mint) {
                 crate::pool::mints::ensure_mint_info(&self.rpc, &[*input_mint, *output_mint]).await;
+                amount_eff = amount.saturating_sub(crate::pool::mints::transfer_fee(input_mint).map(|f| f.fee(amount)).unwrap_or(0));
             }
+            let amount_eff = amount_eff;
             let t0 = std::time::Instant::now();
             let futs = cold.iter().map(|&i| async move {
                 (i, self.evaluate_cold(&entries[i], input_mint, output_mint, amount_eff).await)
@@ -838,6 +979,15 @@ impl Quoter {
                 }
             }
         }
+        if let PoolState::MeteoraDlmm { pair, .. } = &state {
+            let fresh_bins = super::dlmm::BINS.get(&entry.address).map(|b| b.is_current(pair, self.cache.ttl())).unwrap_or(false);
+            if !fresh_bins {
+                if let Err(e) = crate::pool::bins::load_dlmm_bins(&self.rpc, &state).await {
+                    debug!(pool = %entry.address, error = %e, "cold: dlmm bin arrays failed");
+                    return None;
+                }
+            }
+        }
         // Meteora Standard whose vault-share reserves were never computed (old
         // warm file): one batched read of its 6 accounts, then cache.
         if let PoolState::Meteora { reserves, .. } = &state {
@@ -886,7 +1036,7 @@ impl Quoter {
         let mirror = self.mirror.as_ref()?;
         let (vault_a, vault_b, mint_a, mint_b) = extract_vault_mints(state)?;
 
-        // Can't determine direction without mints (RaydiumV4)
+        // Can't determine direction without mints
         if mint_a == Pubkey::default() && mint_b == Pubkey::default() {
             return None;
         }
@@ -1346,14 +1496,10 @@ fn extract_vault_mints(pool_state: &PoolState) -> Option<(Pubkey, Pubkey, Pubkey
         PoolState::RaydiumV4 {
             coin_vault,
             pc_vault,
+            coin_mint,
+            pc_mint,
             ..
-        } => {
-            // RaydiumV4 doesn't store mints directly in PoolState.
-            // We return the vaults, and use Pubkey::default() as placeholder mints.
-            // The caller must use the registry's mint_a/mint_b for direction detection.
-            // We return (coin_vault, pc_vault, default, default) — handled specially in fetch_reserves.
-            Some((*coin_vault, *pc_vault, Pubkey::default(), Pubkey::default()))
-        }
+        } => Some((*coin_vault, *pc_vault, *coin_mint, *pc_mint)),
 
         PoolState::Meteora {
             a_token_vault,
@@ -1503,29 +1649,13 @@ async fn fetch_reserves(
 
     let (ra, rb) = (bal_a? as u128, bal_b? as u128);
 
-    // For RaydiumV4 where mints are default (not stored in state),
-    // we use vault order: coin_vault = vault_a (first), pc_vault = vault_b (second).
-    // The caller's input_mint won't match Pubkey::default(), so we need to infer
-    // direction from which vault the input lands in. However, without mints we
-    // can't determine direction here — we return (ra, rb) and let the caller
-    // use the registry mint_a/mint_b. For simplicity, treat vault_a as "A" side.
-    // Direction detection for V4: not applicable since V4 doesn't have mints in state.
-    // The registry mint_a corresponds to coin, mint_b to pc.
-    if mint_a == Pubkey::default() && mint_b == Pubkey::default() {
-        // RaydiumV4: can't determine direction from mints in state.
-        // Return (ra, rb) as (reserve_a, reserve_b) — the caller needs to map.
-        // For now, return in order and let the outer code figure direction.
-        // Since we don't know which vault corresponds to which mint,
-        // return None to skip RaydiumV4 vault-based quoting for now.
-        // V4 pools are mostly closed (Serum) anyway.
-        return None;
-    }
-
     // Return in (input_reserve, output_reserve) order
     if *input_mint == mint_a {
         Some((ra, rb))
-    } else {
+    } else if *input_mint == mint_b {
         Some((rb, ra))
+    } else {
+        None
     }
 }
 
@@ -1581,13 +1711,32 @@ fn fee_for_pool_type(pool_type: PoolType) -> u16 {
 /// How long a streamed fee observation stays authoritative.
 const OBSERVED_FEE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Meteora DAMM v2 leg: single-range sqrt-price curve + fee scheduler.
+/// Meteora DBC leg: segment walk + base/dynamic fee at the current point
+/// (slot or unix time per the config). Without a known slot the activation
+/// point is used: the scheduler's highest fee, the conservative side.
+fn quote_dbc(input_mint: &Pubkey, base_mint: &Pubkey, quote_mint: &Pubkey, curve: &super::dbc::DbcCurve, amount: u64) -> Option<LegResult> {
+    let quote_to_base = if input_mint == quote_mint { true } else if input_mint == base_mint { false } else { return None };
+    let current_point = match curve.config.activation_type {
+        1 => crate::stream::chain_unix_time(),
+        _ => {
+            let s = crate::stream::latest_slot();
+            if s == 0 { curve.activation_point } else { s }
+        }
+    };
+    let q = curve.swap_exact_in(quote_to_base, amount, current_point)?;
+    let (res_quote, res_base) = curve.implied_reserves();
+    let (reserve_in, reserve_out) = if quote_to_base { (res_quote, res_base) } else { (res_base, res_quote) };
+    Some((q.amount_out, q.fee, reserve_in, reserve_out))
+}
+
+/// Meteora DAMM v2 leg: single-range sqrt-price curve (or constant product on
+/// the tracked `reserves` for a compounding pool) + base/dynamic fee.
 /// Without a known current point the CLIFF (highest) fee is assumed — the
 /// conservative side for a min_out.
 #[allow(clippy::too_many_arguments)]
 fn quote_damm_v2(
     input_mint: &Pubkey, mint_a: &Pubkey, mint_b: &Pubkey,
-    liquidity: u128, sqrt_price: u128, sqrt_min: u128, sqrt_max: u128,
+    liquidity: u128, sqrt_price: u128, sqrt_min: u128, sqrt_max: u128, reserves: (u64, u64),
     fees: &super::damm_v2::DammFees, activation_point: u64, activation_type: u8, collect_fee_mode: u8, pool_status: u8,
     amount: u64,
 ) -> Option<LegResult> {
@@ -1596,7 +1745,7 @@ fn quote_damm_v2(
     }
     let a_to_b = if input_mint == mint_a { true } else if input_mint == mint_b { false } else { return None };
     let current_point = match activation_type {
-        1 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(activation_point),
+        1 => crate::stream::chain_unix_time(),
         _ => {
             let s = crate::stream::latest_slot();
             if s == 0 { activation_point } else { s }
@@ -1605,21 +1754,20 @@ fn quote_damm_v2(
     if current_point < activation_point {
         return None; // not tradable yet
     }
-    let fee_num = fees.total_fee_numerator(current_point, activation_point)?;
-    let q = super::damm_v2::swap_exact_in(sqrt_price, liquidity, sqrt_min, sqrt_max, fee_num, collect_fee_mode, a_to_b, amount)?;
+    let curve = if collect_fee_mode == super::damm_v2::COLLECT_FEE_MODE_COMPOUNDING {
+        super::damm_v2::DammCurve::Compounding { reserve_a: reserves.0, reserve_b: reserves.1 }
+    } else {
+        super::damm_v2::DammCurve::Concentrated { liquidity, sqrt_price, sqrt_min, sqrt_max }
+    };
+    let fee_num = fees.total_fee_numerator(current_point, activation_point, a_to_b, amount, sqrt_price)?;
+    let q = super::damm_v2::swap_exact_in(&curve, fee_num, collect_fee_mode, a_to_b, amount)?;
     if q.amount_out == 0 {
         return None;
     }
-    // Reserves implied by the curve inside its range (for price-impact reporting).
-    let res_a = super::damm_v2::delta_a(sqrt_price, sqrt_max, liquidity, false).unwrap_or(0) as u128;
-    let res_b = super::damm_v2::delta_b(sqrt_min, sqrt_price, liquidity, false).unwrap_or(0) as u128;
-    let (reserve_in, reserve_out) = if a_to_b { (res_a, res_b) } else { (res_b, res_a) };
+    // Reserves implied by the curve (for price-impact reporting).
+    let (res_a, res_b) = curve.reserves();
+    let (reserve_in, reserve_out) = if a_to_b { (res_a as u128, res_b as u128) } else { (res_b as u128, res_a as u128) };
     Some((q.amount_out, q.fee, reserve_in, reserve_out))
-}
-
-/// (tick_current, tick_spacing) of a tick-array pool.
-fn clmm_tick_pos(state: &PoolState) -> Option<(i32, i32)> {
-    crate::pool::ticks::tick_source(state).map(|(_, _, _, t, s)| (t, s))
 }
 
 fn venue_fee_bps(state: &PoolState, pool_type: PoolType, pool: &Pubkey) -> u16 {
@@ -1659,7 +1807,8 @@ mod tests {
         assert!(is_constant_product(PoolType::RaydiumCpmm));
         assert!(is_constant_product(PoolType::PumpFunAmm));
         assert!(!is_constant_product(PoolType::Meteora), "dynamic vaults — no reserve math yet");
-        assert!(!is_constant_product(PoolType::FluxBeam), "transfer-fee pairs — no math yet");
+        assert!(is_constant_product(PoolType::FluxBeam), "SPL token-swap fee schedule read from the pool");
+        assert!(is_quotable(PoolType::FluxBeam));
         assert!(is_constant_product(PoolType::Dooar));
 
         // CLMM pools are NOT constant product
@@ -1700,11 +1849,12 @@ mod tests {
             protocol_fee_recipient: Pubkey::default(), buyback_accounts: Vec::new(),
             base_supply: 1_000_000_000_000_000,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         assert_eq!(venue_fee_bps(&st, PoolType::PumpFunAmm, &Pubkey::new_unique()), 120);
         // a streamed observation overrides the table
         let p = Pubkey::new_unique();
-        crate::stream::observed_fees::record(p, 333);
+        crate::stream::observed_fees::record(p, 33_300);
         assert_eq!(venue_fee_bps(&st, PoolType::PumpFunAmm, &p), 333);
         let (out, fee) = leg_out(120, 100_000_000_000, 200_000_000_000_000, 1_000_000_000).unwrap();
         assert_eq!(out, compute_constant_product_out(100_000_000_000, 200_000_000_000_000, 1_000_000_000, 120).unwrap());
@@ -1733,6 +1883,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let result = extract_reserves_inline(&state, &base_mint);
@@ -1756,6 +1907,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let result = extract_reserves_inline(&state, &quote_mint);
@@ -1770,7 +1922,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let input_mint = Pubkey::new_unique();
         let result = extract_reserves_inline(&state, &input_mint);
@@ -1865,6 +2017,45 @@ mod tests {
     }
 
     #[test]
+    fn clmm_compute_estimate_covers_mainnet_swaps() {
+        // (venue, swap steps, compute units the whole routed transaction used), mainnet simulations
+        for (pt, steps, used) in [
+            (PoolType::RaydiumCl, 1, 110_199), (PoolType::RaydiumCl, 7, 155_095), (PoolType::RaydiumCl, 34, 425_906),
+            (PoolType::Byreal, 1, 146_945), (PoolType::Byreal, 4, 170_788), (PoolType::Byreal, 16, 395_808),
+            (PoolType::Orca, 3, 94_702), (PoolType::Orca, 13, 177_239), (PoolType::Orca, 55, 525_426), (PoolType::Orca, 37, 325_283),
+            (PoolType::PancakeSwap, 1, 129_046), (PoolType::DefiTunaFusion, 1, 114_420),
+        ] {
+            let est = clmm_swap_compute_units(pt, steps);
+            assert!(est >= used, "{pt:?} {steps} steps: {est} < {used}");
+            assert!(est < used * 2 + 50_000, "{pt:?} {steps} steps: {est} is far above {used}");
+        }
+    }
+
+    #[test]
+    fn test_stable_meteora_pool_is_answered_without_a_cold_read() {
+        let (ma, mb, pool) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let state = |constant_product: bool, trade_fee_denominator: u64| PoolState::Meteora {
+            pool, token_a_mint: ma, token_b_mint: mb,
+            a_vault: Pubkey::new_unique(), b_vault: Pubkey::new_unique(),
+            a_token_vault: Pubkey::new_unique(), b_token_vault: Pubkey::new_unique(),
+            a_vault_lp_mint: Pubkey::new_unique(), b_vault_lp_mint: Pubkey::new_unique(),
+            a_vault_lp: Pubkey::new_unique(), b_vault_lp: Pubkey::new_unique(),
+            admin_token_a_fee: Pubkey::new_unique(), admin_token_b_fee: Pubkey::new_unique(),
+            vault_program: Pubkey::new_unique(),
+            reserves: crate::quote::meteora_std::MeteoraStdReserves { constant_product, trade_fee_denominator, trade_fee_numerator: 25, ..Default::default() },
+        };
+        let quoter = Quoter::new(
+            Arc::new(PoolRegistry::new()),
+            Arc::new(crate::pool::cache::PoolCache::new(2000)),
+            Arc::new(RpcClient::new("http://localhost:8899".to_string())),
+        );
+        let entry = PoolEntry { address: pool, pool_type: PoolType::Meteora, mint_a: ma, mint_b: mb };
+        assert!(matches!(quoter.quote_state(&state(false, 10_000), &entry, &ma, 1_000), Eval::Quoted(None)), "stable curve: not quotable, no RPC");
+        assert!(matches!(quoter.quote_state(&state(true, 10_000), &entry, &ma, 1_000), Eval::Cold), "CP pool whose reserves were never read");
+        assert!(matches!(quoter.quote_state(&state(false, 0), &entry, &ma, 1_000), Eval::Cold), "unparsed (old warm file): read it");
+    }
+
+    #[test]
     fn test_extract_vault_mints_meteora_damm() {
         let va = Pubkey::new_unique();
         let vb = Pubkey::new_unique();
@@ -1876,7 +2067,7 @@ mod tests {
             token_b_vault: vb,
             token_a_mint: ma,
             token_b_mint: mb,
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
 
         let (v_a, v_b, m_a, m_b) = extract_vault_mints(&state).unwrap();
@@ -1900,6 +2091,7 @@ mod tests {
             quote_vault: qv,
             base_mint: bm,
             quote_mint: qm,
+            curve: Default::default(),
         };
 
         let (va, vb, ma, mb) = extract_vault_mints(&state).unwrap();
@@ -1989,31 +2181,88 @@ mod tests {
     fn test_extract_vault_mints_raydium_v4() {
         let cv = Pubkey::new_unique();
         let pv = Pubkey::new_unique();
-        let state = PoolState::RaydiumV4 {
+        let (cm, pm) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let state = v4_state(cv, pv, cm, pm, 0, 0);
+        assert_eq!(extract_vault_mints(&state), Some((cv, pv, cm, pm)));
+    }
+
+    fn v4_state(coin_vault: Pubkey, pc_vault: Pubkey, coin_mint: Pubkey, pc_mint: Pubkey, pnl_coin: u64, pnl_pc: u64) -> PoolState {
+        PoolState::RaydiumV4 {
             amm_id: Pubkey::new_unique(),
             authority: Pubkey::new_unique(),
-            open_orders: Pubkey::new_unique(),
-            target_orders: Pubkey::new_unique(),
-            coin_vault: cv,
-            pc_vault: pv,
-            serum_program: Pubkey::new_unique(),
-            serum_market: Pubkey::new_unique(),
-            serum_bids: Pubkey::new_unique(),
-            serum_asks: Pubkey::new_unique(),
-            serum_event_queue: Pubkey::new_unique(),
-            serum_coin_vault: Pubkey::new_unique(),
-            serum_pc_vault: Pubkey::new_unique(),
-            serum_vault_signer: Pubkey::new_unique(),
-        };
+            coin_vault,
+            pc_vault,
+            coin_mint,
+            pc_mint,
+            swap_fee_numerator: 25,
+            swap_fee_denominator: 10_000,
+            need_take_pnl_coin: pnl_coin,
+            need_take_pnl_pc: pnl_pc,
+            status: 6,
+            pool_open_time: 0,
+        }
+    }
 
-        let result = extract_vault_mints(&state);
-        assert!(result.is_some());
-        let (va, vb, ma, mb) = result.unwrap();
-        assert_eq!(va, cv);
-        assert_eq!(vb, pv);
-        // Mints are Pubkey::default() for V4 (not stored in state)
-        assert_eq!(ma, Pubkey::default());
-        assert_eq!(mb, Pubkey::default());
+    fn v4_quoter() -> (Arc<PoolRegistry>, Arc<crate::pool::cache::PoolCache>, Arc<crate::stream::account_mirror::AccountMirror>, Quoter) {
+        let registry = Arc::new(PoolRegistry::new());
+        let cache = Arc::new(crate::pool::cache::PoolCache::new(60_000));
+        let mirror = Arc::new(crate::stream::account_mirror::AccountMirror::new());
+        let rpc = Arc::new(RpcClient::new("http://localhost:8899".to_string()));
+        let quoter = Quoter::with_mirror(Arc::clone(&registry), Arc::clone(&cache), rpc, Arc::clone(&mirror));
+        (registry, cache, mirror, quoter)
+    }
+
+    fn v4_pool(registry: &PoolRegistry, cache: &crate::pool::cache::PoolCache, mirror: &crate::stream::account_mirror::AccountMirror, coin: Pubkey, pc: Pubkey, vaults: (u64, u64), pnl: (u64, u64)) -> Pubkey {
+        let (pool, cv, pv) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: pool, pool_type: PoolType::RaydiumV4, mint_a: coin, mint_b: pc });
+        cache.insert(pool, v4_state(cv, pv, coin, pc, pnl.0, pnl.1));
+        mirror.update_vault_balance(cv, vaults.0);
+        mirror.update_vault_balance(pv, vaults.1);
+        pool
+    }
+
+    fn quote_req(input_mint: Pubkey, output_mint: Pubkey, amount: u64, only_direct_routes: bool) -> QuoteRequest {
+        QuoteRequest { input_mint, output_mint, amount, slippage_bps: 50, only_direct_routes, exclude_dexes: vec![], dexes: vec![], max_accounts: 64 }
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_quote_matches_the_mainnet_ray_log_both_ways() {
+        // 58oQChx4… SOL/USDC, tx 75pWHXMn…: vault balances before the swap, the
+        // pool's need_take_pnl, and the ray_log out amounts.
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_470_889_557_717, 21_208_903_794_498), (39_925_487, 4_739_163));
+        let out: u64 = quoter.quote(&quote_req(SOL_NATIVE_MINT, USDC_MINT, 33_157_350, true)).await.unwrap().amount_out.parse().unwrap();
+        assert_eq!(out, 3_930_460);
+        // pc → coin on the same reserves (tx 4r7FMgx8…: its own pre-balances)
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_424_565_685_852, 21_214_253_619_335), (39_925_487, 4_739_163));
+        let resp = quoter.quote(&quote_req(USDC_MINT, SOL_NATIVE_MINT, 250_000_000, true)).await.unwrap();
+        assert_eq!(resp.amount_out, "2097368298");
+        assert_eq!(resp.routes[0].pool.dex, "Raydium V4");
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_pools_route_as_a_two_hop_leg() {
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        let token = Pubkey::new_unique();
+        v4_pool(&registry, &cache, &mirror, token, SOL_NATIVE_MINT, (5_000_000_000_000, 100_000_000_000), (0, 0));
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_470_889_557_717, 21_208_903_794_498), (39_925_487, 4_739_163));
+        let resp = quoter.quote(&quote_req(token, USDC_MINT, 1_000_000_000, false)).await.unwrap();
+        assert_eq!(resp.routes.len(), 2);
+        assert!(resp.routes.iter().all(|r| r.pool.dex == "Raydium V4"));
+        let hop1: u64 = resp.routes[0].pool.amount_out.parse().unwrap();
+        let (h1, _) = crate::execution::amms::raydium_v4::swap_base_in_out(5_000_000_000_000, 100_000_000_000, 1_000_000_000, 25, 10_000).unwrap();
+        assert_eq!(hop1, h1);
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_closed_pool_is_not_quoted() {
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        let pool = v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (1_000_000_000, 1_000_000_000), (0, 0));
+        if let Some(PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, .. }) = cache.get(&pool) {
+            cache.insert(pool, PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, swap_fee_numerator: 25, swap_fee_denominator: 10_000, need_take_pnl_coin: 0, need_take_pnl_pc: 0, status: 3, pool_open_time: 0 });
+        }
+        assert!(quoter.quote(&quote_req(SOL_NATIVE_MINT, USDC_MINT, 1_000, true)).await.is_err(), "WithdrawOnly pool");
     }
 
     #[test]
@@ -2026,6 +2275,8 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
+            buyback_fee_recipient: Pubkey::new_unique(),
         };
         assert!(extract_vault_mints(&state).is_none());
     }
@@ -2075,6 +2326,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         assert!(extract_vault_mints(&state).is_none());
     }
@@ -2310,10 +2562,10 @@ mod tests {
 
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
-        // MeteoraDlmm is not supported for quoting
+        // DefiTuna Pools is not supported for quoting
         registry.add(PoolEntry {
             address: Pubkey::new_unique(),
-            pool_type: PoolType::MeteoraDlmm,
+            pool_type: PoolType::DefiTunaPools,
             mint_a,
             mint_b,
         });
@@ -2461,6 +2713,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {
@@ -2481,6 +2734,75 @@ mod tests {
         let out: u64 = resp.amount_out.parse().unwrap();
         assert!(out > 0, "out_amount should be > 0");
         assert!(out < 100_000, "out_amount should be less than input (different reserves)");
+    }
+
+    #[tokio::test]
+    async fn test_quoter_bonding_curves_from_memory() {
+        use crate::constants::SOL_NATIVE_MINT;
+        let registry = Arc::new(PoolRegistry::new());
+        let cache = Arc::new(crate::pool::cache::PoolCache::new(60_000));
+        let rpc = Arc::new(RpcClient::new("http://localhost:8899".to_string()));
+        let quoter = Quoter::new(Arc::clone(&registry), Arc::clone(&cache), Arc::clone(&rpc));
+        let req = |input_mint, output_mint, amount| QuoteRequest {
+            input_mint, output_mint, amount, slippage_bps: 100, only_direct_routes: true, exclude_dexes: vec![], dexes: vec![], max_accounts: 64,
+        };
+
+        // pump.fun: a live pre-trade curve (FSP4kDr3…, buy_exact_sol_in 0.1 SOL)
+        let (mint, curve_addr) = (Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: curve_addr, pool_type: PoolType::PumpFun, mint_a: mint, mint_b: SOL_NATIVE_MINT });
+        let curve = crate::quote::pump_bonding::PumpCurve {
+            virtual_sol_reserves: 41_556_085_197,
+            virtual_token_reserves: 774_615_796_118_287,
+            real_sol_reserves: 11_556_085_197,
+            real_token_reserves: 494_715_796_118_287,
+            token_total_supply: 1_000_000_000_000_000,
+            has_creator: true,
+            ..Default::default()
+        };
+        let pump = |curve| PoolState::PumpFun {
+            global: Pubkey::new_unique(), fee_account: Pubkey::new_unique(), mint, bonding_curve: curve_addr,
+            associated_bonding_curve: Pubkey::new_unique(), event_authority: Pubkey::new_unique(), creator: Pubkey::new_unique(),
+            curve, buyback_fee_recipient: Pubkey::new_unique(),
+        };
+        cache.insert(curve_addr, pump(curve));
+        let buy = quoter.quote(&req(SOL_NATIVE_MINT, mint, 100_000_000)).await.unwrap();
+        assert_eq!((buy.amount_out.as_str(), buy.routes[0].pool.dex.as_str()), ("1836647138012", "PumpFun"));
+        let sell = quoter.quote(&req(mint, SOL_NATIVE_MINT, 1_836_647_138_012)).await.unwrap();
+        assert!(sell.amount_out.parse::<u64>().unwrap() < 100_000_000);
+        // a completed curve is not quoted
+        cache.insert(curve_addr, pump(crate::quote::pump_bonding::PumpCurve { complete: true, ..curve }));
+        assert!(quoter.quote(&req(SOL_NATIVE_MINT, mint, 100_000_000)).await.is_err());
+
+        // Meteora DBC: a flat-fee config, both directions, migrated → refused
+        let (base, pool) = (Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: pool, pool_type: PoolType::MeteoraDbc, mint_a: base, mint_b: SOL_NATIVE_MINT });
+        let dbc_curve = crate::quote::dbc::DbcCurve {
+            sqrt_price: 3_262_546_676_709_219,
+            quote_reserve: 1_399_303_498,
+            activation_point: 0,
+            config: crate::quote::dbc::DbcConfig {
+                activation_type: 1,
+                migration_quote_threshold: 85_000_000_000,
+                sqrt_start_price: 3_141_367_320_245_630,
+                curve: vec![
+                    (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
+                    (13_043_817_825_332_782, 2_425_988_008_058_820_449_100_000_000_000_000),
+                ],
+                cliff_fee_numerator: 20_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dbc = |curve| PoolState::MeteoraDbc {
+            pool, config: Pubkey::new_unique(), pool_authority: Pubkey::new_unique(), base_vault: Pubkey::new_unique(),
+            quote_vault: Pubkey::new_unique(), base_mint: base, quote_mint: SOL_NATIVE_MINT, curve,
+        };
+        cache.insert(pool, dbc(dbc_curve.clone()));
+        let buy = quoter.quote(&req(SOL_NATIVE_MINT, base, 40_204_811)).await.unwrap();
+        assert_eq!(buy.amount_out, "1258276557343754", "658ZWbNq… EvtSwap2");
+        assert!(quoter.quote(&req(base, SOL_NATIVE_MINT, 1_000_000_000_000)).await.is_ok());
+        cache.insert(pool, dbc(crate::quote::dbc::DbcCurve { is_migrated: true, ..dbc_curve }));
+        assert!(quoter.quote(&req(base, SOL_NATIVE_MINT, 1_000_000_000_000)).await.is_err());
     }
 
     #[tokio::test]
@@ -2519,6 +2841,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Pool 2: TOKEN_B / SOL
@@ -2541,6 +2864,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Quote: TOKEN_A -> TOKEN_B (no direct pool, must route through SOL)
@@ -2608,6 +2932,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         registry.add(PoolEntry {
@@ -2629,6 +2954,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {
@@ -2684,6 +3010,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Indirect pools: TOKEN_A / SOL and TOKEN_B / SOL (worse total output due to double fees)
@@ -2707,6 +3034,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let pool2 = Pubkey::new_unique();
@@ -2729,6 +3057,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {

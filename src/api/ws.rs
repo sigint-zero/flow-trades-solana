@@ -68,7 +68,7 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Parse the subscription into a QuoteRequest
-    let (req, interval_ms) = match parse_subscription(&sub) {
+    let (mut req, interval_ms) = match parse_subscription(&sub) {
         Ok(r) => r,
         Err(e) => {
             let _ = send_error(&mut socket, &e).await;
@@ -76,8 +76,14 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
-    // Stream quotes at the configured interval
-    let mut ticker = interval(Duration::from_millis(interval_ms));
+    // Stream quotes at the configured interval. A slow quote skips the ticks it
+    // overran instead of bursting the backlog as identical quotes.
+    let ticker_for = |ms: u64| {
+        let mut t = interval(Duration::from_millis(ms));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    };
+    let mut ticker = ticker_for(interval_ms);
 
     loop {
         tokio::select! {
@@ -106,9 +112,20 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Client sent a new subscription — currently we only support one
-                        // subscription per connection; log and ignore re-subscriptions.
-                        debug!("WebSocket received message during streaming: {}", text.len());
+                        // A new subscription replaces the current one; an invalid
+                        // one is reported and the current one keeps streaming.
+                        let parsed = serde_json::from_str::<WsSubscription>(&text)
+                            .map_err(|e| format!("invalid subscription: {e}"))
+                            .and_then(|sub| parse_subscription(&sub));
+                        match parsed {
+                            Ok((new_req, new_interval_ms)) => {
+                                req = new_req;
+                                ticker = ticker_for(new_interval_ms);
+                            }
+                            Err(e) => {
+                                let _ = send_error(&mut socket, &e).await;
+                            }
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         debug!("WebSocket client disconnected");

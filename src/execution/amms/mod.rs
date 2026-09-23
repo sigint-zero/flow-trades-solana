@@ -270,6 +270,7 @@ mod tests {
             buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let order = SwapOrder {
@@ -322,6 +323,7 @@ mod tests {
             buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let order = SwapOrder {
@@ -366,7 +368,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
 
         let order = SwapOrder {

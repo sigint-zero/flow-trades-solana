@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 
-use crate::constants::{SOL_NATIVE_MINT, TOKEN_PROGRAM_ID};
+use crate::constants::{SOL_NATIVE_MINT, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID};
 use crate::error::{TradeError, TradeResult};
 use crate::execution::amms::AmmExecutorType;
-use crate::execution::router::wrap_swap;
+use crate::execution::router::{wrap_swap, RouterConfig};
 use crate::execution::simulator::{simulate_versioned, cu_with_headroom};
 use crate::execution::tx_builder::{build_unsigned_versioned_tx, TxBuildConfig};
 use crate::pool::fetcher::{ensure_pamm_fee_accounts, fetch_pool_state, refresh_pamm_reserves};
@@ -38,10 +38,11 @@ pub struct SwapRequest {
     /// Optional tip: appended as the last instruction (SOL transfer to the given address).
     /// Used for Jito bundles, MEV tips, or any destination. Must be last instruction.
     pub tip: Option<TipRequest>,
-    /// Transaction format: `0` (default) = v0 with lookup tables, legacy fallback,
+    /// Transaction format: `0` = v0 with lookup tables, legacy fallback,
     /// 1,232-byte limit; `1` = SIMD-0385 v1 — 4,096 bytes, every account inline
-    /// (no lookup tables), compute budget in the header. Use 1 for multi-hop
-    /// routes that do not fit v0. The signer must support v1 (first byte 0x81).
+    /// (no lookup tables), compute budget in the header. Omitted: v0, or v1 when
+    /// the route does not fit v0 (the response's `tx_version` says which). The
+    /// signer must support v1 (first byte 0x81).
     pub tx_version: Option<u8>,
 }
 
@@ -118,9 +119,29 @@ pub async fn handle_swap(
         &alt_tables,
     )?;
 
-    // Optionally simulate the transaction
+    // Multi-hop routes through accounts the lookup tables do not cover exceed
+    // the 1,232-byte packet limit. When the caller did not pin a version, the
+    // same instructions go out as a v1 transaction (4,096 bytes, no tables);
+    // an explicit `tx_version: 0` gets the error below instead.
+    let v0_len = bincode::serialized_size(&vtx).map_err(|e| TradeError::Internal(format!("serialize tx: {e}")))? as usize;
+    if v0_len > MAX_TX_BYTES {
+        if req.tx_version.is_none() {
+            return handle_swap_v1(&state, &req, swap_ixs, tx_config, &user_pubkey, blockhash, last_valid_block_height, should_simulate).await;
+        }
+        return Err(oversize_v0(v0_len));
+    }
+
+    // Optionally simulate the transaction. Without a caller-set limit the
+    // simulation runs at the transaction maximum, so it measures what the swap
+    // needs (sized below) instead of failing at the default.
     let simulation = if should_simulate {
-        match simulate_versioned(&state.rpc, &vtx).await {
+        let sim_vtx = if req.compute_limit.is_none() {
+            let max = TxBuildConfig { compute_unit_limit: MAX_COMPUTE_UNITS, ..tx_config.clone() };
+            build_unsigned_versioned_tx(&swap_ixs, &user_pubkey, &max, blockhash, &alt_tables)?
+        } else {
+            vtx.clone()
+        };
+        match simulate_versioned(&state.rpc, &sim_vtx).await {
             Ok(sim) => {
                 // If user didn't set an explicit compute_limit, use simulated CU + headroom
                 if req.compute_limit.is_none() && sim.success && sim.units_consumed > 0 {
@@ -166,12 +187,7 @@ pub async fn handle_swap(
     let tx_bytes = bincode::serialize(&final_vtx)
         .map_err(|e| TradeError::Internal(format!("serialize tx: {e}")))?;
     if tx_bytes.len() > MAX_TX_BYTES {
-        return Err(TradeError::Validation(format!(
-            "transaction is {} bytes, over the {MAX_TX_BYTES}-byte limit — the route's accounts are not \
-             covered by the configured lookup tables; quote with direct_only=true, or request \
-             tx_version=1 (4096-byte v1 transactions, no lookup tables)",
-            tx_bytes.len()
-        )));
+        return Err(oversize_v0(tx_bytes.len()));
     }
     let tx_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
@@ -183,6 +199,14 @@ pub async fn handle_swap(
         priority_fee: tx_config.priority_fee_lamports,
         simulation,
     }))
+}
+
+fn oversize_v0(len: usize) -> TradeError {
+    TradeError::Validation(format!(
+        "transaction is {len} bytes, over the {MAX_TX_BYTES}-byte limit — the route's accounts are not \
+         covered by the configured lookup tables; quote with direct_only=true, or request \
+         tx_version=1 (4096-byte v1 transactions, no lookup tables)"
+    ))
 }
 
 /// `/swap` with `tx_version: 1`: the same instructions encoded as a v1
@@ -211,7 +235,14 @@ async fn handle_swap_v1(
     let mut tx_bytes = encode_unsigned_v1(&instructions, user_pubkey, blockhash, budget(&tx_config))?;
 
     let simulation = if should_simulate {
-        match simulate_raw(&state.rpc, &tx_bytes).await {
+        // at the transaction maximum unless the caller set a limit (see v0)
+        let sim_bytes = if req.compute_limit.is_none() {
+            let max = TxBuildConfig { compute_unit_limit: MAX_COMPUTE_UNITS, ..tx_config.clone() };
+            encode_unsigned_v1(&instructions, user_pubkey, blockhash, budget(&max))?
+        } else {
+            tx_bytes.clone()
+        };
+        match simulate_raw(&state.rpc, &sim_bytes).await {
             Ok(sim) => {
                 if req.compute_limit.is_none() && sim.success && sim.units_consumed > 0 {
                     tx_config.compute_unit_limit = cu_with_headroom(sim.units_consumed);
@@ -294,6 +325,10 @@ pub(crate) async fn build_swap_from_quote(
     } else {
         400_000
     };
+    // A Meteora DLMM or CLMM hop's cost grows with the bins / tick ranges it
+    // walks (half a million CU and more on a long walk): budget the walk its
+    // quote made.
+    let compute_limit = if req.compute_limit.is_none() { compute_limit.max(walk_route_compute_units(state, quote)) } else { compute_limit };
 
     let tx_config = TxBuildConfig {
         compute_unit_limit: compute_limit,
@@ -316,6 +351,30 @@ pub(crate) async fn build_swap_from_quote(
     };
 
     Ok((swap_ixs, tx_config, user_pubkey))
+}
+
+/// Compute units for a route with Meteora DLMM or CLMM hops: each such hop's
+/// estimate from its own walk (`quote::dlmm::estimate_compute_units`,
+/// `Quoter::clmm_compute_units`) plus 200k per other hop, capped at the 1.4M
+/// transaction maximum. 0 when no hop walks.
+fn walk_route_compute_units(state: &AppState, quote: &QuoteResponse) -> u32 {
+    let mut total: u32 = 0;
+    let mut any = false;
+    for r in &quote.routes {
+        let est = (|| {
+            let pool = Pubkey::from_str(&r.pool.pool_address).ok()?;
+            let input = Pubkey::from_str(&r.pool.input_token).ok()?;
+            let amount: u64 = r.pool.amount_in.parse().ok()?;
+            match r.pool.dex.as_str() {
+                "Meteora DLMM" => crate::quote::dlmm::estimate_compute_units(&pool, &input, amount),
+                "Raydium CLMM" | "PancakeSwap" | "Orca" | "Byreal" | "DefiTuna Fusion" => state.quoter.clmm_compute_units(&pool, &input, amount),
+                _ => None,
+            }
+        })();
+        any |= est.is_some();
+        total = total.saturating_add(est.unwrap_or(200_000));
+    }
+    if any { total.min(MAX_COMPUTE_UNITS) } else { 0 }
 }
 
 /// Wrap ALL swap instructions in the flow-router CPI for on-chain fee enforcement.
@@ -349,6 +408,7 @@ async fn wrap_in_router(
     let input_tp = get_token_program(state, &input_mint).await?;
     let output_tp = get_token_program(state, &output_mint).await?;
     let fee_tp = output_tp;
+    check_fee_transferable(state, router, &output_mint, output_tp).await?;
 
     let user_input_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
         user, &input_mint, &input_tp,
@@ -390,7 +450,9 @@ async fn wrap_in_router(
     }
 
     let num_hops = quote.routes.len();
-    if num_hops != ixs.swap.len() {
+    // A hop may take more than one CPI (a native-SOL venue wraps its output
+    // for the router), never fewer.
+    if ixs.swap.len() < num_hops {
         return Err(TradeError::Execution(format!(
             "route has {} hops but {} swap instructions", num_hops, ixs.swap.len()
         )));
@@ -408,6 +470,9 @@ async fn wrap_in_router(
             )
         );
     }
+    // The router wants one account per CPI boundary but reads only the last
+    // (output) one; extra CPIs get the output account as a placeholder.
+    token_accounts.extend(std::iter::repeat_n(user_output_ata, ixs.swap.len() - num_hops));
     token_accounts.push(user_output_ata);
 
     let router_ix = wrap_swap(
@@ -433,6 +498,25 @@ async fn wrap_in_router(
     })
 }
 
+/// The router moves its fee out of the user's output account after the swap
+/// and passes no transfer-hook accounts: an output mint whose transfer hook
+/// has a program set cannot pay that fee, so the route is refused up front.
+async fn check_fee_transferable(state: &AppState, router: &RouterConfig, output_mint: &Pubkey, output_tp: Pubkey) -> TradeResult<()> {
+    if router.fee_bps == 0 || output_tp != TOKEN_2022_PROGRAM_ID {
+        return Ok(());
+    }
+    if !crate::pool::mints::is_known(output_mint) {
+        crate::pool::mints::ensure_mint_info(&state.rpc, &[*output_mint]).await;
+    }
+    if crate::pool::mints::has_transfer_hook(output_mint) {
+        return Err(TradeError::Validation(format!(
+            "output mint {output_mint} has a Token-2022 transfer hook; the router cannot pass the hook's \
+             accounts when it collects its fee from the output"
+        )));
+    }
+    Ok(())
+}
+
 /// True when the fee ATA exists on-chain. Positive results are cached for the
 /// process lifetime (an ATA is never closed by us); negatives cost one
 /// `getAccountInfo` per swap until the first executed swap creates it.
@@ -451,6 +535,9 @@ async fn fee_ata_exists(state: &AppState, ata: &Pubkey) -> bool {
 
 /// Solana's transaction size limit (one IPv6 MTU packet).
 pub const MAX_TX_BYTES: usize = 1232;
+
+/// Compute-unit ceiling of one transaction.
+const MAX_COMPUTE_UNITS: u32 = 1_400_000;
 
 /// Pool state for swap building: cache hit, else RPC fetch + cache. For a
 /// pump.fun AMM pool whose buyback remaining-accounts are still unresolved
@@ -471,7 +558,7 @@ async fn load_pool_state(
         }
     };
     let mut dirty = false;
-    if pool_state.needs_pamm_fee_accounts() {
+    if pool_state.needs_pamm_fee_accounts() && !crate::execution::amms::pumpfun_amm::recipients_loaded() {
         // else: leave it — the executor refuses with a clear error, and the
         // next /swap retries the resolve (the pool may have a swap by then).
         dirty |= ensure_pamm_fee_accounts(&state.rpc, &mut pool_state).await;
@@ -499,6 +586,13 @@ async fn load_pool_state(
     }
     if dirty {
         state.cache.insert(*pool_address, pool_state.clone());
+    }
+    // DLMM: the executor picks bin arrays + bitmap extension from the pair's
+    // bins in memory (normally loaded by the quote that preceded this swap)
+    if pool_type == PoolType::MeteoraDlmm && !crate::quote::dlmm::BINS.contains_key(pool_address) {
+        if let Err(e) = crate::pool::bins::load_dlmm_bins(&state.rpc, &pool_state).await {
+            tracing::warn!(pool = %pool_address, error = %e, "dlmm bin arrays unreadable — swap built from the pair's own bitmap");
+        }
     }
     Ok(pool_state)
 }
@@ -576,14 +670,46 @@ fn tidy_multihop(setup: Vec<Instruction>, later_hop_setups: Vec<Vec<Instruction>
 /// The amount a hop can rely on receiving from the previous one.
 use crate::quote::router::guaranteed;
 
-/// Raydium CLMM / PancakeSwap swaps carry the current tick array plus the next
+/// DEX-level floor of an intermediate hop: exactly what the next hop spends,
+/// so a short hop fails here with the venue's slippage error instead of as
+/// "insufficient funds" one hop later. Never 0 — pump.fun AMM rejects a zero
+/// minimum on `buy_exact_quote_in` (6001 ZeroBaseAmount), which is also the
+/// instruction a sell into a SOL-base pool uses.
+fn hop_floor(hop_out: u64, slippage_bps: u16) -> u64 {
+    guaranteed(hop_out, slippage_bps).max(1)
+}
+
+/// pump.fun bonding spends NATIVE SOL; as a later hop the SOL arrives as WSOL
+/// from the previous hop, so the WSOL account is closed (unwrapped into the
+/// payer) inside the router, right before the buy. Returns true when it did.
+fn unwrap_for_native_sol_hop(pool_type: PoolType, input_mint: &Pubkey, ixs: &mut SwapInstructions, user: &Pubkey) -> bool {
+    if pool_type != PoolType::PumpFun || *input_mint != SOL_NATIVE_MINT {
+        return false;
+    }
+    let wsol_ata = spl_associated_token_account::get_associated_token_address(user, &SOL_NATIVE_MINT);
+    match spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &wsol_ata, user, user, &[]) {
+        Ok(close) => {
+            ixs.swap.insert(0, close);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The WSOL account was closed mid-route: a second close would fail.
+fn drop_wsol_close(cleanup: &mut Vec<Instruction>, user: &Pubkey) {
+    let wsol_ata = spl_associated_token_account::get_associated_token_address(user, &SOL_NATIVE_MINT);
+    cleanup.retain(|ix| !(ix.program_id == TOKEN_PROGRAM_ID && ix.data == [9u8] && ix.accounts.first().is_some_and(|a| a.pubkey == wsol_ata)));
+}
+
+/// Raydium CLMM / PancakeSwap / Byreal swaps carry the current tick array plus the next
 /// two in the swap direction as remaining accounts. A neighbouring array that
 /// no LP has ever touched does not exist on chain, and passing it fails the
 /// whole swap with `AccountOwnedByWrongProgram` (owner = System). One
 /// `getMultipleAccounts` per swap prunes the missing neighbours; the first
 /// array (holding the current tick) must exist.
 async fn prune_missing_tick_arrays(rpc: &solana_client::nonblocking::rpc_client::RpcClient, ixs: &mut SwapInstructions, pool_type: PoolType, pool: &Pubkey) -> TradeResult<()> {
-    if !matches!(pool_type, PoolType::RaydiumCl | PoolType::PancakeSwap) {
+    if !matches!(pool_type, PoolType::RaydiumCl | PoolType::PancakeSwap | PoolType::Byreal) {
         return Ok(());
     }
     // With the pool's ticks in memory the executor already passed exactly the
@@ -669,8 +795,7 @@ async fn build_two_hop_ixs(
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_in: {}", hop1.amount_in)))?;
     let hop1_out: u64 = hop1.amount_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_out: {}", hop1.amount_out)))?;
-    // Validated here; enforced by the router on the route's total output.
-    let _route_floor: u64 = quote.minimum_out.parse()
+    let route_floor: u64 = quote.minimum_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid minimum_out: {}", quote.minimum_out)))?;
 
     let pool1_type = pool_type_from_label(&hop1.dex)?;
@@ -686,14 +811,13 @@ async fn build_two_hop_ixs(
     let output_token_program = get_token_program(state, &output_mint).await?;
 
     // Build swap 1: input -> bridge
-    // For hop1, min_amount_out is 0 (we only enforce the final threshold)
     let order1 = SwapOrder {
         pool_address: pool1_address,
         pool_type: pool1_type,
         input_mint,
         output_mint: bridge_mint,
         amount_in,
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        min_amount_out: hop_floor(hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge_token_program,
@@ -714,10 +838,9 @@ async fn build_two_hop_ixs(
         // "insufficient funds" whenever hop 1 lands a hair short; the surplus
         // WSOL/bridge tokens stay with the user.
         amount_in: guaranteed(hop1_out, quote.slippage_bps),
-        // The DEX-level floor is off for the last hop too: its input was scaled
-        // down to the guaranteed amount, so the quoted minimum no longer applies
-        // per hop. The router checks `minimum_out` on the route's total output.
-        min_amount_out: 0,
+        // Hop 2's quote was already priced on that guaranteed input, so the
+        // route's minimum is also this hop's floor (the router re-checks it).
+        min_amount_out: route_floor.max(1),
         user: *user_pubkey,
         input_token_program: bridge_token_program,
         output_token_program,
@@ -726,12 +849,16 @@ async fn build_two_hop_ixs(
     let executor2 = AmmExecutorType::from_pool_type(pool2_type)?;
     let mut ixs2 = executor2.build_swap_ix(&order2, &pool2_state)?;
     prune_missing_tick_arrays(&state.rpc, &mut ixs2, pool2_type, &order2.pool_address).await?;
+    let unwrapped = unwrap_for_native_sol_hop(pool2_type, &bridge_mint, &mut ixs2, user_pubkey);
 
     // Combine: setup1 + setup2, swap1 + swap2, cleanup1 + cleanup2 — see tidy_multihop
     let mut combined_swap = ixs1.swap;
     combined_swap.extend(ixs2.swap);
     let mut combined_cleanup = ixs1.cleanup;
     combined_cleanup.extend(ixs2.cleanup);
+    if unwrapped {
+        drop_wsol_close(&mut combined_cleanup, user_pubkey);
+    }
     let (setup, cleanup) = tidy_multihop(ixs1.setup, vec![ixs2.setup], combined_cleanup, user_pubkey);
 
     Ok(SwapInstructions { setup, swap: combined_swap, cleanup })
@@ -791,8 +918,7 @@ async fn build_three_hop_ixs(
         .map_err(|_| TradeError::Validation(format!("invalid hop1 amount_out: {}", hop1.amount_out)))?;
     let hop2_out: u64 = hop2.amount_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid hop2 amount_out: {}", hop2.amount_out)))?;
-    // Validated here; enforced by the router on the route's total output.
-    let _route_floor: u64 = quote.minimum_out.parse()
+    let route_floor: u64 = quote.minimum_out.parse()
         .map_err(|_| TradeError::Validation(format!("invalid minimum_out: {}", quote.minimum_out)))?;
 
     let pool1_type = pool_type_from_label(&hop1.dex)?;
@@ -817,7 +943,7 @@ async fn build_three_hop_ixs(
         input_mint,
         output_mint: bridge1_mint,
         amount_in,
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        min_amount_out: hop_floor(hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge1_token_program,
@@ -834,7 +960,7 @@ async fn build_three_hop_ixs(
         input_mint: bridge1_mint,
         output_mint: bridge2_mint,
         amount_in: guaranteed(hop1_out, quote.slippage_bps),
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        min_amount_out: hop_floor(hop2_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program: bridge1_token_program,
         output_token_program: bridge2_token_program,
@@ -851,7 +977,7 @@ async fn build_three_hop_ixs(
         input_mint: bridge2_mint,
         output_mint,
         amount_in: guaranteed(hop2_out, quote.slippage_bps),
-        min_amount_out: 0, // router enforces the route floor
+        min_amount_out: route_floor.max(1),
         user: *user_pubkey,
         input_token_program: bridge2_token_program,
         output_token_program,
@@ -860,6 +986,7 @@ async fn build_three_hop_ixs(
     let executor3 = AmmExecutorType::from_pool_type(pool3_type)?;
     let mut ixs3 = executor3.build_swap_ix(&order3, &pool3_state)?;
     prune_missing_tick_arrays(&state.rpc, &mut ixs3, pool3_type, &order3.pool_address).await?;
+    let unwrapped = unwrap_for_native_sol_hop(pool3_type, &bridge2_mint, &mut ixs3, user_pubkey);
 
     // Combine: setups, swap1 + swap2 + swap3, cleanups — see tidy_multihop
     let mut combined_swap = ixs1.swap;
@@ -868,6 +995,9 @@ async fn build_three_hop_ixs(
     let mut combined_cleanup = ixs1.cleanup;
     combined_cleanup.extend(ixs2.cleanup);
     combined_cleanup.extend(ixs3.cleanup);
+    if unwrapped {
+        drop_wsol_close(&mut combined_cleanup, user_pubkey);
+    }
     let (setup, cleanup) = tidy_multihop(ixs1.setup, vec![ixs2.setup, ixs3.setup], combined_cleanup, user_pubkey);
 
     Ok(SwapInstructions { setup, swap: combined_swap, cleanup })
@@ -949,6 +1079,31 @@ mod tests {
             let result = pool_type_from_label(label).unwrap();
             assert_eq!(result, *expected, "label={label}");
         }
+    }
+
+    #[test]
+    fn native_sol_hops_wrap_the_guaranteed_amount_and_unwrap_before_a_buy() {
+        let user = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        // pump.fun selling into the SOL bridge wraps its floor: what hop 2 will spend
+        assert_eq!(hop_floor(1_000_000, 300), 970_000);
+        let _ = token;
+        // pump.fun buying from the SOL bridge: WSOL unwrapped first, inside the router
+        let buy = Instruction { program_id: crate::constants::PUMP_FUN_PROG_ID, accounts: vec![], data: vec![1] };
+        let mut ixs = SwapInstructions { setup: vec![], swap: vec![buy], cleanup: vec![] };
+        assert!(!unwrap_for_native_sol_hop(PoolType::MeteoraDbc, &SOL_NATIVE_MINT, &mut ixs, &user));
+        assert!(unwrap_for_native_sol_hop(PoolType::PumpFun, &SOL_NATIVE_MINT, &mut ixs, &user));
+        let wsol = spl_associated_token_account::get_associated_token_address(&user, &SOL_NATIVE_MINT);
+        assert_eq!((ixs.swap.len(), ixs.swap[0].data.as_slice(), ixs.swap[0].accounts[0].pubkey), (2, [9u8].as_slice(), wsol));
+        // ... so the route's cleanup must not close it again
+        let other = Pubkey::new_unique();
+        let mut cleanup = vec![
+            spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &wsol, &user, &user, &[]).unwrap(),
+            spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &other, &user, &user, &[]).unwrap(),
+        ];
+        drop_wsol_close(&mut cleanup, &user);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].accounts[0].pubkey, other);
     }
 
     #[test]

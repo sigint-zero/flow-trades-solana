@@ -35,6 +35,14 @@ impl QuoteRequest {
             return Err(TradeError::Validation("amount must be > 0".into()));
         }
 
+        // The router executes exact-input swaps only; quoting `amount` as an
+        // input when the caller meant an output would be silently wrong.
+        if let Some(mode) = params.mode.as_deref() {
+            if !mode.eq_ignore_ascii_case("ExactIn") {
+                return Err(TradeError::Validation(format!("unsupported mode {mode}: only ExactIn is supported")));
+            }
+        }
+
         let slippage_bps = params.slippage.unwrap_or(50);
         if slippage_bps > 10_000 {
             return Err(TradeError::Validation(format!("slippage must be <= 10000, got {slippage_bps}")));
@@ -170,6 +178,24 @@ mod tests {
     fn test_compute_threshold_clamp_excess_bps() {
         // bps > 10000 should be clamped
         assert_eq!(compute_threshold(1000, 15_000), 0);
+    }
+
+    #[test]
+    fn test_quote_request_rejects_exact_out() {
+        let params = |mode: Option<&str>| QuoteParams {
+            input: "So11111111111111111111111111111111111111112".to_string(),
+            output: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            amount: "1000000".to_string(),
+            slippage: None,
+            direct_only: None,
+            exclude: None,
+            dexes: None,
+            max_accounts: None,
+            mode: mode.map(str::to_string),
+        };
+        assert!(QuoteRequest::from_params(&params(Some("ExactOut"))).is_err(), "amount would be read as an input");
+        assert!(QuoteRequest::from_params(&params(Some("ExactIn"))).is_ok());
+        assert!(QuoteRequest::from_params(&params(None)).is_ok());
     }
 
     #[test]

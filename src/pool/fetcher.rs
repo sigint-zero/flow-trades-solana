@@ -44,7 +44,7 @@ pub async fn fetch_pool_state(
     let pool_data = fetch_account(rpc, pool_address).await?;
 
     match pool_type {
-        PoolType::RaydiumV4 => parse_raydium_v4(rpc, pool_address, &pool_data).await,
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, &pool_data),
         PoolType::RaydiumCpmm => {
             let mut st = parse_raydium_cpmm(pool_address, &pool_data)?;
             if let PoolState::RaydiumCpmm { config, trade_fee_bps, creator_fee_ppm, .. } = &mut st {
@@ -92,7 +92,13 @@ pub async fn fetch_pool_state(
         PoolType::Orca => parse_orca(pool_address, &pool_data),
         PoolType::FluxBeam => parse_fluxbeam(pool_address, &pool_data),
         PoolType::FlashTrade => parse_flash_trade(pool_address, &pool_data),
-        PoolType::Byreal => parse_byreal(pool_address, &pool_data),
+        PoolType::Byreal => {
+            let mut st = parse_byreal(pool_address, &pool_data)?;
+            if let PoolState::Byreal { amm_config, tick_spacing, fee_rate, .. } = &mut st {
+                *fee_rate = clmm_fee_rate_u16(rpc, amm_config, *tick_spacing, *fee_rate).await;
+            }
+            Ok(st)
+        }
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, &pool_data),
         PoolType::DefiTunaPools => parse_defituna_pools(pool_address, &pool_data),
         PoolType::Saros => parse_saros(pool_address, &pool_data),
@@ -113,9 +119,9 @@ pub async fn fetch_pool_state(
 }
 
 /// Parse pool state directly from raw account bytes — zero RPC.
-/// Returns Ok(state) for the 14 sync pool types that only need the pool account data.
-/// Returns Err for the 5 async pool types that need additional RPC calls (Raydium V4,
-/// PumpFun bonding, PumpFun AMM, Meteora Standard, Meteora DBC).
+/// Returns Ok(state) for the 15 sync pool types that only need the pool account data.
+/// Returns Err for the 4 async pool types that need additional RPC calls (PumpFun
+/// bonding, PumpFun AMM, Meteora Standard, Meteora DBC).
 ///
 /// Used by Geyser account updates to parse inline from notification payloads.
 pub fn parse_pool_state_from_bytes(
@@ -135,6 +141,7 @@ pub fn parse_pool_state_from_bytes(
 
     match pool_type {
         // Sync parsers — work from pool data alone (zero RPC)
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, &account),
         PoolType::RaydiumCpmm => parse_raydium_cpmm(pool_address, &account),
         PoolType::RaydiumCl => parse_raydium_clmm(pool_address, &account),
         PoolType::RaydiumLp => parse_raydium_lp(pool_address, &account),
@@ -160,7 +167,7 @@ pub fn parse_pool_state_from_bytes(
 /// Returns true if this pool type can be parsed from raw bytes without RPC.
 pub fn is_sync_parseable(pool_type: PoolType) -> bool {
     matches!(pool_type,
-        PoolType::RaydiumCpmm | PoolType::RaydiumCl | PoolType::RaydiumLp |
+        PoolType::RaydiumV4 | PoolType::RaydiumCpmm | PoolType::RaydiumCl | PoolType::RaydiumLp |
         PoolType::MeteoraDlmm | PoolType::MeteoraDamm | PoolType::Orca |
         PoolType::FluxBeam | PoolType::FlashTrade | PoolType::Byreal |
         PoolType::DefiTunaFusion | PoolType::DefiTunaPools | PoolType::Saros |
@@ -208,69 +215,38 @@ fn read_pubkey(data: &[u8], offset: usize) -> TradeResult<Pubkey> {
 }
 
 // -- Raydium V4 --
-// AmmInfo layout: authority(32) open_orders(32) target_orders(32)
-// coin_vault(32) pc_vault(32) ... serum_market(32) ...
-// Total AmmInfo ~752 bytes
-async fn parse_raydium_v4(
-    rpc: &RpcClient,
-    pool_address: &Pubkey,
-    pool_data: &Account,
-) -> TradeResult<PoolState> {
+// AmmInfo (752 bytes, no discriminator): status u64@0, nonce@8, … fees
+// {…, swap_fee_numerator@176, swap_fee_denominator@184}, state_data
+// {need_take_pnl_coin@192, need_take_pnl_pc@200, …, pool_open_time@224, …},
+// coin_vault@336, pc_vault@368, coin_vault_mint@400, pc_vault_mint@432,
+// lp_mint@464, open_orders@496, market@528, market_program@560,
+// target_orders@592.
+fn parse_raydium_v4(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
-    if data.len() < 680 {
+    if pool_data.owner != RAYDIUM_V4_PROG_ID {
+        return Err(TradeError::Execution(format!("raydium v4: account owned by {}", pool_data.owner)));
+    }
+    if data.len() < 752 {
         return Err(TradeError::Execution("raydium v4 account too small".into()));
     }
-
-    let coin_vault = read_pubkey(data, 336)?;
-    let pc_vault = read_pubkey(data, 368)?;
-    let open_orders = read_pubkey(data, 432)?;
-    let serum_market = read_pubkey(data, 464)?;
-    let serum_program = read_pubkey(data, 496)?;
-    let target_orders = read_pubkey(data, 528)?;
-
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    // Fetch serum market to get bids, asks, event_queue, vaults, vault_signer.
-    // Post Serum-shutdown many market accounts have been reclaimed (82 bytes / Token account).
-    // The Raydium V4 program still works for AMM-only swaps -- pass the market address
-    // as a placeholder for all serum fields when the market is closed.
-    let market_data = fetch_account(rpc, &serum_market).await?;
-    let mdata = &market_data.data;
-
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().unwrap());
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                &market_data.owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            // Serum market closed -- use market address as placeholder for all fields.
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
-
+    let rd = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    let (swap_fee_numerator, swap_fee_denominator) = (rd(176), rd(184));
+    if swap_fee_denominator == 0 || swap_fee_numerator >= swap_fee_denominator {
+        return Err(TradeError::Execution(format!("raydium v4 swap fee implausible: {swap_fee_numerator}/{swap_fee_denominator}")));
+    }
     Ok(PoolState::RaydiumV4 {
         amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
+        authority: *RAYDIUM_V4_AUTHORITY,
+        coin_vault: read_pubkey(data, 336)?,
+        pc_vault: read_pubkey(data, 368)?,
+        coin_mint: read_pubkey(data, 400)?,
+        pc_mint: read_pubkey(data, 432)?,
+        swap_fee_numerator,
+        swap_fee_denominator,
+        need_take_pnl_coin: rd(192),
+        need_take_pnl_pc: rd(200),
+        status: rd(0),
+        pool_open_time: rd(224),
     })
 }
 
@@ -332,6 +308,7 @@ fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     if data.len() < 8 + 1 + 7 * 32 {
         return Err(TradeError::Execution("raydium clmm account too small".into()));
     }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
     let off = 8;
     // bump at off, skip 2 bytes (bump + padding)
     let amm_config = read_pubkey(data, off + 1)?;
@@ -394,6 +371,7 @@ fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         sqrt_price_x64,
         liquidity,
         fee_rate,
+        fee_ext: crate::quote::clmm::RaydiumFeeExt::parse(data),
     })
 }
 
@@ -509,9 +487,69 @@ pub async fn launchlab_fee_rates(rpc: &RpcClient, global: &Pubkey, platform: &Pu
 }
 
 // -- PumpFun (Bonding Curve) --
-// Bonding curve layout V2: discriminator(8), reserves(5xu64=40), complete(1), creator(32), ...
+// Bonding curve layout: see `quote::pump_bonding::PumpCurve::parse`.
 // NOTE: mint is NOT stored in bonding curve data. We discover it by scanning
-// the bonding curve's token accounts via getTokenAccountsByOwner.
+// the bonding curve's token accounts via getTokenAccountsByOwner, once per curve.
+static PUMPFUN_MINTS: LazyLock<dashmap::DashMap<Pubkey, (Pubkey, Pubkey)>> = LazyLock::new(dashmap::DashMap::new);
+/// The pump.fun `Global` account (fee recipients), re-read at most every 5 min.
+static PUMPFUN_GLOBAL_DATA: std::sync::RwLock<Option<(std::time::Instant, Vec<u8>)>> = std::sync::RwLock::new(None);
+const PUMPFUN_GLOBAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+/// First of `Global.buyback_fee_recipients` — used when the Global is unreadable.
+static PUMPFUN_BUYBACK_FALLBACK: LazyLock<Pubkey> = LazyLock::new(|| pubkey_from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"));
+
+async fn pumpfun_global(rpc: &RpcClient) -> TradeResult<Vec<u8>> {
+    if let Some((at, d)) = PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if at.elapsed() < PUMPFUN_GLOBAL_MAX_AGE {
+            return Ok(d.clone());
+        }
+    }
+    let d = fetch_account(rpc, &PUMPFUN_GLOBAL).await?.data;
+    *PUMPFUN_GLOBAL_DATA.write().unwrap_or_else(|p| p.into_inner()) = Some((std::time::Instant::now(), d.clone()));
+    Ok(d)
+}
+
+/// `(fee_recipient, buyback_fee_recipient)` for a curve, from the `Global`
+/// account (verified on mainnet, 1087 bytes): mayhem-mode curves pay the
+/// reserved recipient (@483), the others the main one (@41); the buyback
+/// recipient is one of eight (@741), picked per mint to spread write locks.
+fn pumpfun_recipients(global: &[u8], mayhem: bool, mint: &Pubkey) -> (Pubkey, Pubkey) {
+    let fee = read_pubkey(global, if mayhem { 483 } else { 41 }).ok().filter(|k| *k != Pubkey::default()).unwrap_or(*PUMPFUN_FEE_FALLBACK);
+    let buyback = read_pubkey(global, 741 + 32 * (mint.to_bytes()[0] as usize % 8))
+        .ok()
+        .filter(|k| *k != Pubkey::default())
+        .unwrap_or(*PUMPFUN_BUYBACK_FALLBACK);
+    (fee, buyback)
+}
+
+/// Build a `PumpFun` state from the curve account + its (known) mint.
+fn pumpfun_state(pool_address: &Pubkey, data: &[u8], mint: Pubkey, token_prog: Pubkey, global_data: &[u8]) -> TradeResult<PoolState> {
+    let curve = crate::quote::pump_bonding::PumpCurve::parse(data)
+        .ok_or_else(|| TradeError::Execution("pumpfun: bonding curve account too small".into()))?;
+    // Creator at offset 49 (used for the creator_vault PDA)
+    let creator = if data.len() >= 81 { read_pubkey(data, 49)? } else { Pubkey::default() };
+    let associated_bonding_curve = spl_associated_token_account::get_associated_token_address_with_program_id(pool_address, &mint, &token_prog);
+    // no Global handed in (Geyser companion not cached yet): the last one read
+    let cached;
+    let global_data = if !global_data.is_empty() {
+        global_data
+    } else {
+        cached = PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, d)| d.clone()).unwrap_or_default();
+        &cached
+    };
+    let (fee_account, buyback_fee_recipient) = pumpfun_recipients(global_data, curve.is_mayhem_mode, &mint);
+    Ok(PoolState::PumpFun {
+        global: *PUMPFUN_GLOBAL,
+        fee_account,
+        mint,
+        bonding_curve: *pool_address,
+        associated_bonding_curve,
+        event_authority: *PUMPFUN_EVENT_AUTHORITY,
+        creator,
+        curve,
+        buyback_fee_recipient,
+    })
+}
+
 async fn parse_pumpfun(
     rpc: &RpcClient,
     pool_address: &Pubkey,
@@ -519,77 +557,43 @@ async fn parse_pumpfun(
 ) -> TradeResult<PoolState> {
     use solana_client::rpc_request::TokenAccountsFilter;
 
-    // Find the bonding curve's token account(s) to discover the mint (parallel fetch)
-    let (token_accounts, token_2022_accounts) = tokio::try_join!(
-        async {
-            rpc.get_token_accounts_by_owner(
-                pool_address,
-                TokenAccountsFilter::ProgramId(TOKEN_PROGRAM_ID),
-            ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token accounts: {e}")))
-        },
-        async {
-            rpc.get_token_accounts_by_owner(
-                pool_address,
-                TokenAccountsFilter::ProgramId(TOKEN_2022_PROGRAM_ID),
-            ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token-2022 accounts: {e}")))
-        },
-    )?;
-
-    let all_accounts: Vec<_> = token_accounts.into_iter().chain(token_2022_accounts).collect();
-
-    if all_accounts.is_empty() {
-        return Err(TradeError::Execution(
-            "pumpfun: no token accounts found for bonding curve".into(),
-        ));
-    }
-
-    // The first (and usually only) token account holds the bonding curve's tokens
-    let ta = &all_accounts[0];
-    let mint = if let solana_account_decoder::UiAccountData::Json(parsed) = &ta.account.data {
-        let mint_str = parsed.parsed["info"]["mint"].as_str().unwrap_or_default();
-        mint_str.parse::<Pubkey>().map_err(|e| TradeError::Execution(format!(
-            "pumpfun: failed to parse mint: {e}"
-        )))?
-    } else {
-        return Err(TradeError::Execution("pumpfun: unexpected account data format".into()));
+    let known = PUMPFUN_MINTS.get(pool_address).map(|v| *v);
+    let (mint, token_prog) = match known {
+        Some(v) => v,
+        None => {
+            // Find the bonding curve's token account(s) to discover the mint (parallel fetch)
+            let (token_accounts, token_2022_accounts) = tokio::try_join!(
+                async {
+                    rpc.get_token_accounts_by_owner(
+                        pool_address,
+                        TokenAccountsFilter::ProgramId(TOKEN_PROGRAM_ID),
+                    ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token accounts: {e}")))
+                },
+                async {
+                    rpc.get_token_accounts_by_owner(
+                        pool_address,
+                        TokenAccountsFilter::ProgramId(TOKEN_2022_PROGRAM_ID),
+                    ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token-2022 accounts: {e}")))
+                },
+            )?;
+            // Anyone can send tokens to the curve: the mint is the one whose
+            // `["bonding-curve", mint]` PDA is this account.
+            let mint = token_accounts
+                .into_iter()
+                .chain(token_2022_accounts)
+                .filter_map(|ta| match &ta.account.data {
+                    solana_account_decoder::UiAccountData::Json(parsed) => parsed.parsed["info"]["mint"].as_str().and_then(|m| m.parse::<Pubkey>().ok()),
+                    _ => None,
+                })
+                .find(|m| Pubkey::find_program_address(&[b"bonding-curve", m.as_ref()], &PUMP_FUN_PROG_ID).0 == *pool_address)
+                .ok_or_else(|| TradeError::Execution("pumpfun: no token account of the curve's mint".into()))?;
+            let token_prog = fetch_account(rpc, &mint).await?.owner;
+            PUMPFUN_MINTS.insert(*pool_address, (mint, token_prog));
+            (mint, token_prog)
+        }
     };
-
-    // Read creator from bonding curve data (offset 49, 32 bytes)
-    let creator = if pool_data.data.len() >= 81 {
-        read_pubkey(&pool_data.data, 49)?
-    } else {
-        Pubkey::default()
-    };
-
-    // Fetch mint account (for token program) and global config in parallel
-    let global = *PUMPFUN_GLOBAL;
-    let (mint_account, global_data) = tokio::try_join!(
-        fetch_account(rpc, &mint),
-        fetch_account(rpc, &global),
-    )?;
-    let token_prog = mint_account.owner;
-    let associated_bonding_curve = spl_associated_token_account::get_associated_token_address_with_program_id(
-        pool_address,
-        &mint,
-        &token_prog,
-    );
-    // Global layout: disc(8) + initialized(1) + authority(32@9) + fee_recipient(32@41)
-    let fee_account = if global_data.data.len() >= 73 {
-        read_pubkey(&global_data.data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
-    let event_authority = *PUMPFUN_EVENT_AUTHORITY;
-
-    Ok(PoolState::PumpFun {
-        global,
-        fee_account,
-        mint,
-        bonding_curve: *pool_address,
-        associated_bonding_curve,
-        event_authority,
-        creator,
-    })
+    let global_data = pumpfun_global(rpc).await?;
+    pumpfun_state(pool_address, &pool_data.data, mint, token_prog, &global_data)
 }
 
 // -- PumpFun AMM (pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA) --
@@ -605,6 +609,12 @@ async fn parse_pumpfun(
 // 171-202: pool_quote_vault (32)
 // 203-210: lp_supply (u64)
 // 211-242: coin_creator (32)
+// 243:   is_mayhem_mode (bool)
+// 244:   is_cashback_coin (bool)
+// 245-260: virtual_quote_reserves (i128)
+// 261-268: creator_fee_bps (u64)
+// 269:   can_edit_creator_fee (bool)
+// 270:   is_holder_reward (bool)
 /// Parse PumpFun AMM pool layout (sync, no RPC needed).
 fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
@@ -616,6 +626,18 @@ fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> Trade
     let quote_mint = read_pubkey(data, 75)?;
     let pool_base_vault = read_pubkey(data, 139)?;
     let pool_quote_vault = read_pubkey(data, 171)?;
+    let flag = |o: usize| data.get(o).is_some_and(|b| *b != 0);
+    let pamm_flags = crate::pool::types::PammFlags {
+        non_canonical: !is_pump_pool(pool_address, &read_pubkey(data, 11)?, &base_mint),
+        mayhem: flag(243),
+        cashback: flag(244),
+        creator_fee_bps: data.get(261..269).map(|b| u64::from_le_bytes(b.try_into().unwrap()).min(10_000) as u16).unwrap_or(0),
+    };
+    // i128 on chain; a negative value would be a program invariant violation
+    let virtual_quote_reserve = data
+        .get(245..261)
+        .map(|b| i128::from_le_bytes(b.try_into().unwrap()).clamp(0, u64::MAX as i128) as u64)
+        .unwrap_or(0);
 
     Ok(PoolState::PumpFunAmm {
         pool: *pool_address,
@@ -629,8 +651,23 @@ fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> Trade
         protocol_fee_recipient: Pubkey::default(),
         buyback_accounts: Vec::new(),
         base_supply: 0,
-            virtual_quote_reserve: if data.len() >= 253 { u64::from_le_bytes(data[245..253].try_into().unwrap()) } else { 0 },
+        virtual_quote_reserve,
+        pamm_flags,
     })
+}
+
+/// pump.fun's canonical-pool test: the pool was created by a pump.fun
+/// graduation iff `pool.creator` is the pump program's
+/// `["pool-authority", base_mint]` PDA. Cached per pool (both are immutable).
+fn is_pump_pool(pool: &Pubkey, pool_creator: &Pubkey, base_mint: &Pubkey) -> bool {
+    static CANONICAL: LazyLock<dashmap::DashMap<Pubkey, bool>> = LazyLock::new(dashmap::DashMap::new);
+    if let Some(v) = CANONICAL.get(pool) {
+        return *v;
+    }
+    let pda = Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], &PUMP_FUN_PROG_ID).0;
+    let v = pda == *pool_creator;
+    CANONICAL.insert(*pool, v);
+    v
 }
 
 /// Resolve, from a RECENT pAMM swap on this pool, (a) the currently valid
@@ -809,6 +846,8 @@ pub fn is_state_priced(pool_type: PoolType) -> bool {
     matches!(
         pool_type,
         PoolType::RaydiumCl | PoolType::Orca | PoolType::PancakeSwap | PoolType::Byreal | PoolType::DefiTunaFusion | PoolType::MeteoraDamm | PoolType::RaydiumLp
+            | PoolType::MeteoraDlmm
+            | PoolType::PumpFun | PoolType::MeteoraDbc
     )
 }
 
@@ -824,20 +863,70 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, account)?,
         PoolType::MeteoraDamm => parse_meteora_damm(pool_address, account)?,
         PoolType::RaydiumLp => parse_raydium_lp(pool_address, account)?,
+        PoolType::MeteoraDlmm => parse_meteora_dlmm(pool_address, account)?,
+        // not state-priced (vault balances), but its PnL / status live in the pool
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, account)?,
+        // Bonding curves: the account carries price + reserves; mint, config
+        // and fee recipients come from the full fetch (`prev`).
+        PoolType::PumpFun => {
+            let Some(PoolState::PumpFun { mint, associated_bonding_curve, fee_account, buyback_fee_recipient, .. }) = prev else {
+                return Err(TradeError::Execution("pumpfun: re-parse needs the fetched state".into()));
+            };
+            let token_prog = PUMPFUN_MINTS.get(pool_address).map(|v| v.1).unwrap_or(TOKEN_PROGRAM_ID);
+            // fee recipients from the cached Global when there is one (a curve
+            // can enter mayhem mode), else from the fetched state
+            let mut st = pumpfun_state(pool_address, &account.data, *mint, token_prog, &[])?;
+            if let PoolState::PumpFun { associated_bonding_curve: abc, fee_account: fee, buyback_fee_recipient: bb, .. } = &mut st {
+                if PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).is_none() {
+                    (*fee, *bb) = (*fee_account, *buyback_fee_recipient);
+                }
+                *abc = *associated_bonding_curve;
+            }
+            if matches!(st, PoolState::PumpFun { buyback_fee_recipient, .. } if buyback_fee_recipient == Pubkey::default()) {
+                return Err(TradeError::Execution("pumpfun: state predates the buyback recipient; needs a full fetch".into()));
+            }
+            st
+        }
+        PoolType::MeteoraDbc => {
+            // a state without its config (older warm file) is left to age into
+            // a full re-fetch instead of being refreshed as unquotable
+            let Some(PoolState::MeteoraDbc { quote_mint, curve, .. }) = prev.filter(|p| matches!(p, PoolState::MeteoraDbc { curve, .. } if !curve.config.curve.is_empty())) else {
+                return Err(TradeError::Execution("meteora dbc: re-parse needs the fetched state".into()));
+            };
+            dbc_state(pool_address, &account.data, *quote_mint, curve.config.clone())?
+        }
         other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
     };
-    match (&mut st, prev) {
-        (PoolState::RaydiumLp { curve, .. }, Some(PoolState::RaydiumLp { curve: prev_curve, .. })) => {
+    if let Some(prev) = prev {
+        carry_over_from_prev(&mut st, prev);
+    }
+    Ok(st)
+}
+
+/// A pool re-parsed from its raw account (block refresh, Geyser account
+/// stream) knows nothing that lives in OTHER accounts: config fee rates
+/// (`AmmConfig`, LaunchLab configs) and the pump.fun AMM fee accounts. Copy
+/// them from the previous full fetch of the same pool.
+pub fn carry_over_from_prev(st: &mut PoolState, prev: &PoolState) {
+    match (&mut *st, prev) {
+        (PoolState::RaydiumLp { curve, .. }, PoolState::RaydiumLp { curve: prev_curve, .. }) => {
             curve.curve_type = prev_curve.curve_type;
             curve.protocol_fee_rate = prev_curve.protocol_fee_rate;
             curve.platform_fee_rate = prev_curve.platform_fee_rate;
             curve.creator_fee_rate = prev_curve.creator_fee_rate;
         }
-        (PoolState::RaydiumClmm { fee_rate, .. }, Some(PoolState::RaydiumClmm { fee_rate: prev_fee, .. }))
-        | (PoolState::PancakeSwap { fee_rate, .. }, Some(PoolState::PancakeSwap { fee_rate: prev_fee, .. })) => *fee_rate = *prev_fee,
+        (PoolState::RaydiumClmm { fee_rate, .. }, PoolState::RaydiumClmm { fee_rate: prev_fee, .. })
+        | (PoolState::PancakeSwap { fee_rate, .. }, PoolState::PancakeSwap { fee_rate: prev_fee, .. })
+        | (PoolState::Byreal { fee_rate, .. }, PoolState::Byreal { fee_rate: prev_fee, .. }) => *fee_rate = *prev_fee,
+        (PoolState::RaydiumCpmm { trade_fee_bps, creator_fee_ppm, .. }, PoolState::RaydiumCpmm { trade_fee_bps: prev_fee, creator_fee_ppm: prev_creator, .. }) => {
+            if *trade_fee_bps == 0 {
+                *trade_fee_bps = *prev_fee;
+                *creator_fee_ppm = *prev_creator;
+            }
+        }
         _ => {}
     }
-    Ok(st)
+    st.carry_over_pamm_fee_accounts(prev);
 }
 
 /// Raydium-style CLMM `AmmConfig.trade_fee_rate` as hundredths of a basis
@@ -900,7 +989,14 @@ async fn parse_pumpfun_amm(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &A
                     fetch_token_balance(rpc, pool_quote_vault),
                 )
             },
-            resolve_pamm_fee_accounts(rpc, pool_address),
+            async {
+                // derivable from the global config: no getSignatures/getTransaction
+                if crate::execution::amms::pumpfun_amm::recipients_loaded() {
+                    (Pubkey::default(), Vec::new())
+                } else {
+                    resolve_pamm_fee_accounts(rpc, pool_address).await
+                }
+            },
             fetch_mint_supply(rpc, base_mint),
         );
         if let Ok((b, q)) = bal {
@@ -985,15 +1081,14 @@ async fn parse_meteora(
 
     // Reserves = the pool's LP share of each vault (2 lp mints + 2 lp accounts).
     let (trade_fee_numerator, trade_fee_denominator, constant_product) = crate::quote::meteora_std::parse_pool_fees(data).unwrap_or((0, 0, false));
-    let mut reserves = crate::quote::meteora_std::MeteoraStdReserves { trade_fee_numerator, trade_fee_denominator, constant_product, ..Default::default() };
+    let (protocol_fee_numerator, protocol_fee_denominator) = crate::quote::meteora_std::parse_protocol_fee(data).unwrap_or((0, 0));
+    let mut reserves = crate::quote::meteora_std::MeteoraStdReserves {
+        trade_fee_numerator, trade_fee_denominator, constant_product, protocol_fee_numerator, protocol_fee_denominator, ..Default::default()
+    };
     if constant_product {
         let extra = rpc.get_multiple_accounts(&[a_vault_lp_mint, b_vault_lp_mint, a_vault_lp, b_vault_lp]).await
             .map_err(|e| TradeError::Rpc(format!("meteora vault lp accounts: {e}")))?;
-        if let Some((a, b)) = meteora_std_amounts(&a_vault_data.data, &b_vault_data.data, &extra) {
-            reserves.token_a_amount = a;
-            reserves.token_b_amount = b;
-            reserves.computed_at = unix_now();
-        }
+        meteora_std_update(&mut reserves, &a_vault_data.data, &b_vault_data.data, &extra);
     }
 
     Ok(PoolState::Meteora {
@@ -1015,22 +1110,19 @@ async fn parse_meteora(
     })
 }
 
+/// Cluster time (vault locked-profit unlocks run on it).
 fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    crate::stream::chain_unix_time()
 }
 
-/// (token_a_amount, token_b_amount) from vault a/b data and
+/// Refresh a Meteora Standard pool's vault shares from vault a/b data and
 /// `[lp_mint_a, lp_mint_b, pool_lp_a, pool_lp_b]` accounts.
-fn meteora_std_amounts(vault_a: &[u8], vault_b: &[u8], extra: &[Option<Account>]) -> Option<(u64, u64)> {
-    use crate::quote::meteora_std::VaultView;
+fn meteora_std_update(reserves: &mut crate::quote::meteora_std::MeteoraStdReserves, vault_a: &[u8], vault_b: &[u8], extra: &[Option<Account>]) -> bool {
     if extra.len() < 4 {
-        return None;
+        return false;
     }
-    let supply = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(36..44)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
-    let bal = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(64..72)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
-    let (va, vb) = (VaultView::parse(vault_a)?, VaultView::parse(vault_b)?);
-    let now = unix_now();
-    Some((va.amount_by_share(bal(2)?, supply(0)?, now), vb.amount_by_share(bal(3)?, supply(1)?, now)))
+    let lp = |i: usize| extra[i].as_ref().map(|a| a.data.as_slice());
+    reserves.update(vault_a, vault_b, [lp(0), lp(1), lp(2), lp(3)], unix_now())
 }
 
 /// Keys to batch-read for a Meteora Standard reserve refresh, in the order
@@ -1052,15 +1144,7 @@ pub fn refresh_meteora_std_from(state: &mut PoolState, accounts: &[Option<Accoun
         return false;
     }
     let (Some(va), Some(vb)) = (&accounts[0], &accounts[1]) else { return false };
-    match meteora_std_amounts(&va.data, &vb.data, &accounts[2..6]) {
-        Some((a, b)) => {
-            reserves.token_a_amount = a;
-            reserves.token_b_amount = b;
-            reserves.computed_at = unix_now();
-            true
-        }
-        None => false,
-    }
+    meteora_std_update(reserves, &va.data, &vb.data, &accounts[2..6])
 }
 
 // -- Meteora DLMM --
@@ -1070,6 +1154,7 @@ pub fn refresh_meteora_std_from(state: &mut PoolState, accounts: &[Option<Accoun
 // status(1), require_base_factor_seed(1), base_factor_seed(2), activation_type(1), _pad(1),
 // token_x_mint(32), token_y_mint(32), reserve_x(32), reserve_y(32),
 // protocol_fee(16), _padding_1(32), reward_infos(2x144=288), oracle(32), ...
+// Fee parameters, active bin and bitmap for quoting: `quote::dlmm::DlmmPair`.
 fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
     if data.len() < 584 {
@@ -1120,6 +1205,7 @@ fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         host_fee_in,
         event_authority,
         bin_arrays,
+        pair: crate::quote::dlmm::DlmmPair::parse(data).unwrap_or_default(),
     })
 }
 
@@ -1138,9 +1224,12 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     let token_b_vault = read_pubkey(data, 264)?;
     // Curve (verified on mainnet): liquidity u128@360 (×2^64), sqrt_min@424,
     // sqrt_max@440, sqrt_price@456, activation_point u64@472, activation_type
-    // u8@480, pool_status@481, collect_fee_mode@484.
+    // u8@480, pool_status@481, collect_fee_mode@484, tracked reserves
+    // token_a_amount / token_b_amount u64@680/688 (compounding pools' curve).
     let rd128 = |o: usize| if data.len() >= o + 16 { u128::from_le_bytes(data[o..o + 16].try_into().unwrap()) } else { 0 };
     let (liquidity, sqrt_min_price, sqrt_max_price, sqrt_price) = (rd128(360), rd128(424), rd128(440), rd128(456));
+    let rd64 = |o: usize| if data.len() >= o + 8 { u64::from_le_bytes(data[o..o + 8].try_into().unwrap()) } else { 0 };
+    let (token_a_amount, token_b_amount) = (rd64(680), rd64(688));
     let activation_point = if data.len() >= 480 { u64::from_le_bytes(data[472..480].try_into().unwrap()) } else { 0 };
     let (activation_type, pool_status, collect_fee_mode) = if data.len() >= 485 { (data[480], data[481], data[484]) } else { (0, 0, 0) };
     let fees = crate::quote::damm_v2::DammFees::parse(data).unwrap_or_default();
@@ -1155,6 +1244,8 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         sqrt_price,
         sqrt_min_price,
         sqrt_max_price,
+        token_a_amount,
+        token_b_amount,
         fees,
         activation_point,
         activation_type,
@@ -1169,35 +1260,57 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
 //  136: base_mint (Pubkey)
 //  168: base_vault (Pubkey)
 //  200: quote_vault (Pubkey)
+//  price/reserves: see `quote::dbc::DbcCurve::apply_pool`
 // PoolConfig layout (1048 bytes):
-//   8:  quote_mint (Pubkey)
+//   8:  quote_mint (Pubkey); curve + fees: see `quote::dbc::DbcConfig::parse`
+/// PoolConfig → (quote_mint, curve + fees). Configs are immutable.
+static DBC_CONFIGS: LazyLock<dashmap::DashMap<Pubkey, (Pubkey, crate::quote::dbc::DbcConfig)>> = LazyLock::new(dashmap::DashMap::new);
+
+fn dbc_config(config_key: &Pubkey, config_data: &[u8]) -> TradeResult<(Pubkey, crate::quote::dbc::DbcConfig)> {
+    if let Some(c) = DBC_CONFIGS.get(config_key) {
+        return Ok(c.clone());
+    }
+    if config_data.len() < 40 {
+        return Err(TradeError::Execution("meteora dbc config too small".into()));
+    }
+    let quote_mint = read_pubkey(config_data, 8)?;
+    // An unparseable config leaves the curve empty: the pool is not quoted.
+    let cfg = crate::quote::dbc::DbcConfig::parse(config_data).unwrap_or_default();
+    if !cfg.curve.is_empty() {
+        DBC_CONFIGS.insert(*config_key, (quote_mint, cfg.clone()));
+    }
+    Ok((quote_mint, cfg))
+}
+
+fn dbc_state(pool_address: &Pubkey, data: &[u8], quote_mint: Pubkey, config: crate::quote::dbc::DbcConfig) -> TradeResult<PoolState> {
+    if data.len() < 232 {
+        return Err(TradeError::Execution("meteora dbc pool too small".into()));
+    }
+    let mut curve = crate::quote::dbc::DbcCurve { config, ..Default::default() };
+    curve.apply_pool(data);
+    Ok(PoolState::MeteoraDbc {
+        pool: *pool_address,
+        config: read_pubkey(data, 72)?,
+        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
+        base_vault: read_pubkey(data, 168)?,
+        quote_vault: read_pubkey(data, 200)?,
+        base_mint: read_pubkey(data, 136)?,
+        quote_mint,
+        curve,
+    })
+}
+
 async fn parse_meteora_dbc(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
     if data.len() < 232 {
         return Err(TradeError::Execution("meteora dbc pool too small".into()));
     }
-
     let config_key = read_pubkey(data, 72)?;
-    let base_mint = read_pubkey(data, 136)?;
-    let base_vault = read_pubkey(data, 168)?;
-    let quote_vault = read_pubkey(data, 200)?;
-
-    // Fetch config account to get quote_mint
-    let config_data = fetch_account(rpc, &config_key).await?;
-    if config_data.data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(&config_data.data, 8)?;
-
-    Ok(PoolState::MeteoraDbc {
-        pool: *pool_address,
-        config: config_key,
-        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
-    })
+    let (quote_mint, config) = match DBC_CONFIGS.get(&config_key) {
+        Some(c) => c.clone(),
+        None => dbc_config(&config_key, &fetch_account(rpc, &config_key).await?.data)?,
+    };
+    dbc_state(pool_address, data, quote_mint, config)
 }
 
 // -- Orca Whirlpool --
@@ -1367,60 +1480,49 @@ fn parse_flash_trade(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
     })
 }
 
+// -- Byreal CLMM (Raydium CLMM fork) --
+// Pool account = Raydium's 1544-byte PoolState (same offsets as PancakeSwap
+// below), plus Byreal fee fields in Raydium's padding (`quote::byreal_fee`).
+/// Anchor discriminator of Byreal's `PoolState` account.
+const BYREAL_POOL_DISCRIMINATOR: [u8; 8] = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46];
+
 fn parse_byreal(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
-    if data.len() < 8 + 9 * 32 {
+    if data.len() < 1176 {
         return Err(TradeError::Execution("byreal pool too small".into()));
     }
-    // Orca Whirlpool fork -- same interleaved layout
-    let off = 8;
-    let token_mint_a = read_pubkey(data, off + 93)?;
-    let token_vault_a = read_pubkey(data, off + 125)?;
-    let token_mint_b = read_pubkey(data, off + 173)?;
-    let token_vault_b = read_pubkey(data, off + 205)?;
-
-    let tick_spacing = if data.len() >= off + 35 {
-        u16::from_le_bytes(data[off + 33..off + 35].try_into().unwrap()) as i32
-    } else {
-        1
-    };
-
-    // liquidity: u128 at off+41 (same as Orca)
-    let liquidity = if data.len() >= off + 57 {
-        u128::from_le_bytes(data[off + 41..off + 57].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // sqrt_price_x64: u128 at off+57
-    let sqrt_price_x64 = if data.len() >= off + 73 {
-        u128::from_le_bytes(data[off + 57..off + 73].try_into().unwrap())
-    } else {
-        0
-    };
-
-    let tick_current = if data.len() >= off + 77 {
-        i32::from_le_bytes(data[off + 73..off + 77].try_into().unwrap())
-    } else {
-        0
-    };
-
-    let (oracle, _) = Pubkey::find_program_address(
-        &[b"oracle", pool_address.as_ref()],
-        &BYREAL_PROG_ID,
-    );
+    if data[..8] != BYREAL_POOL_DISCRIMINATOR {
+        return Err(TradeError::Execution(format!("byreal: {pool_address} is not a pool state")));
+    }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
+    let amm_config = read_pubkey(data, 9)?;
+    let token_mint_a = read_pubkey(data, 73)?;
+    let token_mint_b = read_pubkey(data, 105)?;
+    let token_vault_a = read_pubkey(data, 137)?;
+    let token_vault_b = read_pubkey(data, 169)?;
+    let observation = read_pubkey(data, 201)?;
+    let tick_spacing = u16::from_le_bytes(data[235..237].try_into().unwrap()) as i32;
+    let liquidity = u128::from_le_bytes(data[237..253].try_into().unwrap());
+    let sqrt_price_x64 = u128::from_le_bytes(data[253..269].try_into().unwrap());
+    let tick_current = i32::from_le_bytes(data[269..273].try_into().unwrap());
+    let fee = crate::quote::byreal_fee::ByrealFee::parse(data)
+        .ok_or_else(|| TradeError::Execution("byreal pool too small".into()))?;
 
     Ok(PoolState::Byreal {
         pool: *pool_address,
+        amm_config,
         token_vault_a,
         token_vault_b,
-        oracle,
+        observation,
         token_mint_a,
         token_mint_b,
         tick_current,
         tick_spacing,
         sqrt_price_x64,
         liquidity,
+        // AmmConfig.trade_fee_rate, read by `fetch_pool_state`; 25 bps until then
+        fee_rate: 2500,
+        fee,
     })
 }
 
@@ -1529,6 +1631,7 @@ fn parse_pancakeswap(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
     if data.len() < 273 {
         return Err(TradeError::Execution("pancakeswap pool too small".into()));
     }
+    crate::pool::ticks::record_tick_bitmap(pool_address, data);
     let amm_config = read_pubkey(data, 9)?;
     let token_mint_a = read_pubkey(data, 73)?;
     let token_mint_b = read_pubkey(data, 105)?;
@@ -1851,14 +1954,6 @@ fn pubkey_from_str(s: &str) -> Pubkey {
 /// Returns an empty Vec for sync-parseable types.
 pub fn extract_companion_keys(pool_type: PoolType, data: &[u8]) -> Vec<Pubkey> {
     match pool_type {
-        PoolType::RaydiumV4 => {
-            // Serum market at offset 464
-            if data.len() >= 496 {
-                read_pubkey(data, 464).into_iter().collect()
-            } else {
-                vec![]
-            }
-        }
         PoolType::Meteora => {
             // a_vault at 104, b_vault at 136
             if data.len() >= 168 {
@@ -1885,63 +1980,6 @@ pub fn extract_companion_keys(pool_type: PoolType, data: &[u8]) -> Vec<Pubkey> {
     }
 }
 
-/// Parse RaydiumV4 using cached serum market data (no RPC).
-pub fn parse_raydium_v4_with_companion(
-    pool_address: &Pubkey,
-    pool_data: &[u8],
-    serum_market_data: &[u8],
-    serum_market_owner: &Pubkey,
-) -> TradeResult<PoolState> {
-    if pool_data.len() < 680 {
-        return Err(TradeError::Execution("raydium v4 account too small".into()));
-    }
-
-    let coin_vault = read_pubkey(pool_data, 336)?;
-    let pc_vault = read_pubkey(pool_data, 368)?;
-    let open_orders = read_pubkey(pool_data, 432)?;
-    let serum_market = read_pubkey(pool_data, 464)?;
-    let serum_program = read_pubkey(pool_data, 496)?;
-    let target_orders = read_pubkey(pool_data, 528)?;
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    let mdata = serum_market_data;
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().map_err(|_|
-                TradeError::Execution("raydium v4: nonce slice".into()))?);
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                serum_market_owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
-
-    Ok(PoolState::RaydiumV4 {
-        amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
-    })
-}
-
 /// Parse PumpFun bonding curve using pre-discovered companion data (no RPC).
 ///
 /// The caller must have already discovered the mint (via one-time RPC) and
@@ -1953,37 +1991,7 @@ pub fn parse_pumpfun_with_companion(
     token_prog: Pubkey,
     global_data: &[u8],
 ) -> TradeResult<PoolState> {
-    let global = *PUMPFUN_GLOBAL;
-    let event_authority = *PUMPFUN_EVENT_AUTHORITY;
-
-    let creator = if pool_data.len() >= 81 {
-        read_pubkey(pool_data, 49)?
-    } else {
-        Pubkey::default()
-    };
-
-    let associated_bonding_curve =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            pool_address,
-            &mint,
-            &token_prog,
-        );
-
-    let fee_account = if global_data.len() >= 73 {
-        read_pubkey(global_data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
-
-    Ok(PoolState::PumpFun {
-        global,
-        fee_account,
-        mint,
-        bonding_curve: *pool_address,
-        associated_bonding_curve,
-        event_authority,
-        creator,
-    })
+    pumpfun_state(pool_address, pool_data, mint, token_prog, global_data)
 }
 
 /// Parse PumpFun AMM using cached vault balances from the AccountMirror (no RPC).
@@ -2076,26 +2084,8 @@ pub fn parse_meteora_dbc_with_companion(
     if pool_data.len() < 232 {
         return Err(TradeError::Execution("meteora dbc pool too small".into()));
     }
-
-    let config_key = read_pubkey(pool_data, 72)?;
-    let base_mint = read_pubkey(pool_data, 136)?;
-    let base_vault = read_pubkey(pool_data, 168)?;
-    let quote_vault = read_pubkey(pool_data, 200)?;
-
-    if config_data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(config_data, 8)?;
-
-    Ok(PoolState::MeteoraDbc {
-        pool: *pool_address,
-        config: config_key,
-        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
-    })
+    let (quote_mint, config) = dbc_config(&read_pubkey(pool_data, 72)?, config_data)?;
+    dbc_state(pool_address, pool_data, quote_mint, config)
 }
 
 /// Try to parse an async pool type using companion data from the AccountMirror.
@@ -2110,16 +2100,6 @@ pub fn parse_with_mirror(
     match pool_type {
         // Sync types — no mirror needed
         pt if is_sync_parseable(pt) => parse_pool_state_from_bytes(pt, pool_address, data, owner),
-
-        PoolType::RaydiumV4 => {
-            let market_key = read_pubkey(data, 464)?;
-            let market_data = mirror.get_companion(&market_key).ok_or_else(||
-                TradeError::Execution("raydium v4: serum market not in mirror".into()))?;
-            // We need the market owner for vault_signer derivation. Since Serum is closed,
-            // the owner doesn't matter (placeholder path). Use a default.
-            let market_owner = Pubkey::default();
-            parse_raydium_v4_with_companion(pool_address, data, &market_data, &market_owner)
-        }
 
         PoolType::PumpFunAmm => {
             // Sync layout parser + vault balances from mirror
@@ -2174,6 +2154,25 @@ mod tests {
     use super::*;
     use solana_sdk::account::Account;
     use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn raw_reparse_keeps_config_fees_from_the_previous_fetch() {
+        let cpmm = |trade_fee_bps: u16, creator_fee_ppm: u32| PoolState::RaydiumCpmm {
+            pool: Pubkey::new_unique(), authority: Pubkey::new_unique(), config: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(), token_1_vault: Pubkey::new_unique(),
+            token_0_mint: Pubkey::new_unique(), token_1_mint: Pubkey::new_unique(), observation: Pubkey::new_unique(),
+            trade_fee_bps, protocol_fees_0: 0, protocol_fees_1: 0, fund_fees_0: 0, fund_fees_1: 0,
+            creator_fee_ppm, enable_creator_fee: true, creator_fee_on: 0,
+        };
+        // a raw account parse cannot read AmmConfig: 0 → the fetched rate is kept
+        let mut raw = cpmm(0, 0);
+        carry_over_from_prev(&mut raw, &cpmm(4, 500));
+        assert!(matches!(raw, PoolState::RaydiumCpmm { trade_fee_bps: 4, creator_fee_ppm: 500, .. }));
+        // a parse that did read it wins
+        let mut fresh = cpmm(25, 0);
+        carry_over_from_prev(&mut fresh, &cpmm(4, 500));
+        assert!(matches!(fresh, PoolState::RaydiumCpmm { trade_fee_bps: 25, .. }));
+    }
 
     /// Helper: create an Account with zeroed data of the given size.
     fn make_account(size: usize) -> Account {
@@ -2448,6 +2447,7 @@ mod tests {
                 host_fee_in: _,
                 event_authority: _,
                 bin_arrays,
+                pair: _,
             } => {
                 assert_eq!(lb_pair, pool_addr);
                 assert_eq!(rx, reserve_x);
@@ -2683,46 +2683,80 @@ mod tests {
 
     // -- Byreal --
 
+    /// First 277 bytes of the mainnet Byreal SOL/USDC pool
+    /// 9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq (1544-byte Raydium-layout PoolState).
+    const BYREAL_SOL_USDC_HEAD: &str = "9+3j9dfD3kb+L+5YLsVv0o3EkYaL3WHYfedkSjbRQLqlJ34QDGMZ3i0O5g+zIL5ZpbxeXsNo7D0wbV4rc72JMFhn16FkdzmaAQabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWE+P+p8vsA0tRWI2pmfJWcDgCvYd1Z8DtaHbhyB+fCP8fKh9AAWLHxqPXRnLTvQYUQMIDXWKE4rJcPOdBLvnQoTJGcSSIj+UCpR/pbiCz8GHBSB03Hx1cNFGFm0ROoEwl4JBgEAO4RL5b0AAAAAAAAAAAAAAHRVmtjZOU9YAAAAAAAAAADYrP//AAAAAA==";
+
+    fn byreal_account() -> Account {
+        use base64::Engine;
+        let mut acct = make_account(1544);
+        let head = base64::engine::general_purpose::STANDARD.decode(BYREAL_SOL_USDC_HEAD).unwrap();
+        acct.data[..head.len()].copy_from_slice(&head);
+        acct
+    }
+
     #[test]
     fn test_parse_byreal_success() {
-        let mut acct = make_account(296);
-        let pool_addr = Pubkey::new_unique();
-
-        let token_mint_a = Pubkey::new_unique();
-        let token_vault_a = Pubkey::new_unique();
-        let token_mint_b = Pubkey::new_unique();
-        let token_vault_b = Pubkey::new_unique();
-
-        write_pubkey(&mut acct.data, 101, &token_mint_a);
-        write_pubkey(&mut acct.data, 133, &token_vault_a);
-        write_pubkey(&mut acct.data, 181, &token_mint_b);
-        write_pubkey(&mut acct.data, 213, &token_vault_b);
-
-        write_u16(&mut acct.data, 41, 4);
-        write_i32(&mut acct.data, 81, 123);
-
-        let result = parse_byreal(&pool_addr, &acct).unwrap();
+        let pool_addr = pubkey_from_str("9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq");
+        let result = parse_byreal(&pool_addr, &byreal_account()).unwrap();
         match result {
             PoolState::Byreal {
                 pool,
-                token_vault_a: va,
-                token_vault_b: vb,
-                token_mint_a: ma,
-                token_mint_b: mb,
+                amm_config,
+                token_vault_a,
+                token_vault_b,
+                observation,
+                token_mint_a,
+                token_mint_b,
                 tick_current,
                 tick_spacing,
-                ..
+                sqrt_price_x64,
+                liquidity,
+                fee_rate,
+                fee,
             } => {
                 assert_eq!(pool, pool_addr);
-                assert_eq!(va, token_vault_a);
-                assert_eq!(vb, token_vault_b);
-                assert_eq!(ma, token_mint_a);
-                assert_eq!(mb, token_mint_b);
-                assert_eq!(tick_current, 123);
-                assert_eq!(tick_spacing, 4);
+                assert_eq!(amm_config, pubkey_from_str("4E6xP73xzTs4aCvY92hbXRwWkYptNwvViPZmLcZEBUk4"));
+                assert_eq!(token_mint_a, SOL_NATIVE_MINT);
+                assert_eq!(token_mint_b, USDC_MINT);
+                assert_eq!(token_vault_a, pubkey_from_str("5BzogZvHNEuwstR4iwTWdd7jknFBZqJQWVjxPsDfEUD6"));
+                assert_eq!(token_vault_b, pubkey_from_str("HL8turx8hJEEPVH4ivxzxwfdxVA1PH3LeYbSmh3hYfzz"));
+                assert_eq!(observation, pubkey_from_str("3T6qNbQqWYDfSTew1ifsNedtoeDP8LRuCegmUH27ykEZ"));
+                assert_eq!(tick_spacing, 1);
+                assert_eq!(tick_current, -21288);
+                assert_eq!(liquidity, 815_595_750_459);
+                assert_eq!(sqrt_price_x64, 6_363_368_406_302_479_732);
+                assert_eq!(fee_rate, 2500, "AmmConfig fee is read by fetch_pool_state");
+                assert_eq!((fee.pool_trade_fee_rate, fee.flags, fee.decimals_0, fee.decimals_1), (0, 0, 9, 6), "no pool-level fee features");
+                assert!(!fee.is_dynamic());
             }
             _ => panic!("expected Byreal variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_byreal_reads_the_pool_fee_fields() {
+        let pool_addr = Pubkey::new_unique();
+        // the mainnet dynamic-fee SOL/USDC pool's fields: trade_fee_rate 1,
+        // flags 24 (dynamic fee, token 1 quote), buffer 100, 10/20/40/50, USDC feed
+        let mut acct = byreal_account();
+        acct.data[393..397].copy_from_slice(&1u32.to_le_bytes());
+        acct.data[1096] = 24;
+        acct.data[1100..1102].copy_from_slice(&100u16.to_le_bytes());
+        acct.data[1102..1106].copy_from_slice(&[10, 20, 40, 50]);
+        acct.data[1080..1088].copy_from_slice(&1_700_000_000u64.to_le_bytes());
+        let usdc_feed: [u8; 32] = [0xea, 0xa0, 0x20, 0xc6, 0x1c, 0xc4, 0x79, 0x71, 0x28, 0x13, 0x46, 0x1c, 0xe1, 0x53, 0x89, 0x4a, 0x96, 0xa6, 0xc0, 0x0b, 0x21, 0xed, 0x0c, 0xfc, 0x27, 0x98, 0xd1, 0xf9, 0xa9, 0xe9, 0xc9, 0x4a];
+        acct.data[1144..1176].copy_from_slice(&usdc_feed);
+        let PoolState::Byreal { fee, .. } = parse_byreal(&pool_addr, &acct).unwrap() else { panic!() };
+        assert_eq!((fee.pool_trade_fee_rate, fee.flags, fee.open_time, fee.arbitrage_fee_buffer_ppm), (1, 24, 1_700_000_000, 100));
+        assert_eq!((fee.slippage_fee_base, fee.slippage_fee_threshold, fee.imbalance_fee_base, fee.imbalance_fee_x), (10, 20, 40, 50));
+        assert!(fee.is_dynamic());
+        assert_eq!(fee.oracle_1, pubkey_from_str("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"), "sponsored USDC/USD feed");
+        // a launch decay-fee pool (flags 7, init 2 %, −1 % / 255 s)
+        let mut acct = byreal_account();
+        acct.data[1096..1100].copy_from_slice(&[7, 2, 1, 255]);
+        let PoolState::Byreal { fee, .. } = parse_byreal(&pool_addr, &acct).unwrap() else { panic!() };
+        assert_eq!((fee.flags, fee.decay_init_rate, fee.decay_decrease_rate, fee.decay_interval), (7, 2, 1, 255));
     }
 
     #[test]
@@ -2730,6 +2764,8 @@ mod tests {
         let acct = make_account(50);
         let pool_addr = Pubkey::new_unique();
         assert!(parse_byreal(&pool_addr, &acct).is_err());
+        // right size, wrong account type (e.g. a payer picked as the pool)
+        assert!(parse_byreal(&pool_addr, &make_account(1544)).is_err());
     }
 
     // -- DefiTuna Fusion --
@@ -3127,25 +3163,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_byreal_oracle_is_pda() {
-        let mut acct = make_account(296);
-        let pool_addr = Pubkey::new_unique();
-        for &offset in &[101, 133, 181, 213] {
-            write_pubkey(&mut acct.data, offset, &Pubkey::new_unique());
-        }
-        let result = parse_byreal(&pool_addr, &acct).unwrap();
-        if let PoolState::Byreal { oracle, .. } = result {
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"oracle", pool_addr.as_ref()],
-                &BYREAL_PROG_ID,
-            );
-            assert_eq!(oracle, expected);
-        } else {
-            panic!("expected Byreal");
-        }
-    }
-
     // -- Boundary size tests (exact minimum) --
 
     #[test]
@@ -3195,13 +3212,48 @@ mod tests {
 
     // ── Companion parser tests ──
 
+    /// Mainnet Raydium AMM v4 SOL/USDC pool 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2
+    /// (752-byte AmmInfo, status 6 = SwapOnly, need_take_pnl coin 39,925,487 /
+    /// pc 4,739,163 — the offsets its `ray_log` curve reserves were checked against).
+    const RAYDIUM_V4_SOL_USDC: &str = "BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAJAAAAAAAAAAYAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAEBCDwAAAAAA9AEAAAAAAAAAAAAAAAAAAEBCDwAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAA7zZhAgAAAABbUEgAAAAAAE64FyutAwAALkI4/Jo0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACzqVos/TzgAAAAAAAAAAABzVLPxIFgFAAAAAAAAAAAAMWNjiHMDAACZN03ShGQFAAAAAAAAAAAAQEusDaXyOAAAAAAAAAAAAEiYZsIJJAAAuHDhLdN5iRVh0un6jyZDGDTrc28vJPwqKk3/H9XcpN/yy7m3YO3bGFcGMDBjrTPXtXKW6gLU4DNeMc6vpMxC3QabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWFsT5PYWOiP+v6gjENnRJfo5qkywMgxSCYqGuPMx4KexvkvOQ/5YJ6K1De7jkwfGqQ6wF0kMIzKd96FEsVQkpLTasTDzvqfGb9UyNwPXk0c7uUyfSZIKynSsTy6pDRHIY0NB1GoKC2mEwX+KZw3uZjlhHHbETUDcxD4vhBFpgr27qvkPHweIeqm+XyL01XiG9EnlnR1bByOEGxucSuhFtlwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh9l8Mi0iVAABO2XAAAAAAABAEAAAAAAAAAAAAAAAAAAA=";
+
+    fn raydium_v4_account() -> Account {
+        use base64::Engine;
+        let mut acct = make_account(0);
+        acct.data = base64::engine::general_purpose::STANDARD.decode(RAYDIUM_V4_SOL_USDC).unwrap();
+        acct.owner = RAYDIUM_V4_PROG_ID;
+        acct
+    }
+
     #[test]
-    fn test_extract_companion_keys_raydium_v4() {
-        let mut data = vec![0u8; 680];
-        let market = Pubkey::new_unique();
-        write_pubkey(&mut data, 464, &market);
-        let keys = extract_companion_keys(PoolType::RaydiumV4, &data);
-        assert_eq!(keys, vec![market]);
+    fn test_parse_raydium_v4_mainnet_amm_info() {
+        let pool = pubkey_from_str("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2");
+        let st = parse_raydium_v4(&pool, &raydium_v4_account()).unwrap();
+        let PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, swap_fee_numerator, swap_fee_denominator, need_take_pnl_coin, need_take_pnl_pc, status, pool_open_time } = st else {
+            panic!("expected RaydiumV4");
+        };
+        assert_eq!(amm_id, pool);
+        assert_eq!(authority, pubkey_from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+        assert_eq!(coin_vault, pubkey_from_str("DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz"));
+        assert_eq!(pc_vault, pubkey_from_str("HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz"));
+        assert_eq!((coin_mint, pc_mint), (SOL_NATIVE_MINT, USDC_MINT));
+        assert_eq!((swap_fee_numerator, swap_fee_denominator), (25, 10_000));
+        assert_eq!((need_take_pnl_coin, need_take_pnl_pc), (39_925_487, 4_739_163));
+        assert_eq!((status, pool_open_time), (6, 0));
+        // sync: parseable from raw bytes (Geyser / block refresh)
+        assert!(is_sync_parseable(PoolType::RaydiumV4));
+        assert!(parse_pool_state_from_bytes(PoolType::RaydiumV4, &pool, &raydium_v4_account().data, &RAYDIUM_V4_PROG_ID).is_ok());
+    }
+
+    #[test]
+    fn test_parse_raydium_v4_rejects_foreign_or_short_accounts() {
+        let pool = Pubkey::new_unique();
+        let mut foreign = raydium_v4_account();
+        foreign.owner = Pubkey::new_unique();
+        assert!(parse_raydium_v4(&pool, &foreign).is_err());
+        let mut short = raydium_v4_account();
+        short.data.truncate(700);
+        assert!(parse_raydium_v4(&pool, &short).is_err());
     }
 
     #[test]
@@ -3232,50 +3284,14 @@ mod tests {
         assert!(extract_companion_keys(PoolType::RaydiumCpmm, &data).is_empty());
         assert!(extract_companion_keys(PoolType::Orca, &data).is_empty());
         assert!(extract_companion_keys(PoolType::PumpFunAmm, &data).is_empty());
+        assert!(extract_companion_keys(PoolType::RaydiumV4, &data).is_empty());
     }
 
     #[test]
     fn test_extract_companion_keys_too_short() {
         let data = vec![0u8; 10]; // way too short
-        assert!(extract_companion_keys(PoolType::RaydiumV4, &data).is_empty());
         assert!(extract_companion_keys(PoolType::Meteora, &data).is_empty());
         assert!(extract_companion_keys(PoolType::MeteoraDbc, &data).is_empty());
-    }
-
-    #[test]
-    fn test_raydium_v4_with_companion_closed_market() {
-        let pool_addr = Pubkey::new_unique();
-        let mut pool_data = vec![0u8; 680];
-        let market = Pubkey::new_unique();
-        write_pubkey(&mut pool_data, 336, &Pubkey::new_unique()); // coin_vault
-        write_pubkey(&mut pool_data, 368, &Pubkey::new_unique()); // pc_vault
-        write_pubkey(&mut pool_data, 432, &Pubkey::new_unique()); // open_orders
-        write_pubkey(&mut pool_data, 464, &market); // serum_market
-        write_pubkey(&mut pool_data, 496, &Pubkey::new_unique()); // serum_program
-        write_pubkey(&mut pool_data, 528, &Pubkey::new_unique()); // target_orders
-
-        // Short market data = closed serum (< 388 bytes)
-        let market_data = vec![0u8; 82];
-        let market_owner = Pubkey::new_unique();
-
-        let result = parse_raydium_v4_with_companion(&pool_addr, &pool_data, &market_data, &market_owner);
-        assert!(result.is_ok());
-        if let PoolState::RaydiumV4 { serum_bids, serum_asks, serum_market: sm, .. } = result.unwrap() {
-            // Closed market: all serum fields = market address
-            assert_eq!(serum_bids, market);
-            assert_eq!(serum_asks, market);
-            assert_eq!(sm, market);
-        } else {
-            panic!("expected RaydiumV4");
-        }
-    }
-
-    #[test]
-    fn test_raydium_v4_with_companion_too_small() {
-        let result = parse_raydium_v4_with_companion(
-            &Pubkey::new_unique(), &[0u8; 100], &[], &Pubkey::default(),
-        );
-        assert!(result.is_err());
     }
 
     #[test]
@@ -3388,6 +3404,92 @@ mod tests {
         } else {
             panic!("expected MeteoraDbc");
         }
+    }
+
+    fn b64(s: &str) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap()
+    }
+
+    fn key(s: &str) -> Pubkey {
+        s.parse().unwrap()
+    }
+
+    /// pump.fun `Global` (4wTV1Y…, mainnet), the first 997 of its 1087 bytes:
+    /// everything through the buyback fee recipients.
+    const PUMP_GLOBAL_B64: &str = "p+joschscn8B07uMqzQc4FKEV/LDgX0yeEQZY9zVX+1YuiTJmd2sAqpKwvjQ3Vy8l+MonBl8tQYqVPPZVrnOblEV+WVnqlyz5gAQ2EfjzwMAAKwj/AYAAAAAeMX7UdECAACAxqR+jQMAXwAAAAAAAAAf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wHB4eQAAAAAAAUAAAAAAAAAYIzMHfzpYbQ7d5wZFQWm4tO/RdWk20YYrXbILWF1RTVjg3MADqIssmTTSv9koEte+r+7dN3NBImXsZgVR9fREIOEdCkuZ1qUtDbssKmYiUIyioPdxiM4ApYSZ8XNYRfLjRgaDISfqTem80re0wge+VcAqssMm7PZCaS5FHUnpOutEeak/ClEpPqCUb74FUJuG/soxrZkZndgfGrZ9WamRteqj7Bg2CkbTE1HXa/3Yslr3A2s6zbAEurRLtOpSEFh4ATIfOuY+lzkf4A4Bv0seUXSlSSVmuwA3tl4FPOPeEYf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wchXZlAeTaU4RYGbORZuBj9+bugx7QbeD+joSDKQZUyAaKLX9JqtHmmqcxsv2sLI+thiFo3HgEgrKkTvu89E4p46JMUH7GOnxV02BDheOGeMGBOMXWqLkoy38hgByfRBwkBNYRTYlYJT5EoGRJ++k5Ea0MzcheT0Th2+arb89x9C19udQGCIPlCZ3ADI3tNa0U3WbSlxpC1nDXZuxh6CQy9KjOYep67E2eZq1mSWxPl3Iswgd8AXbQnwUePpG/4w0egdOlUPz43otBGInrdy06cd0xEJYxD7fJKqKrh8AIUZlvaTDjNbbdDj1m0CLuew7TKnorR8fJGU8SZtXlsINv5sy3dnuo/ObNyEVxxhHwYRc+lNsaFB04DDkTQId4++eNcTLeA8I7i/uhL7ERqV3gl2mjUOfqKXaOwxc/1D2P0VGsBQ55lEMA9ZfrZMeidBL4Ltw1Rlx9RxBX7NEwH20GfISICI1UWqRcTTGdYjEk4IK4VXulmZVd6wbcY2kfdzyoFDuan4iBou4hkCqV/kJMIxh/vcRoBY/WnVcBwvIYNH2NnIHzs2lvMbLHq8PFtaEBFZrGNVtJIGssxcDJlbpBVHHhElkH4SVjcc6dqhdh1b1XALNrKiboZMnkMNoqxV+ktc8VLlrXJMZQeRupL4uDjESd0T8a3TPtFXv6vi9VxeSztRPwfePlKM9CQnF5rX7AhVwrY262N6P2z0g7RzZnrjk6HcBV+6+tnimVduZs39rEybHZX25DPuKh6vvjHtvLIaQ==";
+
+    #[test]
+    fn pumpfun_recipients_from_the_live_global() {
+        let g = b64(PUMP_GLOBAL_B64);
+        let mint = Pubkey::new_from_array([3u8; 32]); // 3 % 8 → the fourth buyback recipient
+        let (fee, buyback) = pumpfun_recipients(&g, false, &mint);
+        assert_eq!(fee, key("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"));
+        assert_eq!(buyback, key("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"));
+        let (fee, _) = pumpfun_recipients(&g, true, &mint);
+        assert_eq!(fee, key("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS"), "mayhem-mode curves pay the reserved recipient");
+        assert_eq!(pumpfun_recipients(&[], false, &mint), (*PUMPFUN_FEE_FALLBACK, *PUMPFUN_BUYBACK_FALLBACK));
+    }
+
+    #[test]
+    fn pumpfun_block_refresh_reparses_the_curve_and_keeps_the_rest() {
+        let g = b64(PUMP_GLOBAL_B64);
+        let mint = Pubkey::new_unique();
+        let curve_addr = Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &PUMP_FUN_PROG_ID).0;
+        let mut data = vec![0u8; 151];
+        data[8..16].copy_from_slice(&1_073_000_000_000_000u64.to_le_bytes());
+        data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
+        data[24..32].copy_from_slice(&793_100_000_000_000u64.to_le_bytes());
+        data[40..48].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        write_pubkey(&mut data, 49, &Pubkey::new_unique());
+        let prev = pumpfun_state(&curve_addr, &data, mint, TOKEN_2022_PROGRAM_ID, &g).unwrap();
+        // a buy lands: the refresh re-reads only the curve account
+        data[16..24].copy_from_slice(&31_000_000_000u64.to_le_bytes());
+        data[32..40].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+        let acct = Account { data: data.clone(), ..make_account(0) };
+        let fresh = reparse_pool_state(PoolType::PumpFun, &curve_addr, &acct, Some(&prev)).unwrap();
+        let (PoolState::PumpFun { mint: m, associated_bonding_curve: abc, curve, buyback_fee_recipient, .. }, PoolState::PumpFun { associated_bonding_curve: prev_abc, .. }) = (&fresh, &prev) else {
+            panic!("expected PumpFun");
+        };
+        assert_eq!((*m, *abc), (mint, *prev_abc), "mint and the Token-2022 curve ATA come from the fetch");
+        assert_eq!((curve.virtual_sol_reserves, curve.real_sol_reserves), (31_000_000_000, 1_000_000_000));
+        assert_ne!(*buyback_fee_recipient, Pubkey::default());
+        assert!(reparse_pool_state(PoolType::PumpFun, &curve_addr, &acct, None).is_err(), "never a bare re-parse");
+    }
+
+    /// Live DBC pool CCa7ito… and its config 7bH1hBvb… (Bags: 2 % in SOL, two
+    /// segments), each up to its last non-zero byte.
+    const DBC_POOL_B64: &str = "1eAF0WJFd1wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYe35TRSCCnng8FOHW+TAASCkfWEdaxdvbJO0bPpZO2GW9IxB+lQoWn0Mv1MP3ImwcJ2CW26SYv/mj11vXExSy9aTxQHbIVvSx+PM8j6FRjFlhGnxpnqyHt/NdX+zekFzACYbykOWwbZyFZVgIm22NFtR0o2h//FUAA+7/0YvAvZnegc0Y9i+7BORSteZmwPCJHIeiMSs3Nr9ivQxCM1lE+zUbyk4Qc4N6LoECQAAAAAAAAAAAAAAAP8OUgYAAAAAAAAAAAAAAACQxT0AAAAAADiVs1b5NAsAAAAAAAAAAAAmhssaAAAAAAAAAAAAAAAAAAAAAAAAAAD/DlIGAAAAAAAAAAAAAAAAsmDmGgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAABQAAAAAAAAA";
+    const DBC_CONFIG_B64: &str = "GmwOe3TmgSsGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAARnY+t+uy/kVf3qIq/o+IZk+Z2NzDeTdiAQ/sYqEvcdDlvSMQfpUKFp9DL9TD9yJsHCdgltukmL/5o9db1xMUssALTEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAkAAABkAAAABgEAAAAAAAAAAAAAALACcfeMwIQLABJlyhMAAAAfItprGfZbAnsU/n9IVy4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGSns7bgDQAAZKeztuANAgDIAAABxAkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB+dTuTDikLAAAAAAAAAAAA5Dn3oty9FgAAAAAAAAAAAACA9gWeJVwazMlQmbvBAAAubv5/SFcuAAAAAAAAAAAAAMAwVc8efbppjQZGnHcAAA==";
+
+    #[test]
+    fn dbc_state_from_live_accounts_and_block_refresh() {
+        let pool = key("CCa7itoNXuvpPDYyyRhMqJaNstq9SD6rkB29xDHWRmKR");
+        let mut p = b64(DBC_POOL_B64);
+        p.resize(crate::quote::dbc::POOL_LEN, 0);
+        let mut c = b64(DBC_CONFIG_B64);
+        c.resize(crate::quote::dbc::CONFIG_LEN, 0);
+        let st = parse_meteora_dbc_with_companion(&pool, &p, &c).unwrap();
+        let PoolState::MeteoraDbc { base_mint, quote_mint, config, curve, .. } = &st else { panic!("expected MeteoraDbc") };
+        assert_eq!(*base_mint, key("FScwFv8SDJhfKZJjz65XPYrPkrYkCUMYmFAhdGAVBAGS"));
+        assert_eq!(*quote_mint, SOL_NATIVE_MINT);
+        assert_eq!(*config, key("7bH1hBvbEiJneWXwGSYRYGewto314EeK3xcFPoaaJHQL"));
+        assert_eq!((curve.sqrt_price, curve.quote_reserve, curve.base_reserve), (3_154_470_249_927_992, 151_304_936, 994_804_277_164_627_180));
+        assert_eq!((curve.activation_point, curve.is_migrated), (449_545_766, false));
+        let cfg = &curve.config;
+        assert_eq!((cfg.collect_fee_mode, cfg.activation_type, cfg.base_fee_mode, cfg.cliff_fee_numerator, cfg.dynamic_fee), (0, 0, 0, 20_000_000, false));
+        assert_eq!((cfg.migration_quote_threshold, cfg.migration_sqrt_price, cfg.sqrt_start_price), (85_000_000_000, 13_043_817_825_309_819, 3_141_367_320_245_630));
+        assert_eq!(cfg.curve, vec![
+            (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
+            (13_043_817_825_332_782, 2_425_988_008_058_820_449_100_000_000_000_000),
+        ]);
+        // block refresh: the pool account alone, config kept
+        p[280..296].copy_from_slice(&3_200_000_000_000_000u128.to_le_bytes());
+        let acct = Account { data: p, ..make_account(0) };
+        let fresh = reparse_pool_state(PoolType::MeteoraDbc, &pool, &acct, Some(&st)).unwrap();
+        let PoolState::MeteoraDbc { curve: fresh_curve, .. } = &fresh else { panic!("expected MeteoraDbc") };
+        assert_eq!(fresh_curve.sqrt_price, 3_200_000_000_000_000);
+        assert_eq!(fresh_curve.config, *cfg);
+        assert!(is_state_priced(PoolType::PumpFun) && is_state_priced(PoolType::MeteoraDbc), "touched by a block → re-read");
     }
 
     #[test]

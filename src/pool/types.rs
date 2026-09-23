@@ -162,23 +162,47 @@ impl SplSwapFees {
     }
 }
 
+/// The pump.fun AMM pool facts its fee program keys on (`Pool` account:
+/// `creator` @11, `is_mayhem_mode` @243, `is_cashback_coin` @244,
+/// `creator_fee_bps` @261). The default is a canonical pool with no overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PammFlags {
+    /// `pool.creator` is not the pump program's `["pool-authority", base_mint]`
+    /// PDA, i.e. the pool was not created by a pump.fun graduation: it pays the
+    /// flat schedule, not the market-cap tiers.
+    pub non_canonical: bool,
+    /// Mayhem-mode pool: market cap is taken on a fixed 1e15 supply.
+    pub mayhem: bool,
+    /// Cashback coin: the creator fee is credited to the trader's volume accumulator.
+    pub cashback: bool,
+    /// Per-pool creator fee rate; replaces the schedule's creator rate when
+    /// non-zero and the global config allows it.
+    pub creator_fee_bps: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolState {
+    /// Raydium AMM v4 (`AmmInfo`, 752 bytes). The program prices swaps on
+    /// `vault − need_take_pnl` without the OpenBook market, so the
+    /// state is parsed from the pool account alone and swaps use
+    /// `swap_base_in_v2`, which takes no market accounts.
     RaydiumV4 {
         amm_id: Pubkey,
         authority: Pubkey,
-        open_orders: Pubkey,
-        target_orders: Pubkey,
         coin_vault: Pubkey,
         pc_vault: Pubkey,
-        serum_program: Pubkey,
-        serum_market: Pubkey,
-        serum_bids: Pubkey,
-        serum_asks: Pubkey,
-        serum_event_queue: Pubkey,
-        serum_coin_vault: Pubkey,
-        serum_pc_vault: Pubkey,
-        serum_vault_signer: Pubkey,
+        coin_mint: Pubkey,
+        pc_mint: Pubkey,
+        /// `fees.swap_fee_numerator / swap_fee_denominator` (ceil, off the input).
+        swap_fee_numerator: u64,
+        swap_fee_denominator: u64,
+        /// `state_data.need_take_pnl_{coin,pc}`: accrued protocol PnL sitting in
+        /// the vaults but outside the curve.
+        need_take_pnl_coin: u64,
+        need_take_pnl_pc: u64,
+        /// `AmmStatus` (1 Initialized, 6 SwapOnly, 7 WaitingTrade can swap).
+        status: u64,
+        pool_open_time: u64,
     },
     RaydiumCpmm {
         pool: Pubkey,
@@ -229,6 +253,9 @@ pub enum PoolState {
         liquidity: u128,
         /// Fee rate in hundredths of a basis point (e.g., 2500 = 25 bps)
         fee_rate: u16,
+        /// Fee side (`fee_on`) and dynamic fee of newer pools.
+        #[serde(default)]
+        fee_ext: crate::quote::clmm::RaydiumFeeExt,
     },
     RaydiumLp {
         pool_state: Pubkey,
@@ -253,6 +280,14 @@ pub enum PoolState {
         event_authority: Pubkey,
         /// Creator pubkey from bonding curve data (offset +49). Used for creator_vault PDA.
         creator: Pubkey,
+        /// Reserves and flags of the curve (`quote::pump_bonding`), re-read with
+        /// the account.
+        #[serde(default)]
+        curve: crate::quote::pump_bonding::PumpCurve,
+        /// One of `Global.buyback_fee_recipients`: a writable remaining account
+        /// every buy/sell must carry (after the `bonding-curve-v2` PDA).
+        #[serde(default)]
+        buyback_fee_recipient: Pubkey,
     },
     PumpFunAmm {
         pool: Pubkey,
@@ -287,11 +322,14 @@ pub enum PoolState {
         /// so the quote engine needs it; 0 = unknown → the most expensive tier is
         /// assumed (a conservative quote, never a spurious revert).
         base_supply: u64,
-        /// Virtual quote reserve (u64 at pool offset 245, mid-2026 update): the
+        /// Virtual quote reserve (i128 at pool offset 245, mid-2026 update): the
         /// curve prices on `quote_reserve + virtual_quote_reserve`, not on the
         /// vault balance alone (verified byte-exact on live Buy/Sell events).
         #[serde(default)]
         virtual_quote_reserve: u64,
+        /// Pool facts that select the fee schedule (see `PammFlags`).
+        #[serde(default)]
+        pamm_flags: PammFlags,
     },
     Meteora {
         pool: Pubkey,
@@ -324,6 +362,9 @@ pub enum PoolState {
         event_authority: Pubkey,
         /// Bin array PDAs derived from active_id
         bin_arrays: Vec<Pubkey>,
+        /// Fee parameters, active bin and liquidity bitmap (see `quote::dlmm`).
+        #[serde(default)]
+        pair: crate::quote::dlmm::DlmmPair,
     },
     MeteoraDamm {
         pool: Pubkey,
@@ -340,6 +381,12 @@ pub enum PoolState {
         sqrt_min_price: u128,
         #[serde(default)]
         sqrt_max_price: u128,
+        /// Reserves the pool tracks itself (layout v1); the curve of a
+        /// compounding pool (`collect_fee_mode` 2).
+        #[serde(default)]
+        token_a_amount: u64,
+        #[serde(default)]
+        token_b_amount: u64,
         #[serde(default)]
         fees: crate::quote::damm_v2::DammFees,
         #[serde(default)]
@@ -360,6 +407,9 @@ pub enum PoolState {
         quote_vault: Pubkey,
         base_mint: Pubkey,
         quote_mint: Pubkey,
+        /// Price, reserves and the config's curve + fees (`quote::dbc`).
+        #[serde(default)]
+        curve: crate::quote::dbc::DbcCurve,
     },
     Orca {
         whirlpool: Pubkey,
@@ -396,11 +446,14 @@ pub enum PoolState {
         custody: Pubkey,
         token_mint: Pubkey,
     },
+    /// Byreal CLMM: a Raydium CLMM fork (same pool / AmmConfig / tick-array
+    /// layouts and PDAs, own program id).
     Byreal {
         pool: Pubkey,
+        amm_config: Pubkey,
         token_vault_a: Pubkey,
         token_vault_b: Pubkey,
-        oracle: Pubkey,
+        observation: Pubkey,
         token_mint_a: Pubkey,
         token_mint_b: Pubkey,
         tick_current: i32,
@@ -409,6 +462,12 @@ pub enum PoolState {
         sqrt_price_x64: u128,
         /// Current tick range liquidity (u128)
         liquidity: u128,
+        /// `AmmConfig.trade_fee_rate`, hundredths of a basis point
+        fee_rate: u16,
+        /// Byreal's pool-level fee fields (rate override, launch decay fee,
+        /// dynamic-fee flag) — see `quote::byreal_fee`.
+        #[serde(default)]
+        fee: crate::quote::byreal_fee::ByrealFee,
     },
     DefiTunaFusion {
         pool: Pubkey,
@@ -725,7 +784,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();
@@ -748,6 +807,7 @@ mod tests {
             host_fee_in: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             bin_arrays: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            pair: Default::default(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();
@@ -774,6 +834,7 @@ mod tests {
             sqrt_price_x64: 1u128 << 64,
             liquidity: 1_000_000,
             fee_rate: 25,
+            fee_ext: Default::default(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();

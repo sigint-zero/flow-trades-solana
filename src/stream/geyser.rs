@@ -337,6 +337,9 @@ async fn run_session(
         let account_info = match update.update_oneof {
             Some(UpdateOneof::Block(block_update)) => {
                 crate::stream::note_slot(block_update.slot);
+                if let Some(t) = block_update.block_time.as_ref() {
+                    crate::stream::note_block_time(t.timestamp);
+                }
                 raw_tx_updates.fetch_add(block_update.transactions.len() as u64, Ordering::Relaxed);
 
                 // Swap stream: parse + broadcast every confirmed DEX swap.
@@ -395,15 +398,17 @@ async fn run_session(
                                 let candidate = all_keys[acct_idx];
                                 if manager.registry.contains(&candidate) { return; }
 
-                                // PumpFun bonding: extract mint from tx accounts (index 2)
-                                if pool_type == PoolType::PumpFun && accounts.len() > 2 {
-                                    let mint_idx = accounts[2] as usize;
+                                // PumpFun bonding: extract mint from tx accounts (index 2;
+                                // index 1 with the token program at 3 in the `_v2` layout)
+                                let (mint_at, tp_at) = if pool_idx == 10 { (1, 3) } else { (2, 8) };
+                                if pool_type == PoolType::PumpFun && accounts.len() > mint_at {
+                                    let mint_idx = accounts[mint_at] as usize;
                                     if mint_idx < all_keys.len() {
                                         let mint = all_keys[mint_idx];
                                         let mut mint_data = vec![0u8; 64];
                                         mint_data[..32].copy_from_slice(mint.as_ref());
-                                        if accounts.len() > 8 {
-                                            let tp_idx = accounts[8] as usize;
+                                        if accounts.len() > tp_at {
+                                            let tp_idx = accounts[tp_at] as usize;
                                             if tp_idx < all_keys.len() {
                                                 mint_data[32..64].copy_from_slice(all_keys[tp_idx].as_ref());
                                             }
@@ -593,13 +598,11 @@ async fn run_session(
                 // Register vaults for this pool (buffers for subscription update)
                 register_pool_vaults(manager, &pool_address, &state, &pending_vaults);
 
-                // A raw-bytes re-parse cannot see the pump.fun AMM buyback accounts
-                // resolved earlier from a swap — keep them across the refresh.
+                // A raw-bytes re-parse cannot see what lives in other accounts
+                // (config fee rates, pump.fun AMM fee accounts) — keep it.
                 let mut state = state;
-                if state.needs_pamm_fee_accounts() {
-                    if let Some(prev) = manager.cache.get(&pool_address) {
-                        state.carry_over_pamm_fee_accounts(&prev);
-                    }
+                if let Some(prev) = manager.cache.get(&pool_address) {
+                    crate::pool::fetcher::carry_over_from_prev(&mut state, &prev);
                 }
                 manager.cache.insert(pool_address, state);
                 manager.stats.record_update();
@@ -659,10 +662,8 @@ async fn run_session(
                         }
                     }
                     let mut state = state;
-                    if state.needs_pamm_fee_accounts() {
-                        if let Some(prev) = manager.cache.get(&pool_address) {
-                            state.carry_over_pamm_fee_accounts(&prev);
-                        }
+                    if let Some(prev) = manager.cache.get(&pool_address) {
+                        crate::pool::fetcher::carry_over_from_prev(&mut state, &prev);
                     }
                     manager.cache.insert(pool_address, state);
                     manager.stats.record_update();

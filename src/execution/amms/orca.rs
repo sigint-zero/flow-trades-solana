@@ -54,15 +54,16 @@ impl AmmExecutor for OrcaExecutor {
         // Direction
         let a_to_b = order.input_mint == *token_mint_a;
 
-        // Derive tick arrays based on swap direction
-        let ta_current = derive_tick_array(whirlpool, tick_current, tick_spacing, 0);
-        let (ta0, ta1, ta2) = if a_to_b {
-            let ta_prev = derive_tick_array(whirlpool, tick_current, tick_spacing, -1);
-            (ta_current, ta_prev, ta_prev)
-        } else {
-            let ta_next = derive_tick_array(whirlpool, tick_current, tick_spacing, 1);
-            (ta_current, ta_next, ta_next)
-        };
+        // Three sequential tick arrays in the swap direction, from the one
+        // holding the current tick (one spacing up for b→a, as Orca's SDK
+        // does). The quote engine walks no further (`TickData::swap_tick_bound`).
+        let first = if a_to_b { tick_current } else { tick_current + tick_spacing };
+        let step = if a_to_b { -1 } else { 1 };
+        let (ta0, ta1, ta2) = (
+            derive_tick_array(whirlpool, first, tick_spacing, 0),
+            derive_tick_array(whirlpool, first, tick_spacing, step),
+            derive_tick_array(whirlpool, first, tick_spacing, 2 * step),
+        );
 
         // Determine token programs for A and B mints
         let (prog_a, prog_b) = if a_to_b {

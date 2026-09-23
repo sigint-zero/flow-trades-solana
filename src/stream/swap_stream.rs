@@ -491,10 +491,10 @@ fn parse_one_tx(
                     } else {
                         legs.in_amount as u128
                     };
-                    if let Some(bps) = crate::stream::observed_fees::implied_fee_bps(
+                    if let Some(ppm) = crate::stream::observed_fees::implied_fee_ppm(
                         paid_in, legs.out_amount as u128, legs.r_in_pre, legs.r_out_pre,
                     ) {
-                        crate::stream::observed_fees::record(pool, bps);
+                        crate::stream::observed_fees::record(pool, ppm);
                     }
                 }
                 build_swap(&facts.sig, slot, facts.block_time, dex, pool, facts.fee_payer,

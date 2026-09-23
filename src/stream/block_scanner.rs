@@ -100,7 +100,7 @@ pub fn dex_program_to_type(program_id: &Pubkey) -> Option<PoolType> {
 ///
 /// Each DEX puts the pool account at a specific index:
 /// - accounts[1]: RaydiumV4, RaydiumCpmm, RaydiumLp, Meteora, MeteoraDlmm, FluxBeam, Saros, Dooar
-/// - accounts[2]: RaydiumCl, PumpFun, MeteoraDamm, MeteoraDbc, Orca, PancakeSwap
+/// - accounts[2]: RaydiumCl, Byreal, PumpFun, MeteoraDamm, MeteoraDbc, Orca, PancakeSwap
 /// - accounts[3]: PumpupBonding (pool_sol_account)
 /// - accounts[0]: PumpFunAmm (buy/sell: `[0] pool, [1] user, [2] global_config,
 ///   [3] base_mint, ...` — index 3 was the MINT, which made every pAMM pool
@@ -117,6 +117,7 @@ pub fn extract_pool_index(pool_type: PoolType) -> usize {
         PoolType::Saros => 1,
         PoolType::Dooar => 1,
         PoolType::RaydiumCl => 2,
+        PoolType::Byreal => 2,
         PoolType::PumpFun => 2,
         PoolType::MeteoraDamm => 2,
         PoolType::MeteoraDbc => 2,
@@ -129,7 +130,6 @@ pub fn extract_pool_index(pool_type: PoolType) -> usize {
         PoolType::PumpupBonding => 3,
         // Remaining DEXes: try accounts[1] as a reasonable default
         PoolType::FlashTrade
-        | PoolType::Byreal
         | PoolType::DefiTunaFusion
         | PoolType::DefiTunaPools => 1,
         PoolType::Unknown => 1,
@@ -213,13 +213,31 @@ pub fn swap_pool_index(program_id: &Pubkey, ix_data: &[u8]) -> Option<(PoolType,
     const LP_BUY_EXACT_OUT: [u8; 8] = [24, 211, 116, 40, 105, 3, 153, 56];
     const LP_SELL_EXACT_IN: [u8; 8] = [149, 39, 222, 155, 211, 124, 152, 26];
     const LP_SELL_EXACT_OUT: [u8; 8] = [95, 200, 71, 34, 8, 9, 11, 166];
+    const BYREAL_SWAP_V3_DYN: [u8; 8] = [229, 46, 213, 132, 105, 40, 40, 228]; // Byreal `swap_v3_dyn`
     let idx = match base {
-        // Raydium V4: legacy u8 tag — 9 = swap_base_in, 11 = swap_base_out; [1] = amm
-        PoolType::RaydiumV4 => (matches!(ix_data.first(), Some(9) | Some(11))).then_some(1)?,
+        // Raydium V4: legacy u8 tag — 9 / 11 = swap_base_in / swap_base_out,
+        // 16 / 17 = their `_v2` forms without OpenBook accounts; [1] = amm
+        PoolType::RaydiumV4 => (matches!(ix_data.first(), Some(9) | Some(11) | Some(16) | Some(17))).then_some(1)?,
         PoolType::RaydiumCpmm => (d(CPMM_SWAP_BASE_IN) || d(CPMM_SWAP_BASE_OUT)).then_some(3)?,
         PoolType::RaydiumLp => (d(LP_BUY_EXACT_IN) || d(LP_BUY_EXACT_OUT) || d(LP_SELL_EXACT_IN) || d(LP_SELL_EXACT_OUT)).then_some(4)?,
         PoolType::RaydiumCl | PoolType::PancakeSwap => (d(ANCHOR_SWAP) || d(ANCHOR_SWAP_V2)).then_some(2)?,
-        PoolType::PumpFun => (d(BUY_DISC) || d(SELL_DISC)).then_some(3)?,
+        // Byreal (Raydium CLMM fork): swap / swap_v2 / swap_v3_dyn, [2] = pool_state
+        PoolType::Byreal => (d(ANCHOR_SWAP) || d(ANCHOR_SWAP_V2) || d(BYREAL_SWAP_V3_DYN)).then_some(2)?,
+        // bonding curve at [3] in buy/sell/buy_exact_sol_in, at [10] in the
+        // `_v2` instructions (quote-mint aware; also used on SOL curves)
+        PoolType::PumpFun => {
+            use crate::execution::amms::pumpfun::BUY_EXACT_SOL_IN_DISC;
+            const BUY_V2: [u8; 8] = [0xb8, 0x17, 0xee, 0x61, 0x67, 0xc5, 0xd3, 0x3d];
+            const SELL_V2: [u8; 8] = [0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2];
+            const BUY_EXACT_QUOTE_IN_V2: [u8; 8] = [0xc2, 0xab, 0x1c, 0x46, 0x68, 0x4d, 0x5b, 0x2f];
+            if d(BUY_DISC) || d(SELL_DISC) || d(BUY_EXACT_SOL_IN_DISC) {
+                3
+            } else if d(BUY_V2) || d(SELL_V2) || d(BUY_EXACT_QUOTE_IN_V2) {
+                10
+            } else {
+                return None;
+            }
+        }
         PoolType::PumpFunAmm => (d(BUY_DISC) || d(SELL_DISC) || d(BUY_EXACT_QUOTE_IN_DISC)).then_some(0)?,
         PoolType::Meteora => d(ANCHOR_SWAP).then_some(0)?,
         PoolType::MeteoraDlmm => (d(ANCHOR_SWAP) || d(SWAP2) || d(DLMM_EXACT_OUT) || d(DLMM_WITH_PRICE)).then_some(0)?,
@@ -230,7 +248,7 @@ pub fn swap_pool_index(program_id: &Pubkey, ix_data: &[u8]) -> Option<(PoolType,
         }
         // SPL token-swap forks: single-byte tag 1 = Swap; [0] = swap state
         PoolType::FluxBeam | PoolType::Saros | PoolType::Dooar => (ix_data.first() == Some(&1)).then_some(0)?,
-        PoolType::FlashTrade | PoolType::Byreal | PoolType::DefiTunaPools => 0,
+        PoolType::FlashTrade | PoolType::DefiTunaPools => 0,
         PoolType::DefiTunaFusion => 4,
         // Pumpup shares one program across the AMM (`swap`, [0] pool) and the
         // bonding curve (`buy`/`sell`, [3] pool_sol_account).
@@ -292,10 +310,11 @@ pub(crate) fn pool_type_for_ix_b58(program_id: &Pubkey, ix_data_b58: &str) -> Op
 pub fn extract_mints_from_state(state: &crate::pool::types::PoolState) -> Option<(Pubkey, Pubkey)> {
     use crate::pool::types::PoolState;
     match state {
-        PoolState::RaydiumV4 { .. } => {
-            // RaydiumV4 doesn't store mints in PoolState — skip
-            None
-        }
+        PoolState::RaydiumV4 {
+            coin_mint,
+            pc_mint,
+            ..
+        } => Some((*coin_mint, *pc_mint)),
         PoolState::RaydiumCpmm {
             token_0_mint,
             token_1_mint,
@@ -572,6 +591,9 @@ async fn run_block_subscribe(
     while let Some(notification) = stream.next().await {
         let update = notification.value;
         crate::stream::note_slot(update.slot);
+        if let Some(t) = update.block.as_ref().and_then(|b| b.block_time) {
+            crate::stream::note_block_time(t);
+        }
         if let Some(block) = update.block {
             *summary_slots += 1;
 
@@ -637,6 +659,9 @@ async fn run_block_subscribe(
                                 }
                                 if crate::pool::fetcher::is_state_priced(pool_type) {
                                     let _ = crate::pool::ticks::load_clmm_ticks(&rpc, &state).await;
+                                }
+                                if pool_type == PoolType::MeteoraDlmm {
+                                    let _ = crate::pool::bins::load_dlmm_bins(&rpc, &state).await;
                                 }
                                 if let Some((mint_a, mint_b)) = extract_mints_from_state(&state) {
                                     // token program + Token-2022 transfer fee, once per mint
@@ -749,11 +774,24 @@ mod tests {
         let f = |pid: &Pubkey, data: &[u8]| swap_pool_index(pid, data);
         assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[9, 0, 0]), Some((PoolType::RaydiumV4, 1)));
         assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[11]), Some((PoolType::RaydiumV4, 1)));
+        assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[16, 0]), Some((PoolType::RaydiumV4, 1)), "swap_base_in_v2");
+        assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[17, 0]), Some((PoolType::RaydiumV4, 1)), "swap_base_out_v2");
         assert_eq!(f(&RAYDIUM_V4_PROG_ID, &[3]), None, "V4 deposit is not a swap");
+        // Byreal (Raydium CLMM fork): [0] is the payer, [2] the pool — mainnet
+        // swap_v3_dyn / swap_v2 on 27x6aSxc… and 5bWgqeKb…
+        let byreal_v3_dyn = [0xe5u8, 0x2e, 0xd5, 0x84, 0x69, 0x28, 0x28, 0xe4];
+        assert_eq!(f(&BYREAL_PROG_ID, &byreal_v3_dyn), Some((PoolType::Byreal, 2)));
+        assert_eq!(f(&BYREAL_PROG_ID, &anchor_swap_v2), Some((PoolType::Byreal, 2)));
+        assert_eq!(f(&BYREAL_PROG_ID, &anchor_swap), Some((PoolType::Byreal, 2)));
+        assert_eq!(f(&BYREAL_PROG_ID, &[0x87, 0x80, 0x2f, 0x4d, 0x0f, 0x98, 0xf0, 0x31]), None, "open_position is not a swap");
         assert_eq!(f(&RAYDIUM_CPMM_PROG_ID, &cpmm_in), Some((PoolType::RaydiumCpmm, 3)));
         assert_eq!(f(&RAYDIUM_LP_PROG_ID, &lp_buy_in), Some((PoolType::RaydiumLp, 4)));
         assert_eq!(f(&RAYDIUM_CL_PROG_ID, &anchor_swap_v2), Some((PoolType::RaydiumCl, 2)));
         assert_eq!(f(&PUMP_FUN_PROG_ID, &BUY_DISC), Some((PoolType::PumpFun, 3)), "bonding curve, not the mint at [2]");
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &crate::execution::amms::pumpfun::BUY_EXACT_SOL_IN_DISC), Some((PoolType::PumpFun, 3)));
+        // sell_v2 (live, 61xBNv9n…): the curve moves to [10]
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &[0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2]), Some((PoolType::PumpFun, 10)));
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &[0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4]), None, "create_v2 is not a swap");
         assert_eq!(f(&PUMP_FUN_AMM_PROG_ID, &SELL_DISC), Some((PoolType::PumpFunAmm, 0)));
         assert_eq!(f(&METEORA_PROG_ID, &anchor_swap), Some((PoolType::Meteora, 0)));
         assert_eq!(f(&METEORA_DLMM_PROG_ID, &anchor_swap), Some((PoolType::MeteoraDlmm, 0)));
@@ -861,6 +899,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base, quote)));
@@ -897,33 +936,30 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: mint_a,
             token_b_mint: mint_b,
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
     }
 
     #[test]
-    fn test_extract_mints_from_state_raydium_v4_returns_none() {
-        // RaydiumV4 doesn't store mints in PoolState
+    fn test_extract_mints_from_state_raydium_v4() {
+        let (coin, pc) = (Pubkey::new_unique(), Pubkey::new_unique());
         let state = crate::pool::types::PoolState::RaydiumV4 {
             amm_id: Pubkey::new_unique(),
             authority: Pubkey::new_unique(),
-            open_orders: Pubkey::new_unique(),
-            target_orders: Pubkey::new_unique(),
             coin_vault: Pubkey::new_unique(),
             pc_vault: Pubkey::new_unique(),
-            serum_program: Pubkey::new_unique(),
-            serum_market: Pubkey::new_unique(),
-            serum_bids: Pubkey::new_unique(),
-            serum_asks: Pubkey::new_unique(),
-            serum_event_queue: Pubkey::new_unique(),
-            serum_coin_vault: Pubkey::new_unique(),
-            serum_pc_vault: Pubkey::new_unique(),
-            serum_vault_signer: Pubkey::new_unique(),
+            coin_mint: coin,
+            pc_mint: pc,
+            swap_fee_numerator: 25,
+            swap_fee_denominator: 10_000,
+            need_take_pnl_coin: 0,
+            need_take_pnl_pc: 0,
+            status: 6,
+            pool_open_time: 0,
         };
-        let result = extract_mints_from_state(&state);
-        assert!(result.is_none());
+        assert_eq!(extract_mints_from_state(&state), Some((coin, pc)));
     }
 
     #[test]
@@ -937,6 +973,8 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
+            buyback_fee_recipient: Pubkey::new_unique(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint, SOL_NATIVE_MINT)));
@@ -957,6 +995,7 @@ mod tests {
             host_fee_in: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             bin_arrays: vec![],
+            pair: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_x, mint_y)));
@@ -970,10 +1009,9 @@ mod tests {
 
         let states = vec![
             crate::pool::types::PoolState::RaydiumV4 {
-                amm_id: pk(), authority: pk(), open_orders: pk(), target_orders: pk(),
-                coin_vault: pk(), pc_vault: pk(), serum_program: pk(), serum_market: pk(),
-                serum_bids: pk(), serum_asks: pk(), serum_event_queue: pk(),
-                serum_coin_vault: pk(), serum_pc_vault: pk(), serum_vault_signer: pk(),
+                amm_id: pk(), authority: pk(), coin_vault: pk(), pc_vault: pk(),
+                coin_mint: pk(), pc_mint: pk(), swap_fee_numerator: 25, swap_fee_denominator: 10_000,
+                need_take_pnl_coin: 0, need_take_pnl_pc: 0, status: 6, pool_open_time: 0,
             },
             crate::pool::types::PoolState::RaydiumCpmm {
                 pool: pk(), authority: pk(), config: pk(),
@@ -992,7 +1030,7 @@ mod tests {
                 tick_array_0: pk(), tick_array_1: pk(), tick_array_2: pk(),
                 token_mint_0: pk(), token_mint_1: pk(),
                 tick_current: 0, tick_spacing: 1,
-                sqrt_price_x64: 0, liquidity: 0, fee_rate: 0,
+                sqrt_price_x64: 0, liquidity: 0, fee_rate: 0, fee_ext: Default::default(),
             },
             crate::pool::types::PoolState::Orca {
                 whirlpool: pk(), token_vault_a: pk(), token_vault_b: pk(),
@@ -1003,7 +1041,7 @@ mod tests {
             crate::pool::types::PoolState::MeteoraDamm {
                 pool: pk(), token_a_vault: pk(), token_b_vault: pk(),
                 token_a_mint: pk(), token_b_mint: pk(),
-                liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+                liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
             },
         ];
 
@@ -1089,6 +1127,7 @@ mod tests {
             quote_vault: Pubkey::new_unique(),
             base_mint,
             quote_mint,
+            curve: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base_mint, quote_mint)));
@@ -1196,14 +1235,15 @@ mod tests {
         let mint_b = Pubkey::new_unique();
         let state = crate::pool::types::PoolState::Byreal {
             pool: Pubkey::new_unique(),
+            amm_config: Pubkey::new_unique(),
             token_vault_a: Pubkey::new_unique(),
             token_vault_b: Pubkey::new_unique(),
-            oracle: Pubkey::new_unique(),
+            observation: Pubkey::new_unique(),
             token_mint_a: mint_a,
             token_mint_b: mint_b,
             tick_current: 0,
             tick_spacing: 1,
-            sqrt_price_x64: 0, liquidity: 0,
+            sqrt_price_x64: 0, liquidity: 0, fee_rate: 2500, fee: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_a, mint_b)));
@@ -1226,7 +1266,7 @@ mod tests {
             token_mint_1: mint_1,
             tick_current: 0,
             tick_spacing: 1,
-            sqrt_price_x64: 0, liquidity: 0, fee_rate: 0,
+            sqrt_price_x64: 0, liquidity: 0, fee_rate: 0, fee_ext: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_0, mint_1)));

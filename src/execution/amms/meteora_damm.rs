@@ -16,10 +16,10 @@ impl AmmExecutor for MeteoraDammExecutor {
         order: &SwapOrder,
         pool_state: &PoolState,
     ) -> TradeResult<SwapInstructions> {
-        let (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint) = match pool_state {
+        let (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint, fees) = match pool_state {
             PoolState::MeteoraDamm {
-                pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint, ..
-            } => (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint),
+                pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint, fees, ..
+            } => (pool, token_a_vault, token_b_vault, token_a_mint, token_b_mint, fees),
             _ => return Err(TradeError::Execution("expected MeteoraDamm pool state".into())),
         };
 
@@ -83,7 +83,7 @@ impl AmmExecutor for MeteoraDammExecutor {
         };
 
         // Accounts (14) -- DAMM v2 IDL
-        let accounts = vec![
+        let mut accounts = vec![
             AccountMeta::new_readonly(pool_authority, false),           // [0]
             AccountMeta::new(*pool, false),                             // [1]
             AccountMeta::new(user_source_ata, false),                   // [2]
@@ -99,6 +99,12 @@ impl AmmExecutor for MeteoraDammExecutor {
             AccountMeta::new_readonly(event_authority, false),          // [12]
             AccountMeta::new_readonly(METEORA_DAMM_PROG_ID, false),     // [13]
         ];
+        // A rate-limiter pool inside its window checks, via the instructions
+        // sysvar (first remaining account), that this is the only swap on the
+        // pool in the transaction; without it the swap fails.
+        if fees.fee_scheduler_mode == crate::quote::damm_v2::BASE_FEE_RATE_LIMITER {
+            accounts.push(AccountMeta::new_readonly(solana_sdk::sysvar::instructions::ID, false));
+        }
 
         let swap_ix = Instruction {
             program_id: METEORA_DAMM_PROG_ID,
@@ -111,5 +117,46 @@ impl AmmExecutor for MeteoraDammExecutor {
             swap: vec![swap_ix],
             cleanup,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::types::PoolType;
+
+    fn build(fee_scheduler_mode: u8) -> Instruction {
+        let (mint_a, mint_b, pool) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let state = PoolState::MeteoraDamm {
+            pool,
+            token_a_vault: Pubkey::new_unique(),
+            token_b_vault: Pubkey::new_unique(),
+            token_a_mint: mint_a,
+            token_b_mint: mint_b,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0,
+            fees: crate::quote::damm_v2::DammFees { fee_scheduler_mode, ..Default::default() },
+            activation_point: 0, activation_type: 0, collect_fee_mode: 1, pool_status: 0,
+        };
+        let order = SwapOrder {
+            pool_address: pool,
+            pool_type: PoolType::MeteoraDamm,
+            input_mint: mint_b,
+            output_mint: mint_a,
+            amount_in: 1_000,
+            min_amount_out: 1,
+            user: Pubkey::new_unique(),
+            input_token_program: TOKEN_PROGRAM_ID,
+            output_token_program: TOKEN_PROGRAM_ID,
+        };
+        MeteoraDammExecutor.build_swap_ix(&order, &state).unwrap().swap.remove(0)
+    }
+
+    #[test]
+    fn rate_limiter_pools_get_the_instructions_sysvar() {
+        assert_eq!(build(0).accounts.len(), 14);
+        let ix = build(crate::quote::damm_v2::BASE_FEE_RATE_LIMITER);
+        assert_eq!(ix.accounts.len(), 15);
+        assert_eq!(ix.accounts[14].pubkey, solana_sdk::sysvar::instructions::ID);
+        assert!(!ix.accounts[14].is_writable && !ix.accounts[14].is_signer);
     }
 }

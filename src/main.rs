@@ -258,11 +258,13 @@ async fn main() {
     };
     let stream_manager = Arc::new(stream_manager_inner);
 
-    let geyser_manager = Arc::clone(&stream_manager);
-    tokio::spawn(async move {
-        geyser_manager.spawn().await;
-    });
-    info!("pool state: Geyser gRPC streaming active");
+    if config.geyser_endpoint.is_some() {
+        let geyser_manager = Arc::clone(&stream_manager);
+        tokio::spawn(async move {
+            geyser_manager.spawn().await;
+        });
+        info!("pool state: Geyser gRPC streaming active");
+    }
 
     // RPC blockSubscribe fallback. Geyser is the primary block source, but
     // if no `geyser_endpoint` is configured, the manager's block-handling
@@ -385,6 +387,10 @@ async fn main() {
     match flow_trades::execution::amms::pumpfun_amm::load_fee_tiers(&rpc).await {
         Ok(n) => info!(tiers = n, "pump.fun AMM fee tiers loaded from chain"),
         Err(e) => tracing::warn!(error = %e, "pump.fun AMM fee tiers: using built-in table"),
+    }
+    match flow_trades::quote::pump_bonding::load_fee_tiers(&rpc).await {
+        Ok(n) => info!(tiers = n, "pump.fun bonding fee tiers loaded from chain"),
+        Err(e) => tracing::warn!(error = %e, "pump.fun bonding fee tiers: using built-in table"),
     }
 
     // Mint facts (token program, Token-2022 transfer fee) for every known pool
