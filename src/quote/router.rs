@@ -836,10 +836,14 @@ impl Quoter {
             }
         }
         if !cold.is_empty() {
-            // Unknown mints are looked up once (transfer fee, token program).
+            // Unknown mints are looked up once (transfer fee, token program);
+            // the input's fee is only known after that.
+            let mut amount_eff = amount_eff;
             if !crate::pool::mints::is_known(input_mint) || !crate::pool::mints::is_known(output_mint) {
                 crate::pool::mints::ensure_mint_info(&self.rpc, &[*input_mint, *output_mint]).await;
+                amount_eff = amount.saturating_sub(crate::pool::mints::transfer_fee(input_mint).map(|f| f.fee(amount)).unwrap_or(0));
             }
+            let amount_eff = amount_eff;
             let t0 = std::time::Instant::now();
             let futs = cold.iter().map(|&i| async move {
                 (i, self.evaluate_cold(&entries[i], input_mint, output_mint, amount_eff).await)
