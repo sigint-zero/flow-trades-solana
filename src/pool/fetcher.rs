@@ -485,9 +485,69 @@ pub async fn launchlab_fee_rates(rpc: &RpcClient, global: &Pubkey, platform: &Pu
 }
 
 // -- PumpFun (Bonding Curve) --
-// Bonding curve layout V2: discriminator(8), reserves(5xu64=40), complete(1), creator(32), ...
+// Bonding curve layout: see `quote::pump_bonding::PumpCurve::parse`.
 // NOTE: mint is NOT stored in bonding curve data. We discover it by scanning
-// the bonding curve's token accounts via getTokenAccountsByOwner.
+// the bonding curve's token accounts via getTokenAccountsByOwner, once per curve.
+static PUMPFUN_MINTS: LazyLock<dashmap::DashMap<Pubkey, (Pubkey, Pubkey)>> = LazyLock::new(dashmap::DashMap::new);
+/// The pump.fun `Global` account (fee recipients), re-read at most every 5 min.
+static PUMPFUN_GLOBAL_DATA: std::sync::RwLock<Option<(std::time::Instant, Vec<u8>)>> = std::sync::RwLock::new(None);
+const PUMPFUN_GLOBAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+/// First of `Global.buyback_fee_recipients` — used when the Global is unreadable.
+static PUMPFUN_BUYBACK_FALLBACK: LazyLock<Pubkey> = LazyLock::new(|| pubkey_from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"));
+
+async fn pumpfun_global(rpc: &RpcClient) -> TradeResult<Vec<u8>> {
+    if let Some((at, d)) = PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if at.elapsed() < PUMPFUN_GLOBAL_MAX_AGE {
+            return Ok(d.clone());
+        }
+    }
+    let d = fetch_account(rpc, &PUMPFUN_GLOBAL).await?.data;
+    *PUMPFUN_GLOBAL_DATA.write().unwrap_or_else(|p| p.into_inner()) = Some((std::time::Instant::now(), d.clone()));
+    Ok(d)
+}
+
+/// `(fee_recipient, buyback_fee_recipient)` for a curve, from the `Global`
+/// account (verified on mainnet, 1087 bytes): mayhem-mode curves pay the
+/// reserved recipient (@483), the others the main one (@41); the buyback
+/// recipient is one of eight (@741), picked per mint to spread write locks.
+fn pumpfun_recipients(global: &[u8], mayhem: bool, mint: &Pubkey) -> (Pubkey, Pubkey) {
+    let fee = read_pubkey(global, if mayhem { 483 } else { 41 }).ok().filter(|k| *k != Pubkey::default()).unwrap_or(*PUMPFUN_FEE_FALLBACK);
+    let buyback = read_pubkey(global, 741 + 32 * (mint.to_bytes()[0] as usize % 8))
+        .ok()
+        .filter(|k| *k != Pubkey::default())
+        .unwrap_or(*PUMPFUN_BUYBACK_FALLBACK);
+    (fee, buyback)
+}
+
+/// Build a `PumpFun` state from the curve account + its (known) mint.
+fn pumpfun_state(pool_address: &Pubkey, data: &[u8], mint: Pubkey, token_prog: Pubkey, global_data: &[u8]) -> TradeResult<PoolState> {
+    let curve = crate::quote::pump_bonding::PumpCurve::parse(data)
+        .ok_or_else(|| TradeError::Execution("pumpfun: bonding curve account too small".into()))?;
+    // Creator at offset 49 (used for the creator_vault PDA)
+    let creator = if data.len() >= 81 { read_pubkey(data, 49)? } else { Pubkey::default() };
+    let associated_bonding_curve = spl_associated_token_account::get_associated_token_address_with_program_id(pool_address, &mint, &token_prog);
+    // no Global handed in (Geyser companion not cached yet): the last one read
+    let cached;
+    let global_data = if !global_data.is_empty() {
+        global_data
+    } else {
+        cached = PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).as_ref().map(|(_, d)| d.clone()).unwrap_or_default();
+        &cached
+    };
+    let (fee_account, buyback_fee_recipient) = pumpfun_recipients(global_data, curve.is_mayhem_mode, &mint);
+    Ok(PoolState::PumpFun {
+        global: *PUMPFUN_GLOBAL,
+        fee_account,
+        mint,
+        bonding_curve: *pool_address,
+        associated_bonding_curve,
+        event_authority: *PUMPFUN_EVENT_AUTHORITY,
+        creator,
+        curve,
+        buyback_fee_recipient,
+    })
+}
+
 async fn parse_pumpfun(
     rpc: &RpcClient,
     pool_address: &Pubkey,
@@ -495,77 +555,43 @@ async fn parse_pumpfun(
 ) -> TradeResult<PoolState> {
     use solana_client::rpc_request::TokenAccountsFilter;
 
-    // Find the bonding curve's token account(s) to discover the mint (parallel fetch)
-    let (token_accounts, token_2022_accounts) = tokio::try_join!(
-        async {
-            rpc.get_token_accounts_by_owner(
-                pool_address,
-                TokenAccountsFilter::ProgramId(TOKEN_PROGRAM_ID),
-            ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token accounts: {e}")))
-        },
-        async {
-            rpc.get_token_accounts_by_owner(
-                pool_address,
-                TokenAccountsFilter::ProgramId(TOKEN_2022_PROGRAM_ID),
-            ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token-2022 accounts: {e}")))
-        },
-    )?;
-
-    let all_accounts: Vec<_> = token_accounts.into_iter().chain(token_2022_accounts).collect();
-
-    if all_accounts.is_empty() {
-        return Err(TradeError::Execution(
-            "pumpfun: no token accounts found for bonding curve".into(),
-        ));
-    }
-
-    // The first (and usually only) token account holds the bonding curve's tokens
-    let ta = &all_accounts[0];
-    let mint = if let solana_account_decoder::UiAccountData::Json(parsed) = &ta.account.data {
-        let mint_str = parsed.parsed["info"]["mint"].as_str().unwrap_or_default();
-        mint_str.parse::<Pubkey>().map_err(|e| TradeError::Execution(format!(
-            "pumpfun: failed to parse mint: {e}"
-        )))?
-    } else {
-        return Err(TradeError::Execution("pumpfun: unexpected account data format".into()));
+    let known = PUMPFUN_MINTS.get(pool_address).map(|v| *v);
+    let (mint, token_prog) = match known {
+        Some(v) => v,
+        None => {
+            // Find the bonding curve's token account(s) to discover the mint (parallel fetch)
+            let (token_accounts, token_2022_accounts) = tokio::try_join!(
+                async {
+                    rpc.get_token_accounts_by_owner(
+                        pool_address,
+                        TokenAccountsFilter::ProgramId(TOKEN_PROGRAM_ID),
+                    ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token accounts: {e}")))
+                },
+                async {
+                    rpc.get_token_accounts_by_owner(
+                        pool_address,
+                        TokenAccountsFilter::ProgramId(TOKEN_2022_PROGRAM_ID),
+                    ).await.map_err(|e| TradeError::Execution(format!("pumpfun: failed to fetch token-2022 accounts: {e}")))
+                },
+            )?;
+            // Anyone can send tokens to the curve: the mint is the one whose
+            // `["bonding-curve", mint]` PDA is this account.
+            let mint = token_accounts
+                .into_iter()
+                .chain(token_2022_accounts)
+                .filter_map(|ta| match &ta.account.data {
+                    solana_account_decoder::UiAccountData::Json(parsed) => parsed.parsed["info"]["mint"].as_str().and_then(|m| m.parse::<Pubkey>().ok()),
+                    _ => None,
+                })
+                .find(|m| Pubkey::find_program_address(&[b"bonding-curve", m.as_ref()], &PUMP_FUN_PROG_ID).0 == *pool_address)
+                .ok_or_else(|| TradeError::Execution("pumpfun: no token account of the curve's mint".into()))?;
+            let token_prog = fetch_account(rpc, &mint).await?.owner;
+            PUMPFUN_MINTS.insert(*pool_address, (mint, token_prog));
+            (mint, token_prog)
+        }
     };
-
-    // Read creator from bonding curve data (offset 49, 32 bytes)
-    let creator = if pool_data.data.len() >= 81 {
-        read_pubkey(&pool_data.data, 49)?
-    } else {
-        Pubkey::default()
-    };
-
-    // Fetch mint account (for token program) and global config in parallel
-    let global = *PUMPFUN_GLOBAL;
-    let (mint_account, global_data) = tokio::try_join!(
-        fetch_account(rpc, &mint),
-        fetch_account(rpc, &global),
-    )?;
-    let token_prog = mint_account.owner;
-    let associated_bonding_curve = spl_associated_token_account::get_associated_token_address_with_program_id(
-        pool_address,
-        &mint,
-        &token_prog,
-    );
-    // Global layout: disc(8) + initialized(1) + authority(32@9) + fee_recipient(32@41)
-    let fee_account = if global_data.data.len() >= 73 {
-        read_pubkey(&global_data.data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
-    let event_authority = *PUMPFUN_EVENT_AUTHORITY;
-
-    Ok(PoolState::PumpFun {
-        global,
-        fee_account,
-        mint,
-        bonding_curve: *pool_address,
-        associated_bonding_curve,
-        event_authority,
-        creator,
-    })
+    let global_data = pumpfun_global(rpc).await?;
+    pumpfun_state(pool_address, &pool_data.data, mint, token_prog, &global_data)
 }
 
 // -- PumpFun AMM (pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA) --
@@ -786,6 +812,7 @@ pub fn is_state_priced(pool_type: PoolType) -> bool {
         pool_type,
         PoolType::RaydiumCl | PoolType::Orca | PoolType::PancakeSwap | PoolType::Byreal | PoolType::DefiTunaFusion | PoolType::MeteoraDamm | PoolType::RaydiumLp
             | PoolType::MeteoraDlmm
+            | PoolType::PumpFun | PoolType::MeteoraDbc
     )
 }
 
@@ -804,6 +831,35 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
         PoolType::MeteoraDlmm => parse_meteora_dlmm(pool_address, account)?,
         // not state-priced (vault balances), but its PnL / status live in the pool
         PoolType::RaydiumV4 => parse_raydium_v4(pool_address, account)?,
+        // Bonding curves: the account carries price + reserves; mint, config
+        // and fee recipients come from the full fetch (`prev`).
+        PoolType::PumpFun => {
+            let Some(PoolState::PumpFun { mint, associated_bonding_curve, fee_account, buyback_fee_recipient, .. }) = prev else {
+                return Err(TradeError::Execution("pumpfun: re-parse needs the fetched state".into()));
+            };
+            let token_prog = PUMPFUN_MINTS.get(pool_address).map(|v| v.1).unwrap_or(TOKEN_PROGRAM_ID);
+            // fee recipients from the cached Global when there is one (a curve
+            // can enter mayhem mode), else from the fetched state
+            let mut st = pumpfun_state(pool_address, &account.data, *mint, token_prog, &[])?;
+            if let PoolState::PumpFun { associated_bonding_curve: abc, fee_account: fee, buyback_fee_recipient: bb, .. } = &mut st {
+                if PUMPFUN_GLOBAL_DATA.read().unwrap_or_else(|p| p.into_inner()).is_none() {
+                    (*fee, *bb) = (*fee_account, *buyback_fee_recipient);
+                }
+                *abc = *associated_bonding_curve;
+            }
+            if matches!(st, PoolState::PumpFun { buyback_fee_recipient, .. } if buyback_fee_recipient == Pubkey::default()) {
+                return Err(TradeError::Execution("pumpfun: state predates the buyback recipient; needs a full fetch".into()));
+            }
+            st
+        }
+        PoolType::MeteoraDbc => {
+            // a state without its config (older warm file) is left to age into
+            // a full re-fetch instead of being refreshed as unquotable
+            let Some(PoolState::MeteoraDbc { quote_mint, curve, .. }) = prev.filter(|p| matches!(p, PoolState::MeteoraDbc { curve, .. } if !curve.config.curve.is_empty())) else {
+                return Err(TradeError::Execution("meteora dbc: re-parse needs the fetched state".into()));
+            };
+            dbc_state(pool_address, &account.data, *quote_mint, curve.config.clone())?
+        }
         other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
     };
     match (&mut st, prev) {
@@ -1152,35 +1208,57 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
 //  136: base_mint (Pubkey)
 //  168: base_vault (Pubkey)
 //  200: quote_vault (Pubkey)
+//  price/reserves: see `quote::dbc::DbcCurve::apply_pool`
 // PoolConfig layout (1048 bytes):
-//   8:  quote_mint (Pubkey)
+//   8:  quote_mint (Pubkey); curve + fees: see `quote::dbc::DbcConfig::parse`
+/// PoolConfig → (quote_mint, curve + fees). Configs are immutable.
+static DBC_CONFIGS: LazyLock<dashmap::DashMap<Pubkey, (Pubkey, crate::quote::dbc::DbcConfig)>> = LazyLock::new(dashmap::DashMap::new);
+
+fn dbc_config(config_key: &Pubkey, config_data: &[u8]) -> TradeResult<(Pubkey, crate::quote::dbc::DbcConfig)> {
+    if let Some(c) = DBC_CONFIGS.get(config_key) {
+        return Ok(c.clone());
+    }
+    if config_data.len() < 40 {
+        return Err(TradeError::Execution("meteora dbc config too small".into()));
+    }
+    let quote_mint = read_pubkey(config_data, 8)?;
+    // An unparseable config leaves the curve empty: the pool is not quoted.
+    let cfg = crate::quote::dbc::DbcConfig::parse(config_data).unwrap_or_default();
+    if !cfg.curve.is_empty() {
+        DBC_CONFIGS.insert(*config_key, (quote_mint, cfg.clone()));
+    }
+    Ok((quote_mint, cfg))
+}
+
+fn dbc_state(pool_address: &Pubkey, data: &[u8], quote_mint: Pubkey, config: crate::quote::dbc::DbcConfig) -> TradeResult<PoolState> {
+    if data.len() < 232 {
+        return Err(TradeError::Execution("meteora dbc pool too small".into()));
+    }
+    let mut curve = crate::quote::dbc::DbcCurve { config, ..Default::default() };
+    curve.apply_pool(data);
+    Ok(PoolState::MeteoraDbc {
+        pool: *pool_address,
+        config: read_pubkey(data, 72)?,
+        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
+        base_vault: read_pubkey(data, 168)?,
+        quote_vault: read_pubkey(data, 200)?,
+        base_mint: read_pubkey(data, 136)?,
+        quote_mint,
+        curve,
+    })
+}
+
 async fn parse_meteora_dbc(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
     if data.len() < 232 {
         return Err(TradeError::Execution("meteora dbc pool too small".into()));
     }
-
     let config_key = read_pubkey(data, 72)?;
-    let base_mint = read_pubkey(data, 136)?;
-    let base_vault = read_pubkey(data, 168)?;
-    let quote_vault = read_pubkey(data, 200)?;
-
-    // Fetch config account to get quote_mint
-    let config_data = fetch_account(rpc, &config_key).await?;
-    if config_data.data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(&config_data.data, 8)?;
-
-    Ok(PoolState::MeteoraDbc {
-        pool: *pool_address,
-        config: config_key,
-        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
-    })
+    let (quote_mint, config) = match DBC_CONFIGS.get(&config_key) {
+        Some(c) => c.clone(),
+        None => dbc_config(&config_key, &fetch_account(rpc, &config_key).await?.data)?,
+    };
+    dbc_state(pool_address, data, quote_mint, config)
 }
 
 // -- Orca Whirlpool --
@@ -1859,37 +1937,7 @@ pub fn parse_pumpfun_with_companion(
     token_prog: Pubkey,
     global_data: &[u8],
 ) -> TradeResult<PoolState> {
-    let global = *PUMPFUN_GLOBAL;
-    let event_authority = *PUMPFUN_EVENT_AUTHORITY;
-
-    let creator = if pool_data.len() >= 81 {
-        read_pubkey(pool_data, 49)?
-    } else {
-        Pubkey::default()
-    };
-
-    let associated_bonding_curve =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            pool_address,
-            &mint,
-            &token_prog,
-        );
-
-    let fee_account = if global_data.len() >= 73 {
-        read_pubkey(global_data, 41)?
-    } else {
-        *PUMPFUN_FEE_FALLBACK
-    };
-
-    Ok(PoolState::PumpFun {
-        global,
-        fee_account,
-        mint,
-        bonding_curve: *pool_address,
-        associated_bonding_curve,
-        event_authority,
-        creator,
-    })
+    pumpfun_state(pool_address, pool_data, mint, token_prog, global_data)
 }
 
 /// Parse PumpFun AMM using cached vault balances from the AccountMirror (no RPC).
@@ -1982,26 +2030,8 @@ pub fn parse_meteora_dbc_with_companion(
     if pool_data.len() < 232 {
         return Err(TradeError::Execution("meteora dbc pool too small".into()));
     }
-
-    let config_key = read_pubkey(pool_data, 72)?;
-    let base_mint = read_pubkey(pool_data, 136)?;
-    let base_vault = read_pubkey(pool_data, 168)?;
-    let quote_vault = read_pubkey(pool_data, 200)?;
-
-    if config_data.len() < 40 {
-        return Err(TradeError::Execution("meteora dbc config too small".into()));
-    }
-    let quote_mint = read_pubkey(config_data, 8)?;
-
-    Ok(PoolState::MeteoraDbc {
-        pool: *pool_address,
-        config: config_key,
-        pool_authority: *METEORA_DBC_POOL_AUTHORITY,
-        base_vault,
-        quote_vault,
-        base_mint,
-        quote_mint,
-    })
+    let (quote_mint, config) = dbc_config(&read_pubkey(pool_data, 72)?, config_data)?;
+    dbc_state(pool_address, pool_data, quote_mint, config)
 }
 
 /// Try to parse an async pool type using companion data from the AccountMirror.
@@ -3301,6 +3331,92 @@ mod tests {
         } else {
             panic!("expected MeteoraDbc");
         }
+    }
+
+    fn b64(s: &str) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s).unwrap()
+    }
+
+    fn key(s: &str) -> Pubkey {
+        s.parse().unwrap()
+    }
+
+    /// pump.fun `Global` (4wTV1Y…, mainnet), the first 997 of its 1087 bytes:
+    /// everything through the buyback fee recipients.
+    const PUMP_GLOBAL_B64: &str = "p+joschscn8B07uMqzQc4FKEV/LDgX0yeEQZY9zVX+1YuiTJmd2sAqpKwvjQ3Vy8l+MonBl8tQYqVPPZVrnOblEV+WVnqlyz5gAQ2EfjzwMAAKwj/AYAAAAAeMX7UdECAACAxqR+jQMAXwAAAAAAAAAf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wHB4eQAAAAAAAUAAAAAAAAAYIzMHfzpYbQ7d5wZFQWm4tO/RdWk20YYrXbILWF1RTVjg3MADqIssmTTSv9koEte+r+7dN3NBImXsZgVR9fREIOEdCkuZ1qUtDbssKmYiUIyioPdxiM4ApYSZ8XNYRfLjRgaDISfqTem80re0wge+VcAqssMm7PZCaS5FHUnpOutEeak/ClEpPqCUb74FUJuG/soxrZkZndgfGrZ9WamRteqj7Bg2CkbTE1HXa/3Yslr3A2s6zbAEurRLtOpSEFh4ATIfOuY+lzkf4A4Bv0seUXSlSSVmuwA3tl4FPOPeEYf6nQ58860xO9Lucx77kChpiYXG2hBX+3tQLeolW+E5wchXZlAeTaU4RYGbORZuBj9+bugx7QbeD+joSDKQZUyAaKLX9JqtHmmqcxsv2sLI+thiFo3HgEgrKkTvu89E4p46JMUH7GOnxV02BDheOGeMGBOMXWqLkoy38hgByfRBwkBNYRTYlYJT5EoGRJ++k5Ea0MzcheT0Th2+arb89x9C19udQGCIPlCZ3ADI3tNa0U3WbSlxpC1nDXZuxh6CQy9KjOYep67E2eZq1mSWxPl3Iswgd8AXbQnwUePpG/4w0egdOlUPz43otBGInrdy06cd0xEJYxD7fJKqKrh8AIUZlvaTDjNbbdDj1m0CLuew7TKnorR8fJGU8SZtXlsINv5sy3dnuo/ObNyEVxxhHwYRc+lNsaFB04DDkTQId4++eNcTLeA8I7i/uhL7ERqV3gl2mjUOfqKXaOwxc/1D2P0VGsBQ55lEMA9ZfrZMeidBL4Ltw1Rlx9RxBX7NEwH20GfISICI1UWqRcTTGdYjEk4IK4VXulmZVd6wbcY2kfdzyoFDuan4iBou4hkCqV/kJMIxh/vcRoBY/WnVcBwvIYNH2NnIHzs2lvMbLHq8PFtaEBFZrGNVtJIGssxcDJlbpBVHHhElkH4SVjcc6dqhdh1b1XALNrKiboZMnkMNoqxV+ktc8VLlrXJMZQeRupL4uDjESd0T8a3TPtFXv6vi9VxeSztRPwfePlKM9CQnF5rX7AhVwrY262N6P2z0g7RzZnrjk6HcBV+6+tnimVduZs39rEybHZX25DPuKh6vvjHtvLIaQ==";
+
+    #[test]
+    fn pumpfun_recipients_from_the_live_global() {
+        let g = b64(PUMP_GLOBAL_B64);
+        let mint = Pubkey::new_from_array([3u8; 32]); // 3 % 8 → the fourth buyback recipient
+        let (fee, buyback) = pumpfun_recipients(&g, false, &mint);
+        assert_eq!(fee, key("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"));
+        assert_eq!(buyback, key("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"));
+        let (fee, _) = pumpfun_recipients(&g, true, &mint);
+        assert_eq!(fee, key("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS"), "mayhem-mode curves pay the reserved recipient");
+        assert_eq!(pumpfun_recipients(&[], false, &mint), (*PUMPFUN_FEE_FALLBACK, *PUMPFUN_BUYBACK_FALLBACK));
+    }
+
+    #[test]
+    fn pumpfun_block_refresh_reparses_the_curve_and_keeps_the_rest() {
+        let g = b64(PUMP_GLOBAL_B64);
+        let mint = Pubkey::new_unique();
+        let curve_addr = Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &PUMP_FUN_PROG_ID).0;
+        let mut data = vec![0u8; 151];
+        data[8..16].copy_from_slice(&1_073_000_000_000_000u64.to_le_bytes());
+        data[16..24].copy_from_slice(&30_000_000_000u64.to_le_bytes());
+        data[24..32].copy_from_slice(&793_100_000_000_000u64.to_le_bytes());
+        data[40..48].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        write_pubkey(&mut data, 49, &Pubkey::new_unique());
+        let prev = pumpfun_state(&curve_addr, &data, mint, TOKEN_2022_PROGRAM_ID, &g).unwrap();
+        // a buy lands: the refresh re-reads only the curve account
+        data[16..24].copy_from_slice(&31_000_000_000u64.to_le_bytes());
+        data[32..40].copy_from_slice(&1_000_000_000u64.to_le_bytes());
+        let acct = Account { data: data.clone(), ..make_account(0) };
+        let fresh = reparse_pool_state(PoolType::PumpFun, &curve_addr, &acct, Some(&prev)).unwrap();
+        let (PoolState::PumpFun { mint: m, associated_bonding_curve: abc, curve, buyback_fee_recipient, .. }, PoolState::PumpFun { associated_bonding_curve: prev_abc, .. }) = (&fresh, &prev) else {
+            panic!("expected PumpFun");
+        };
+        assert_eq!((*m, *abc), (mint, *prev_abc), "mint and the Token-2022 curve ATA come from the fetch");
+        assert_eq!((curve.virtual_sol_reserves, curve.real_sol_reserves), (31_000_000_000, 1_000_000_000));
+        assert_ne!(*buyback_fee_recipient, Pubkey::default());
+        assert!(reparse_pool_state(PoolType::PumpFun, &curve_addr, &acct, None).is_err(), "never a bare re-parse");
+    }
+
+    /// Live DBC pool CCa7ito… and its config 7bH1hBvb… (Bags: 2 % in SOL, two
+    /// segments), each up to its last non-zero byte.
+    const DBC_POOL_B64: &str = "1eAF0WJFd1wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYe35TRSCCnng8FOHW+TAASCkfWEdaxdvbJO0bPpZO2GW9IxB+lQoWn0Mv1MP3ImwcJ2CW26SYv/mj11vXExSy9aTxQHbIVvSx+PM8j6FRjFlhGnxpnqyHt/NdX+zekFzACYbykOWwbZyFZVgIm22NFtR0o2h//FUAA+7/0YvAvZnegc0Y9i+7BORSteZmwPCJHIeiMSs3Nr9ivQxCM1lE+zUbyk4Qc4N6LoECQAAAAAAAAAAAAAAAP8OUgYAAAAAAAAAAAAAAACQxT0AAAAAADiVs1b5NAsAAAAAAAAAAAAmhssaAAAAAAAAAAAAAAAAAAAAAAAAAAD/DlIGAAAAAAAAAAAAAAAAsmDmGgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAABQAAAAAAAAA";
+    const DBC_CONFIG_B64: &str = "GmwOe3TmgSsGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAARnY+t+uy/kVf3qIq/o+IZk+Z2NzDeTdiAQ/sYqEvcdDlvSMQfpUKFp9DL9TD9yJsHCdgltukmL/5o9db1xMUssALTEBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAkAAABkAAAABgEAAAAAAAAAAAAAALACcfeMwIQLABJlyhMAAAAfItprGfZbAnsU/n9IVy4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGSns7bgDQAAZKeztuANAgDIAAABxAkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB+dTuTDikLAAAAAAAAAAAA5Dn3oty9FgAAAAAAAAAAAACA9gWeJVwazMlQmbvBAAAubv5/SFcuAAAAAAAAAAAAAMAwVc8efbppjQZGnHcAAA==";
+
+    #[test]
+    fn dbc_state_from_live_accounts_and_block_refresh() {
+        let pool = key("CCa7itoNXuvpPDYyyRhMqJaNstq9SD6rkB29xDHWRmKR");
+        let mut p = b64(DBC_POOL_B64);
+        p.resize(crate::quote::dbc::POOL_LEN, 0);
+        let mut c = b64(DBC_CONFIG_B64);
+        c.resize(crate::quote::dbc::CONFIG_LEN, 0);
+        let st = parse_meteora_dbc_with_companion(&pool, &p, &c).unwrap();
+        let PoolState::MeteoraDbc { base_mint, quote_mint, config, curve, .. } = &st else { panic!("expected MeteoraDbc") };
+        assert_eq!(*base_mint, key("FScwFv8SDJhfKZJjz65XPYrPkrYkCUMYmFAhdGAVBAGS"));
+        assert_eq!(*quote_mint, SOL_NATIVE_MINT);
+        assert_eq!(*config, key("7bH1hBvbEiJneWXwGSYRYGewto314EeK3xcFPoaaJHQL"));
+        assert_eq!((curve.sqrt_price, curve.quote_reserve, curve.base_reserve), (3_154_470_249_927_992, 151_304_936, 994_804_277_164_627_180));
+        assert_eq!((curve.activation_point, curve.is_migrated), (449_545_766, false));
+        let cfg = &curve.config;
+        assert_eq!((cfg.collect_fee_mode, cfg.activation_type, cfg.base_fee_mode, cfg.cliff_fee_numerator, cfg.dynamic_fee), (0, 0, 0, 20_000_000, false));
+        assert_eq!((cfg.migration_quote_threshold, cfg.sqrt_start_price), (85_000_000_000, 3_141_367_320_245_630));
+        assert_eq!(cfg.curve, vec![
+            (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
+            (13_043_817_825_332_782, 2_425_988_008_058_820_449_100_000_000_000_000),
+        ]);
+        // block refresh: the pool account alone, config kept
+        p[280..296].copy_from_slice(&3_200_000_000_000_000u128.to_le_bytes());
+        let acct = Account { data: p, ..make_account(0) };
+        let fresh = reparse_pool_state(PoolType::MeteoraDbc, &pool, &acct, Some(&st)).unwrap();
+        let PoolState::MeteoraDbc { curve: fresh_curve, .. } = &fresh else { panic!("expected MeteoraDbc") };
+        assert_eq!(fresh_curve.sqrt_price, 3_200_000_000_000_000);
+        assert_eq!(fresh_curve.config, *cfg);
+        assert!(is_state_priced(PoolType::PumpFun) && is_state_priced(PoolType::MeteoraDbc), "touched by a block → re-read");
     }
 
     #[test]

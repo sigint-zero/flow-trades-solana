@@ -413,7 +413,9 @@ async fn wrap_in_router(
     }
 
     let num_hops = quote.routes.len();
-    if num_hops != ixs.swap.len() {
+    // A hop may take more than one CPI (a native-SOL venue wraps its output
+    // for the router), never fewer.
+    if ixs.swap.len() < num_hops {
         return Err(TradeError::Execution(format!(
             "route has {} hops but {} swap instructions", num_hops, ixs.swap.len()
         )));
@@ -431,6 +433,9 @@ async fn wrap_in_router(
             )
         );
     }
+    // The router wants one account per CPI boundary but reads only the last
+    // (output) one; extra CPIs get the output account as a placeholder.
+    token_accounts.extend(std::iter::repeat_n(user_output_ata, ixs.swap.len() - num_hops));
     token_accounts.push(user_output_ata);
 
     let router_ix = wrap_swap(
@@ -606,6 +611,41 @@ fn tidy_multihop(setup: Vec<Instruction>, later_hop_setups: Vec<Vec<Instruction>
 /// The amount a hop can rely on receiving from the previous one.
 use crate::quote::router::guaranteed;
 
+/// pump.fun bonding pays NATIVE SOL; as the first hop of a route its executor
+/// wraps `min_amount_out` into WSOL for the next hop, which spends exactly the
+/// guaranteed amount — so that is the floor it gets. 0 (no per-hop floor) for
+/// every other hop.
+fn native_sol_hop_floor(pool_type: PoolType, output_mint: &Pubkey, quoted_out: u64, slippage_bps: u16) -> u64 {
+    if pool_type == PoolType::PumpFun && *output_mint == SOL_NATIVE_MINT {
+        guaranteed(quoted_out, slippage_bps)
+    } else {
+        0
+    }
+}
+
+/// pump.fun bonding spends NATIVE SOL; as a later hop the SOL arrives as WSOL
+/// from the previous hop, so the WSOL account is closed (unwrapped into the
+/// payer) inside the router, right before the buy. Returns true when it did.
+fn unwrap_for_native_sol_hop(pool_type: PoolType, input_mint: &Pubkey, ixs: &mut SwapInstructions, user: &Pubkey) -> bool {
+    if pool_type != PoolType::PumpFun || *input_mint != SOL_NATIVE_MINT {
+        return false;
+    }
+    let wsol_ata = spl_associated_token_account::get_associated_token_address(user, &SOL_NATIVE_MINT);
+    match spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &wsol_ata, user, user, &[]) {
+        Ok(close) => {
+            ixs.swap.insert(0, close);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The WSOL account was closed mid-route: a second close would fail.
+fn drop_wsol_close(cleanup: &mut Vec<Instruction>, user: &Pubkey) {
+    let wsol_ata = spl_associated_token_account::get_associated_token_address(user, &SOL_NATIVE_MINT);
+    cleanup.retain(|ix| !(ix.program_id == TOKEN_PROGRAM_ID && ix.data == [9u8] && ix.accounts.first().is_some_and(|a| a.pubkey == wsol_ata)));
+}
+
 /// Raydium CLMM / PancakeSwap / Byreal swaps carry the current tick array plus the next
 /// two in the swap direction as remaining accounts. A neighbouring array that
 /// no LP has ever touched does not exist on chain, and passing it fails the
@@ -723,7 +763,8 @@ async fn build_two_hop_ixs(
         input_mint,
         output_mint: bridge_mint,
         amount_in,
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        // intermediate — no slippage enforcement, except a native-SOL hop's wrap
+        min_amount_out: native_sol_hop_floor(pool1_type, &bridge_mint, hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge_token_program,
@@ -756,12 +797,16 @@ async fn build_two_hop_ixs(
     let executor2 = AmmExecutorType::from_pool_type(pool2_type)?;
     let mut ixs2 = executor2.build_swap_ix(&order2, &pool2_state)?;
     prune_missing_tick_arrays(&state.rpc, &mut ixs2, pool2_type, &order2.pool_address).await?;
+    let unwrapped = unwrap_for_native_sol_hop(pool2_type, &bridge_mint, &mut ixs2, user_pubkey);
 
     // Combine: setup1 + setup2, swap1 + swap2, cleanup1 + cleanup2 — see tidy_multihop
     let mut combined_swap = ixs1.swap;
     combined_swap.extend(ixs2.swap);
     let mut combined_cleanup = ixs1.cleanup;
     combined_cleanup.extend(ixs2.cleanup);
+    if unwrapped {
+        drop_wsol_close(&mut combined_cleanup, user_pubkey);
+    }
     let (setup, cleanup) = tidy_multihop(ixs1.setup, vec![ixs2.setup], combined_cleanup, user_pubkey);
 
     Ok(SwapInstructions { setup, swap: combined_swap, cleanup })
@@ -847,7 +892,8 @@ async fn build_three_hop_ixs(
         input_mint,
         output_mint: bridge1_mint,
         amount_in,
-        min_amount_out: 0, // intermediate — no slippage enforcement
+        // intermediate — no slippage enforcement, except a native-SOL hop's wrap
+        min_amount_out: native_sol_hop_floor(pool1_type, &bridge1_mint, hop1_out, quote.slippage_bps),
         user: *user_pubkey,
         input_token_program,
         output_token_program: bridge1_token_program,
@@ -890,6 +936,7 @@ async fn build_three_hop_ixs(
     let executor3 = AmmExecutorType::from_pool_type(pool3_type)?;
     let mut ixs3 = executor3.build_swap_ix(&order3, &pool3_state)?;
     prune_missing_tick_arrays(&state.rpc, &mut ixs3, pool3_type, &order3.pool_address).await?;
+    let unwrapped = unwrap_for_native_sol_hop(pool3_type, &bridge2_mint, &mut ixs3, user_pubkey);
 
     // Combine: setups, swap1 + swap2 + swap3, cleanups — see tidy_multihop
     let mut combined_swap = ixs1.swap;
@@ -898,6 +945,9 @@ async fn build_three_hop_ixs(
     let mut combined_cleanup = ixs1.cleanup;
     combined_cleanup.extend(ixs2.cleanup);
     combined_cleanup.extend(ixs3.cleanup);
+    if unwrapped {
+        drop_wsol_close(&mut combined_cleanup, user_pubkey);
+    }
     let (setup, cleanup) = tidy_multihop(ixs1.setup, vec![ixs2.setup, ixs3.setup], combined_cleanup, user_pubkey);
 
     Ok(SwapInstructions { setup, swap: combined_swap, cleanup })
@@ -979,6 +1029,32 @@ mod tests {
             let result = pool_type_from_label(label).unwrap();
             assert_eq!(result, *expected, "label={label}");
         }
+    }
+
+    #[test]
+    fn native_sol_hops_wrap_the_guaranteed_amount_and_unwrap_before_a_buy() {
+        let user = Pubkey::new_unique();
+        let token = Pubkey::new_unique();
+        // pump.fun selling into the SOL bridge wraps what hop 2 will spend
+        assert_eq!(native_sol_hop_floor(PoolType::PumpFun, &SOL_NATIVE_MINT, 1_000_000, 300), 970_000);
+        assert_eq!(native_sol_hop_floor(PoolType::Orca, &SOL_NATIVE_MINT, 1_000_000, 300), 0);
+        assert_eq!(native_sol_hop_floor(PoolType::PumpFun, &token, 1_000_000, 300), 0);
+        // pump.fun buying from the SOL bridge: WSOL unwrapped first, inside the router
+        let buy = Instruction { program_id: crate::constants::PUMP_FUN_PROG_ID, accounts: vec![], data: vec![1] };
+        let mut ixs = SwapInstructions { setup: vec![], swap: vec![buy], cleanup: vec![] };
+        assert!(!unwrap_for_native_sol_hop(PoolType::MeteoraDbc, &SOL_NATIVE_MINT, &mut ixs, &user));
+        assert!(unwrap_for_native_sol_hop(PoolType::PumpFun, &SOL_NATIVE_MINT, &mut ixs, &user));
+        let wsol = spl_associated_token_account::get_associated_token_address(&user, &SOL_NATIVE_MINT);
+        assert_eq!((ixs.swap.len(), ixs.swap[0].data.as_slice(), ixs.swap[0].accounts[0].pubkey), (2, [9u8].as_slice(), wsol));
+        // ... so the route's cleanup must not close it again
+        let other = Pubkey::new_unique();
+        let mut cleanup = vec![
+            spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &wsol, &user, &user, &[]).unwrap(),
+            spl_token::instruction::close_account(&TOKEN_PROGRAM_ID, &other, &user, &user, &[]).unwrap(),
+        ];
+        drop_wsol_close(&mut cleanup, &user);
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(cleanup[0].accounts[0].pubkey, other);
     }
 
     #[test]

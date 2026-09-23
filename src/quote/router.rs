@@ -65,7 +65,8 @@ fn is_constant_product(pool_type: PoolType) -> bool {
         // walk, `quote::dlmm`), Raydium LaunchLab
         // (virtual-reserve bonding curve, `quote::launchlab`), Meteora Standard
         // (LP share of dynamic vaults, `quote::meteora_std`), every CLMM venue
-        // (`quote::clmm` tick walk).
+        // (`quote::clmm` tick walk), pump.fun bonding (`quote::pump_bonding`)
+        // and Meteora DBC (`quote::dbc`).
     )
 }
 
@@ -83,8 +84,7 @@ fn is_clmm(pool_type: PoolType) -> bool {
 
 /// Check if a pool type is quotable (constant product or CLMM).
 fn is_quotable(pool_type: PoolType) -> bool {
-    is_constant_product(pool_type) || is_clmm(pool_type) || matches!(pool_type, PoolType::MeteoraDamm | PoolType::RaydiumLp | PoolType::Meteora)
-        || pool_type == PoolType::MeteoraDlmm
+    is_constant_product(pool_type) || is_clmm(pool_type) || matches!(pool_type, PoolType::MeteoraDamm | PoolType::RaydiumLp | PoolType::Meteora | PoolType::MeteoraDlmm | PoolType::PumpFun | PoolType::MeteoraDbc)
 }
 
 /// Get the label for a pool type from the program_id_to_label mapping.
@@ -653,6 +653,25 @@ impl Quoter {
                 // liquidity runs out within the arrays a swap can carry, or disabled
                 _ => Eval::Quoted(None),
             };
+        }
+
+        if let PoolState::PumpFun { mint, curve, .. } = state {
+            let q = if *input_mint == crate::constants::SOL_NATIVE_MINT {
+                curve.buy_exact_in(amount)
+            } else if input_mint == mint {
+                curve.sell_exact_in(amount)
+            } else {
+                None
+            };
+            return Eval::Quoted(q.map(|q| {
+                let (sol, tok) = (curve.virtual_sol_reserves as u128, curve.virtual_token_reserves as u128);
+                let (rin, rout) = if input_mint == mint { (tok, sol) } else { (sol, tok) };
+                (q.amount_out, q.fee, rin, rout)
+            }));
+        }
+
+        if let PoolState::MeteoraDbc { base_mint, quote_mint, curve, .. } = state {
+            return Eval::Quoted(quote_dbc(input_mint, base_mint, quote_mint, curve, amount));
         }
 
         if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
@@ -1611,6 +1630,24 @@ fn fee_for_pool_type(pool_type: PoolType) -> u16 {
 /// How long a streamed fee observation stays authoritative.
 const OBSERVED_FEE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Meteora DBC leg: segment walk + base/dynamic fee at the current point
+/// (slot or unix time per the config). Without a known slot the activation
+/// point is used: the scheduler's highest fee, the conservative side.
+fn quote_dbc(input_mint: &Pubkey, base_mint: &Pubkey, quote_mint: &Pubkey, curve: &super::dbc::DbcCurve, amount: u64) -> Option<LegResult> {
+    let quote_to_base = if input_mint == quote_mint { true } else if input_mint == base_mint { false } else { return None };
+    let current_point = match curve.config.activation_type {
+        1 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(curve.activation_point),
+        _ => {
+            let s = crate::stream::latest_slot();
+            if s == 0 { curve.activation_point } else { s }
+        }
+    };
+    let q = curve.swap_exact_in(quote_to_base, amount, current_point)?;
+    let (res_quote, res_base) = curve.implied_reserves();
+    let (reserve_in, reserve_out) = if quote_to_base { (res_quote, res_base) } else { (res_base, res_quote) };
+    Some((q.amount_out, q.fee, reserve_in, reserve_out))
+}
+
 /// Meteora DAMM v2 leg: single-range sqrt-price curve + fee scheduler.
 /// Without a known current point the CLIFF (highest) fee is assumed — the
 /// conservative side for a min_out.
@@ -1931,6 +1968,7 @@ mod tests {
             quote_vault: qv,
             base_mint: bm,
             quote_mint: qm,
+            curve: Default::default(),
         };
 
         let (va, vb, ma, mb) = extract_vault_mints(&state).unwrap();
@@ -2114,6 +2152,8 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
+            buyback_fee_recipient: Pubkey::new_unique(),
         };
         assert!(extract_vault_mints(&state).is_none());
     }
@@ -2569,6 +2609,75 @@ mod tests {
         let out: u64 = resp.amount_out.parse().unwrap();
         assert!(out > 0, "out_amount should be > 0");
         assert!(out < 100_000, "out_amount should be less than input (different reserves)");
+    }
+
+    #[tokio::test]
+    async fn test_quoter_bonding_curves_from_memory() {
+        use crate::constants::SOL_NATIVE_MINT;
+        let registry = Arc::new(PoolRegistry::new());
+        let cache = Arc::new(crate::pool::cache::PoolCache::new(60_000));
+        let rpc = Arc::new(RpcClient::new("http://localhost:8899".to_string()));
+        let quoter = Quoter::new(Arc::clone(&registry), Arc::clone(&cache), Arc::clone(&rpc));
+        let req = |input_mint, output_mint, amount| QuoteRequest {
+            input_mint, output_mint, amount, slippage_bps: 100, only_direct_routes: true, exclude_dexes: vec![], dexes: vec![], max_accounts: 64,
+        };
+
+        // pump.fun: a live pre-trade curve (FSP4kDr3…, buy_exact_sol_in 0.1 SOL)
+        let (mint, curve_addr) = (Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: curve_addr, pool_type: PoolType::PumpFun, mint_a: mint, mint_b: SOL_NATIVE_MINT });
+        let curve = crate::quote::pump_bonding::PumpCurve {
+            virtual_sol_reserves: 41_556_085_197,
+            virtual_token_reserves: 774_615_796_118_287,
+            real_sol_reserves: 11_556_085_197,
+            real_token_reserves: 494_715_796_118_287,
+            token_total_supply: 1_000_000_000_000_000,
+            has_creator: true,
+            ..Default::default()
+        };
+        let pump = |curve| PoolState::PumpFun {
+            global: Pubkey::new_unique(), fee_account: Pubkey::new_unique(), mint, bonding_curve: curve_addr,
+            associated_bonding_curve: Pubkey::new_unique(), event_authority: Pubkey::new_unique(), creator: Pubkey::new_unique(),
+            curve, buyback_fee_recipient: Pubkey::new_unique(),
+        };
+        cache.insert(curve_addr, pump(curve));
+        let buy = quoter.quote(&req(SOL_NATIVE_MINT, mint, 100_000_000)).await.unwrap();
+        assert_eq!((buy.amount_out.as_str(), buy.routes[0].pool.dex.as_str()), ("1836647138012", "PumpFun"));
+        let sell = quoter.quote(&req(mint, SOL_NATIVE_MINT, 1_836_647_138_012)).await.unwrap();
+        assert!(sell.amount_out.parse::<u64>().unwrap() < 100_000_000);
+        // a completed curve is not quoted
+        cache.insert(curve_addr, pump(crate::quote::pump_bonding::PumpCurve { complete: true, ..curve }));
+        assert!(quoter.quote(&req(SOL_NATIVE_MINT, mint, 100_000_000)).await.is_err());
+
+        // Meteora DBC: a flat-fee config, both directions, migrated → refused
+        let (base, pool) = (Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: pool, pool_type: PoolType::MeteoraDbc, mint_a: base, mint_b: SOL_NATIVE_MINT });
+        let dbc_curve = crate::quote::dbc::DbcCurve {
+            sqrt_price: 3_262_546_676_709_219,
+            quote_reserve: 1_399_303_498,
+            activation_point: 0,
+            config: crate::quote::dbc::DbcConfig {
+                activation_type: 1,
+                migration_quote_threshold: 85_000_000_000,
+                sqrt_start_price: 3_141_367_320_245_630,
+                curve: vec![
+                    (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
+                    (13_043_817_825_332_782, 2_425_988_008_058_820_449_100_000_000_000_000),
+                ],
+                cliff_fee_numerator: 20_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dbc = |curve| PoolState::MeteoraDbc {
+            pool, config: Pubkey::new_unique(), pool_authority: Pubkey::new_unique(), base_vault: Pubkey::new_unique(),
+            quote_vault: Pubkey::new_unique(), base_mint: base, quote_mint: SOL_NATIVE_MINT, curve,
+        };
+        cache.insert(pool, dbc(dbc_curve.clone()));
+        let buy = quoter.quote(&req(SOL_NATIVE_MINT, base, 40_204_811)).await.unwrap();
+        assert_eq!(buy.amount_out, "1258276557343754", "658ZWbNq… EvtSwap2");
+        assert!(quoter.quote(&req(base, SOL_NATIVE_MINT, 1_000_000_000_000)).await.is_ok());
+        cache.insert(pool, dbc(crate::quote::dbc::DbcCurve { is_migrated: true, ..dbc_curve }));
+        assert!(quoter.quote(&req(base, SOL_NATIVE_MINT, 1_000_000_000_000)).await.is_err());
     }
 
     #[tokio::test]

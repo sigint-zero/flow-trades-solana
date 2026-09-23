@@ -29,6 +29,7 @@ impl AmmExecutor for MeteoraDbcExecutor {
                     quote_vault,
                     base_mint,
                     quote_mint,
+                    ..
                 } => (pool, config, pool_authority, base_vault, quote_vault, base_mint, quote_mint),
                 _ => return Err(TradeError::Execution("expected MeteoraDbc pool state".into())),
             };

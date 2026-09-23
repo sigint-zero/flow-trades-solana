@@ -88,7 +88,7 @@ pool the server has seen; the first quote of an unseen pool costs one to three R
 | Raydium LaunchLab | bonding curve on virtual + real reserves; config fees | |
 | Raydium V4 | x·y=k on vault − `need_take_pnl`; pool fee, ceil off the input | swaps via `swap_base_in_v2` (no OpenBook accounts) |
 | pump.fun AMM | x·y=k on vault quote + virtual quote reserve; market-cap fee tiers; exact-input buys | buyback accounts resolved per pool |
-| pump.fun bonding | — | streamed only |
+| pump.fun bonding | x·y=k on the curve's virtual reserves; protocol + creator fee from the fee config (per-curve creator fee when set); exact-input buys | native SOL: a sell wraps its guaranteed output into WSOL inside the router (the router fee is taken on that amount); completed, non-SOL-quoted and cashback curves are not quoted |
 | Orca Whirlpool | tick-array walk | |
 | PancakeSwap | tick-array walk; fee from `AmmConfig` | |
 | DefiTuna Fusion | tick-array walk | |
@@ -96,7 +96,7 @@ pool the server has seen; the first quote of an unseen pool costs one to three R
 | Meteora DAMM v2 | sqrt-price curve; fee scheduler, dynamic fee, collect mode | |
 | Meteora Standard | x·y=k on the pool's LP share of two dynamic vaults | stable curve not quoted |
 | Meteora DLMM | bin walk; per-bin dynamic fee (volatility accumulator), fee mode, limit orders, bitmap extension | up to 3 bin arrays per swap |
-| Meteora DBC | — | streamed only |
+| Meteora DBC | sqrt-price walk over the config's curve segments; scheduler / rate-limiter base fee, dynamic fee, collect mode | migrated or completed curves and buys that reach the migration threshold are not quoted |
 | Saros | x·y=k; observed fee | |
 | Dooar | x·y=k; on-chain fee schedule | |
 | FluxBeam | x·y=k; on-chain fee schedule (trade + owner fee, both off the input) | most pools charge 90–99 % owner fees |
@@ -115,6 +115,7 @@ Quote vs router-simulated output on mainnet, direct routes, 0.05–50 SOL, both 
 | Venue | Error |
 |---|---|
 | Raydium CPMM, Raydium CLMM, LaunchLab, Orca, PancakeSwap, DefiTuna Fusion, Meteora Standard, Meteora DAMM v2 | 0 bps on a fresh state; ~2 bps when the pool trades between quote and simulation |
+| pump.fun bonding, Meteora DBC | 0 bps on a fresh state; launch pools often trade between quote and simulation |
 | pump.fun AMM, pools with a coin creator | 0 bps |
 | pump.fun AMM, no coin creator | about −65 bps (fee schedule not in the tier config) |
 | Meteora DLMM | 0 atoms vs the program's own swap event on a same-slot state; ~1–5 bps when the pool trades between quote and simulation |

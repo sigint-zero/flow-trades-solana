@@ -395,15 +395,17 @@ async fn run_session(
                                 let candidate = all_keys[acct_idx];
                                 if manager.registry.contains(&candidate) { return; }
 
-                                // PumpFun bonding: extract mint from tx accounts (index 2)
-                                if pool_type == PoolType::PumpFun && accounts.len() > 2 {
-                                    let mint_idx = accounts[2] as usize;
+                                // PumpFun bonding: extract mint from tx accounts (index 2;
+                                // index 1 with the token program at 3 in the `_v2` layout)
+                                let (mint_at, tp_at) = if pool_idx == 10 { (1, 3) } else { (2, 8) };
+                                if pool_type == PoolType::PumpFun && accounts.len() > mint_at {
+                                    let mint_idx = accounts[mint_at] as usize;
                                     if mint_idx < all_keys.len() {
                                         let mint = all_keys[mint_idx];
                                         let mut mint_data = vec![0u8; 64];
                                         mint_data[..32].copy_from_slice(mint.as_ref());
-                                        if accounts.len() > 8 {
-                                            let tp_idx = accounts[8] as usize;
+                                        if accounts.len() > tp_at {
+                                            let tp_idx = accounts[tp_at] as usize;
                                             if tp_idx < all_keys.len() {
                                                 mint_data[32..64].copy_from_slice(all_keys[tp_idx].as_ref());
                                             }

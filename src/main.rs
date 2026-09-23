@@ -386,6 +386,10 @@ async fn main() {
         Ok(n) => info!(tiers = n, "pump.fun AMM fee tiers loaded from chain"),
         Err(e) => tracing::warn!(error = %e, "pump.fun AMM fee tiers: using built-in table"),
     }
+    match flow_trades::quote::pump_bonding::load_fee_tiers(&rpc).await {
+        Ok(n) => info!(tiers = n, "pump.fun bonding fee tiers loaded from chain"),
+        Err(e) => tracing::warn!(error = %e, "pump.fun bonding fee tiers: using built-in table"),
+    }
 
     // Mint facts (token program, Token-2022 transfer fee) for every known pool
     // mint, off the quote path; new pools get theirs at discovery.

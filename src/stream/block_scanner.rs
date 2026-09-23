@@ -223,7 +223,21 @@ pub fn swap_pool_index(program_id: &Pubkey, ix_data: &[u8]) -> Option<(PoolType,
         PoolType::RaydiumCl | PoolType::PancakeSwap => (d(ANCHOR_SWAP) || d(ANCHOR_SWAP_V2)).then_some(2)?,
         // Byreal (Raydium CLMM fork): swap / swap_v2 / swap_v3_dyn, [2] = pool_state
         PoolType::Byreal => (d(ANCHOR_SWAP) || d(ANCHOR_SWAP_V2) || d(BYREAL_SWAP_V3_DYN)).then_some(2)?,
-        PoolType::PumpFun => (d(BUY_DISC) || d(SELL_DISC)).then_some(3)?,
+        // bonding curve at [3] in buy/sell/buy_exact_sol_in, at [10] in the
+        // `_v2` instructions (quote-mint aware; also used on SOL curves)
+        PoolType::PumpFun => {
+            use crate::execution::amms::pumpfun::BUY_EXACT_SOL_IN_DISC;
+            const BUY_V2: [u8; 8] = [0xb8, 0x17, 0xee, 0x61, 0x67, 0xc5, 0xd3, 0x3d];
+            const SELL_V2: [u8; 8] = [0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2];
+            const BUY_EXACT_QUOTE_IN_V2: [u8; 8] = [0xc2, 0xab, 0x1c, 0x46, 0x68, 0x4d, 0x5b, 0x2f];
+            if d(BUY_DISC) || d(SELL_DISC) || d(BUY_EXACT_SOL_IN_DISC) {
+                3
+            } else if d(BUY_V2) || d(SELL_V2) || d(BUY_EXACT_QUOTE_IN_V2) {
+                10
+            } else {
+                return None;
+            }
+        }
         PoolType::PumpFunAmm => (d(BUY_DISC) || d(SELL_DISC) || d(BUY_EXACT_QUOTE_IN_DISC)).then_some(0)?,
         PoolType::Meteora => d(ANCHOR_SWAP).then_some(0)?,
         PoolType::MeteoraDlmm => (d(ANCHOR_SWAP) || d(SWAP2) || d(DLMM_EXACT_OUT) || d(DLMM_WITH_PRICE)).then_some(0)?,
@@ -771,6 +785,10 @@ mod tests {
         assert_eq!(f(&RAYDIUM_LP_PROG_ID, &lp_buy_in), Some((PoolType::RaydiumLp, 4)));
         assert_eq!(f(&RAYDIUM_CL_PROG_ID, &anchor_swap_v2), Some((PoolType::RaydiumCl, 2)));
         assert_eq!(f(&PUMP_FUN_PROG_ID, &BUY_DISC), Some((PoolType::PumpFun, 3)), "bonding curve, not the mint at [2]");
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &crate::execution::amms::pumpfun::BUY_EXACT_SOL_IN_DISC), Some((PoolType::PumpFun, 3)));
+        // sell_v2 (live, 61xBNv9n…): the curve moves to [10]
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &[0x5d, 0xf6, 0x82, 0x3c, 0xe7, 0xe9, 0x40, 0xb2]), Some((PoolType::PumpFun, 10)));
+        assert_eq!(f(&PUMP_FUN_PROG_ID, &[0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4]), None, "create_v2 is not a swap");
         assert_eq!(f(&PUMP_FUN_AMM_PROG_ID, &SELL_DISC), Some((PoolType::PumpFunAmm, 0)));
         assert_eq!(f(&METEORA_PROG_ID, &anchor_swap), Some((PoolType::Meteora, 0)));
         assert_eq!(f(&METEORA_DLMM_PROG_ID, &anchor_swap), Some((PoolType::MeteoraDlmm, 0)));
@@ -951,6 +969,8 @@ mod tests {
             associated_bonding_curve: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             creator: Pubkey::new_unique(),
+            curve: Default::default(),
+            buyback_fee_recipient: Pubkey::new_unique(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint, SOL_NATIVE_MINT)));
@@ -1103,6 +1123,7 @@ mod tests {
             quote_vault: Pubkey::new_unique(),
             base_mint,
             quote_mint,
+            curve: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base_mint, quote_mint)));

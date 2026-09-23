@@ -259,6 +259,14 @@ pub enum PoolState {
         event_authority: Pubkey,
         /// Creator pubkey from bonding curve data (offset +49). Used for creator_vault PDA.
         creator: Pubkey,
+        /// Reserves and flags of the curve (`quote::pump_bonding`), re-read with
+        /// the account.
+        #[serde(default)]
+        curve: crate::quote::pump_bonding::PumpCurve,
+        /// One of `Global.buyback_fee_recipients`: a writable remaining account
+        /// every buy/sell must carry (after the `bonding-curve-v2` PDA).
+        #[serde(default)]
+        buyback_fee_recipient: Pubkey,
     },
     PumpFunAmm {
         pool: Pubkey,
@@ -369,6 +377,9 @@ pub enum PoolState {
         quote_vault: Pubkey,
         base_mint: Pubkey,
         quote_mint: Pubkey,
+        /// Price, reserves and the config's curve + fees (`quote::dbc`).
+        #[serde(default)]
+        curve: crate::quote::dbc::DbcCurve,
     },
     Orca {
         whirlpool: Pubkey,
