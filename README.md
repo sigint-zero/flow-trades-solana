@@ -86,20 +86,20 @@ pool the server has seen; the first quote of an unseen pool costs one to three R
 | Raydium CPMM | x·y=k; trade + creator fee from `AmmConfig` | |
 | Raydium CLMM | tick-array walk; fee from `AmmConfig` | |
 | Raydium LaunchLab | bonding curve on virtual + real reserves; config fees | |
-| Raydium V4 | — | streamed, not indexed |
+| Raydium V4 | x·y=k on vault − `need_take_pnl`; pool fee, ceil off the input | swaps via `swap_base_in_v2` (no OpenBook accounts) |
 | pump.fun AMM | x·y=k on vault quote + virtual quote reserve; market-cap fee tiers; exact-input buys | buyback accounts resolved per pool |
 | pump.fun bonding | — | streamed only |
 | Orca Whirlpool | tick-array walk | |
 | PancakeSwap | tick-array walk; fee from `AmmConfig` | |
 | DefiTuna Fusion | tick-array walk | |
-| Byreal | — | Raydium CLMM fork; parser uses the Orca layout, not quotable |
+| Byreal | tick-array walk (Raydium layout, incl. sparse arrays); `AmmConfig` fee, per-pool override, launch decay fee, dynamic fee (Pyth arbitrage term) | Raydium CLMM fork; `swap_v3_dyn` for dynamic-fee pools; a swap the imbalance term would apply to is not quoted |
 | Meteora DAMM v2 | sqrt-price curve; fee scheduler, dynamic fee, collect mode | |
 | Meteora Standard | x·y=k on the pool's LP share of two dynamic vaults | stable curve not quoted |
 | Meteora DLMM | — | streamed only |
 | Meteora DBC | — | streamed only |
 | Saros | x·y=k; observed fee | |
 | Dooar | x·y=k; on-chain fee schedule | |
-| FluxBeam | — | streamed only |
+| FluxBeam | x·y=k; on-chain fee schedule (trade + owner fee, both off the input) | most pools charge 90–99 % owner fees |
 | FlashTrade | — | stale: `FLASHX8…` is a routing program, not FlashTrade perps; its pools are wallets |
 | DefiTuna Pools | — | stale: no swaps |
 | Pumpup AMM / bonding | — | stale: program no longer trades |
@@ -118,6 +118,7 @@ Quote vs router-simulated output on mainnet, direct routes, 0.05–50 SOL, both 
 | pump.fun AMM, pools with a coin creator | 0 bps |
 | pump.fun AMM, no coin creator | about −65 bps (fee schedule not in the tier config) |
 | Saros | −10 … −25 bps |
+| Raydium V4, Byreal, FluxBeam | 0 bps on a fresh state; the busy V4 SOL/USDC pool ±0.4 bps and Byreal dynamic-fee pools up to ~5 bps when the pool or the Pyth price moves between quote and simulation |
 | Multi-hop (v1) | within ~5 bps; later hops are quoted on the previous hop's guaranteed output |
 
 ---

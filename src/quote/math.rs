@@ -815,18 +815,28 @@ pub fn extract_clmm_params(
             token_mint_b,
             sqrt_price_x64,
             liquidity,
+            fee_rate,
+            fee,
             ..
         } => {
             let a_to_b = *input_mint == *token_mint_a;
             if *input_mint != *token_mint_a && *input_mint != *token_mint_b {
                 return None;
             }
-            // Byreal is an Orca fork; default to 30 bps
+            // Raydium CLMM fork: the AmmConfig rate (hundredths of a basis
+            // point), unless the pool overrides it or charges a launch decay
+            // fee. A dynamic-fee pool adds a per-swap term on top of this
+            // base (`quote::byreal_fee::swap_fee_ppm`).
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            if !fee.can_swap(now) {
+                return None;
+            }
+            let fee_ppm = fee.base_fee_rate(*fee_rate as u32, a_to_b, now)?;
             Some(ClmmParams {
                 sqrt_price_x64: *sqrt_price_x64,
                 liquidity: *liquidity,
-                fee_bps: 30,
-                fee_ppm: 3_000,
+                fee_bps: (fee_ppm / 100).clamp(1, 10_000) as u16,
+                fee_ppm,
                 a_to_b,
                 tick_liquidities: Vec::new(),
             })

@@ -123,14 +123,23 @@ pub fn mirror_block(block: &UiConfirmedBlock, registry: &PoolRegistry, mirror: &
         }
 
         // 2. touched state-priced pools: any writable known pool in the key set
+        // (plus Raydium V4, whose curve reserves net out the PnL kept in the pool)
         for k in &keys {
             if seen.contains(k) {
                 continue;
             }
             if let Some(entry) = registry.get(k) {
-                if (is_state_priced(entry.pool_type) || entry.pool_type == PoolType::Meteora) && entry.mint_a != Pubkey::default() {
+                if (is_state_priced(entry.pool_type) || matches!(entry.pool_type, PoolType::Meteora | PoolType::RaydiumV4)) && entry.mint_a != Pubkey::default() {
                     seen.insert(*k);
                     pass.touched.push((*k, entry.pool_type));
+                }
+            } else if let Some(pools) = crate::quote::byreal_fee::pools_reading_oracle(k) {
+                // a Pyth price push: re-read the dynamic-fee pools that price on it
+                seen.insert(*k);
+                for p in pools {
+                    if seen.insert(p) {
+                        pass.touched.push((p, PoolType::Byreal));
+                    }
                 }
             }
         }
@@ -315,6 +324,32 @@ mod tests {
         assert_eq!(mirror.get_vault_balance(&stranger_vault), None);
         // only the state-priced pool is queued for a re-read
         assert_eq!(pass.touched, vec![(clmm_pool, PoolType::RaydiumCl)]);
+    }
+
+    #[test]
+    fn raydium_v4_pools_are_re_read_for_their_pnl() {
+        let registry = PoolRegistry::new();
+        let mirror = AccountMirror::new();
+        let v4 = Pubkey::new_unique();
+        registry.add(PoolEntry { address: v4, pool_type: PoolType::RaydiumV4, mint_a: Pubkey::new_unique(), mint_b: Pubkey::new_unique() });
+        let block = block_with(vec![Pubkey::new_unique(), v4], vec![]);
+        assert_eq!(mirror_block(&block, &registry, &mirror).touched, vec![(v4, PoolType::RaydiumV4)]);
+    }
+
+    #[test]
+    fn a_pyth_price_push_re_reads_the_dynamic_fee_pools_on_that_oracle() {
+        let registry = PoolRegistry::new();
+        let mirror = AccountMirror::new();
+        let (pool, oracle_0, oracle_1) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        let fee = crate::quote::byreal_fee::ByrealFee { flags: 0b1_0000, oracle_0, oracle_1, ..Default::default() };
+        let state = crate::pool::PoolState::Byreal {
+            pool, amm_config: Pubkey::new_unique(), token_vault_a: Pubkey::new_unique(), token_vault_b: Pubkey::new_unique(),
+            observation: Pubkey::new_unique(), token_mint_a: Pubkey::new_unique(), token_mint_b: Pubkey::new_unique(),
+            tick_current: 0, tick_spacing: 1, sqrt_price_x64: 1 << 64, liquidity: 1, fee_rate: 100, fee,
+        };
+        crate::quote::byreal_fee::publish_dyn_inputs(&state, &[]);
+        let block = block_with(vec![Pubkey::new_unique(), oracle_1], vec![]);
+        assert_eq!(mirror_block(&block, &registry, &mirror).touched, vec![(pool, PoolType::Byreal)]);
     }
 
     #[test]

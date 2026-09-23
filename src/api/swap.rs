@@ -576,14 +576,14 @@ fn tidy_multihop(setup: Vec<Instruction>, later_hop_setups: Vec<Vec<Instruction>
 /// The amount a hop can rely on receiving from the previous one.
 use crate::quote::router::guaranteed;
 
-/// Raydium CLMM / PancakeSwap swaps carry the current tick array plus the next
+/// Raydium CLMM / PancakeSwap / Byreal swaps carry the current tick array plus the next
 /// two in the swap direction as remaining accounts. A neighbouring array that
 /// no LP has ever touched does not exist on chain, and passing it fails the
 /// whole swap with `AccountOwnedByWrongProgram` (owner = System). One
 /// `getMultipleAccounts` per swap prunes the missing neighbours; the first
 /// array (holding the current tick) must exist.
 async fn prune_missing_tick_arrays(rpc: &solana_client::nonblocking::rpc_client::RpcClient, ixs: &mut SwapInstructions, pool_type: PoolType, pool: &Pubkey) -> TradeResult<()> {
-    if !matches!(pool_type, PoolType::RaydiumCl | PoolType::PancakeSwap) {
+    if !matches!(pool_type, PoolType::RaydiumCl | PoolType::PancakeSwap | PoolType::Byreal) {
         return Ok(());
     }
     // With the pool's ticks in memory the executor already passed exactly the

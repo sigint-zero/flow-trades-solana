@@ -164,21 +164,27 @@ impl SplSwapFees {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolState {
+    /// Raydium AMM v4 (`AmmInfo`, 752 bytes). The program prices swaps on
+    /// `vault − need_take_pnl` without the OpenBook market, so the
+    /// state is parsed from the pool account alone and swaps use
+    /// `swap_base_in_v2`, which takes no market accounts.
     RaydiumV4 {
         amm_id: Pubkey,
         authority: Pubkey,
-        open_orders: Pubkey,
-        target_orders: Pubkey,
         coin_vault: Pubkey,
         pc_vault: Pubkey,
-        serum_program: Pubkey,
-        serum_market: Pubkey,
-        serum_bids: Pubkey,
-        serum_asks: Pubkey,
-        serum_event_queue: Pubkey,
-        serum_coin_vault: Pubkey,
-        serum_pc_vault: Pubkey,
-        serum_vault_signer: Pubkey,
+        coin_mint: Pubkey,
+        pc_mint: Pubkey,
+        /// `fees.swap_fee_numerator / swap_fee_denominator` (ceil, off the input).
+        swap_fee_numerator: u64,
+        swap_fee_denominator: u64,
+        /// `state_data.need_take_pnl_{coin,pc}`: accrued protocol PnL sitting in
+        /// the vaults but outside the curve.
+        need_take_pnl_coin: u64,
+        need_take_pnl_pc: u64,
+        /// `AmmStatus` (1 Initialized, 6 SwapOnly, 7 WaitingTrade can swap).
+        status: u64,
+        pool_open_time: u64,
     },
     RaydiumCpmm {
         pool: Pubkey,
@@ -396,11 +402,14 @@ pub enum PoolState {
         custody: Pubkey,
         token_mint: Pubkey,
     },
+    /// Byreal CLMM: a Raydium CLMM fork (same pool / AmmConfig / tick-array
+    /// layouts and PDAs, own program id).
     Byreal {
         pool: Pubkey,
+        amm_config: Pubkey,
         token_vault_a: Pubkey,
         token_vault_b: Pubkey,
-        oracle: Pubkey,
+        observation: Pubkey,
         token_mint_a: Pubkey,
         token_mint_b: Pubkey,
         tick_current: i32,
@@ -409,6 +418,12 @@ pub enum PoolState {
         sqrt_price_x64: u128,
         /// Current tick range liquidity (u128)
         liquidity: u128,
+        /// `AmmConfig.trade_fee_rate`, hundredths of a basis point
+        fee_rate: u16,
+        /// Byreal's pool-level fee fields (rate override, launch decay fee,
+        /// dynamic-fee flag) — see `quote::byreal_fee`.
+        #[serde(default)]
+        fee: crate::quote::byreal_fee::ByrealFee,
     },
     DefiTunaFusion {
         pool: Pubkey,

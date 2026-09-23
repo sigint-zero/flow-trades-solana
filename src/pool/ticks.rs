@@ -23,7 +23,7 @@ pub fn tick_source(state: &PoolState) -> Option<(TickLayout, Pubkey, Pubkey, i32
         PoolState::RaydiumClmm { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Raydium, RAYDIUM_CL_PROG_ID, *pool, *tick_current, *tick_spacing)),
         PoolState::PancakeSwap { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Raydium, PANCAKESWAP_PROG_ID, *pool, *tick_current, *tick_spacing)),
         PoolState::Orca { whirlpool, tick_current, tick_spacing, .. } => Some((TickLayout::Orca, ORCA_PROG_ID, *whirlpool, *tick_current, *tick_spacing)),
-        PoolState::Byreal { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Orca, BYREAL_PROG_ID, *pool, *tick_current, *tick_spacing)),
+        PoolState::Byreal { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Raydium, BYREAL_PROG_ID, *pool, *tick_current, *tick_spacing)),
         PoolState::DefiTunaFusion { pool, tick_current_index, tick_spacing, .. } => Some((TickLayout::Orca, DEFITUNA_FUSION_PROG_ID, *pool, *tick_current_index, *tick_spacing as i32)),
         _ => None,
     }
@@ -41,9 +41,12 @@ pub struct TickFetchPlan {
     pub spacing: i32,
     pub starts: Vec<i32>,
     /// Account keys in order: the arrays for `starts`, then (Raydium layouts)
-    /// the bitmap extension PDA.
+    /// the bitmap extension PDA, then (Byreal dynamic-fee pools) the vaults and
+    /// oracle accounts its fee reads (`quote::byreal_fee::dyn_input_keys`).
     pub keys: Vec<Pubkey>,
     pub extension: Option<Pubkey>,
+    /// The pool state, when its fee needs the extra accounts above.
+    pub dyn_fee_state: Option<PoolState>,
 }
 
 pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
@@ -57,7 +60,11 @@ pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
     if let Some(e) = extension {
         keys.push(e);
     }
-    Some(TickFetchPlan { layout, pool, span, spacing, starts, keys, extension })
+    let dyn_keys = crate::quote::byreal_fee::dyn_input_keys(state);
+    if let Some(k) = dyn_keys {
+        keys.extend(k);
+    }
+    Some(TickFetchPlan { layout, pool, span, spacing, starts, keys, extension, dyn_fee_state: dyn_keys.map(|_| state.clone()) })
 }
 
 /// Build `TickData` from the accounts fetched for `plan.keys` (same order) and
@@ -83,9 +90,13 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
     }
     ticks.sort_unstable_by_key(|(t, _)| *t);
     let bitmap_extension = match plan.extension {
-        Some(e) if accounts.last().map(|a| a.is_some()).unwrap_or(false) => Some(e),
+        Some(e) if accounts.get(plan.starts.len()).map(|a| a.is_some()).unwrap_or(false) => Some(e),
         _ => None,
     };
+    if let Some(st) = &plan.dyn_fee_state {
+        let from = plan.starts.len() + plan.extension.is_some() as usize;
+        crate::quote::byreal_fee::publish_dyn_inputs(st, &accounts[from..]);
+    }
     let data = Arc::new(TickData {
         ticks,
         covered_lo: plan.starts[0],
@@ -139,7 +150,7 @@ pub async fn load_clmm_ticks_many(rpc: &RpcClient, states: &[PoolState]) -> usiz
 }
 
 /// Raydium-style `AmmConfig.trade_fee_rate` (u32 at 47, 1e6 denominator),
-/// cached per config. Shared by Raydium CLMM and PancakeSwap (same layout:
+/// cached per config. Shared by Raydium CLMM, PancakeSwap and Byreal (same layout:
 /// bump u8, index u16, owner, protocol_fee_rate u32, trade_fee_rate u32,
 /// tick_spacing u16, fund_fee_rate u32).
 static CLMM_CONFIG_FEES: std::sync::LazyLock<dashmap::DashMap<Pubkey, u32>> = std::sync::LazyLock::new(dashmap::DashMap::new);

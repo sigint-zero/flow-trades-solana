@@ -59,13 +59,12 @@ fn is_constant_product(pool_type: PoolType) -> bool {
             | PoolType::Dooar
             | PoolType::PumpupBonding
             | PoolType::Pumpup
+            | PoolType::FluxBeam
         // NOT here, quoted with their own math in `quote_state`: Meteora DAMM v2
         // (single-range sqrt-price curve, `quote::damm_v2`), Raydium LaunchLab
         // (virtual-reserve bonding curve, `quote::launchlab`), Meteora Standard
         // (LP share of dynamic vaults, `quote::meteora_std`), every CLMM venue
-        // (`quote::clmm` tick walk). FluxBeam (transfer-fee Token-2022 pairs)
-        // is streamed but not quoted: constant product on its vault balances
-        // over-quotes and the program reverts on its own slippage check.
+        // (`quote::clmm` tick walk).
     )
 }
 
@@ -568,11 +567,17 @@ impl Quoter {
                 Some(t) if t.fetched_at.elapsed() <= self.cache.ttl() => Arc::clone(&t),
                 _ => return Eval::Cold,
             };
-            let out = match clmm::swap_exact_in(params.sqrt_price_x64, params.liquidity, tick_current, params.fee_ppm, &ticks, params.a_to_b, amount) {
+            // Byreal dynamic-fee pools: a per-swap rate from vaults + oracle prices
+            let fee_ppm = match super::byreal_fee::swap_fee_ppm(state, &entry.address, params.a_to_b, amount, params.fee_ppm) {
+                super::byreal_fee::SwapFee::Base => params.fee_ppm,
+                super::byreal_fee::SwapFee::Rate(r) => r,
+                super::byreal_fee::SwapFee::Unavailable => return Eval::Quoted(None),
+            };
+            let out = match clmm::swap_exact_in(params.sqrt_price_x64, params.liquidity, tick_current, fee_ppm, &ticks, params.a_to_b, amount) {
                 Some(r) if r.amount_out > 0 => r.amount_out,
                 _ => return Eval::Quoted(None),
             };
-            let fee_amount = (amount as u128 * params.fee_ppm as u128).div_ceil(clmm::FEE_DENOMINATOR_PPM) as u64;
+            let fee_amount = (amount as u128 * fee_ppm as u128).div_ceil(clmm::FEE_DENOMINATOR_PPM) as u64;
             let q64: u128 = 1u128 << 64;
             let reserve_a = params.liquidity.saturating_mul(q64) / params.sqrt_price_x64.max(1);
             let reserve_b = params.liquidity.saturating_mul(params.sqrt_price_x64) / q64.max(1);
@@ -679,6 +684,18 @@ impl Quoter {
                 }
                 return Some((out, (trade_fee + creator_in) as u64, reserve_in, reserve_out));
             }
+        }
+        // Raydium AMM v4: the program's own arithmetic on `vault − need_take_pnl`.
+        if let PoolState::RaydiumV4 { coin_mint, swap_fee_numerator, swap_fee_denominator, need_take_pnl_coin, need_take_pnl_pc, status, pool_open_time, .. } = state {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            if !crate::execution::amms::raydium_v4::can_swap(*status, *pool_open_time, now) {
+                return None;
+            }
+            let (pnl_in, pnl_out) = if input_mint == coin_mint { (*need_take_pnl_coin, *need_take_pnl_pc) } else { (*need_take_pnl_pc, *need_take_pnl_coin) };
+            let reserve_in = reserve_in.checked_sub(pnl_in as u128)?;
+            let reserve_out = reserve_out.checked_sub(pnl_out as u128)?;
+            let (out, fee) = crate::execution::amms::raydium_v4::swap_base_in_out(reserve_in, reserve_out, amount, *swap_fee_numerator, *swap_fee_denominator)?;
+            return Some((out, fee, reserve_in, reserve_out));
         }
         // SPL token-swap forks: the pool's own fee schedule (trade + owner
         // trade, off the input), constant-product curve only. Saros is not
@@ -886,7 +903,7 @@ impl Quoter {
         let mirror = self.mirror.as_ref()?;
         let (vault_a, vault_b, mint_a, mint_b) = extract_vault_mints(state)?;
 
-        // Can't determine direction without mints (RaydiumV4)
+        // Can't determine direction without mints
         if mint_a == Pubkey::default() && mint_b == Pubkey::default() {
             return None;
         }
@@ -1346,14 +1363,10 @@ fn extract_vault_mints(pool_state: &PoolState) -> Option<(Pubkey, Pubkey, Pubkey
         PoolState::RaydiumV4 {
             coin_vault,
             pc_vault,
+            coin_mint,
+            pc_mint,
             ..
-        } => {
-            // RaydiumV4 doesn't store mints directly in PoolState.
-            // We return the vaults, and use Pubkey::default() as placeholder mints.
-            // The caller must use the registry's mint_a/mint_b for direction detection.
-            // We return (coin_vault, pc_vault, default, default) — handled specially in fetch_reserves.
-            Some((*coin_vault, *pc_vault, Pubkey::default(), Pubkey::default()))
-        }
+        } => Some((*coin_vault, *pc_vault, *coin_mint, *pc_mint)),
 
         PoolState::Meteora {
             a_token_vault,
@@ -1503,24 +1516,6 @@ async fn fetch_reserves(
 
     let (ra, rb) = (bal_a? as u128, bal_b? as u128);
 
-    // For RaydiumV4 where mints are default (not stored in state),
-    // we use vault order: coin_vault = vault_a (first), pc_vault = vault_b (second).
-    // The caller's input_mint won't match Pubkey::default(), so we need to infer
-    // direction from which vault the input lands in. However, without mints we
-    // can't determine direction here — we return (ra, rb) and let the caller
-    // use the registry mint_a/mint_b. For simplicity, treat vault_a as "A" side.
-    // Direction detection for V4: not applicable since V4 doesn't have mints in state.
-    // The registry mint_a corresponds to coin, mint_b to pc.
-    if mint_a == Pubkey::default() && mint_b == Pubkey::default() {
-        // RaydiumV4: can't determine direction from mints in state.
-        // Return (ra, rb) as (reserve_a, reserve_b) — the caller needs to map.
-        // For now, return in order and let the outer code figure direction.
-        // Since we don't know which vault corresponds to which mint,
-        // return None to skip RaydiumV4 vault-based quoting for now.
-        // V4 pools are mostly closed (Serum) anyway.
-        return None;
-    }
-
     // Return in (input_reserve, output_reserve) order
     if *input_mint == mint_a {
         Some((ra, rb))
@@ -1659,7 +1654,8 @@ mod tests {
         assert!(is_constant_product(PoolType::RaydiumCpmm));
         assert!(is_constant_product(PoolType::PumpFunAmm));
         assert!(!is_constant_product(PoolType::Meteora), "dynamic vaults — no reserve math yet");
-        assert!(!is_constant_product(PoolType::FluxBeam), "transfer-fee pairs — no math yet");
+        assert!(is_constant_product(PoolType::FluxBeam), "SPL token-swap fee schedule read from the pool");
+        assert!(is_quotable(PoolType::FluxBeam));
         assert!(is_constant_product(PoolType::Dooar));
 
         // CLMM pools are NOT constant product
@@ -1989,31 +1985,88 @@ mod tests {
     fn test_extract_vault_mints_raydium_v4() {
         let cv = Pubkey::new_unique();
         let pv = Pubkey::new_unique();
-        let state = PoolState::RaydiumV4 {
+        let (cm, pm) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let state = v4_state(cv, pv, cm, pm, 0, 0);
+        assert_eq!(extract_vault_mints(&state), Some((cv, pv, cm, pm)));
+    }
+
+    fn v4_state(coin_vault: Pubkey, pc_vault: Pubkey, coin_mint: Pubkey, pc_mint: Pubkey, pnl_coin: u64, pnl_pc: u64) -> PoolState {
+        PoolState::RaydiumV4 {
             amm_id: Pubkey::new_unique(),
             authority: Pubkey::new_unique(),
-            open_orders: Pubkey::new_unique(),
-            target_orders: Pubkey::new_unique(),
-            coin_vault: cv,
-            pc_vault: pv,
-            serum_program: Pubkey::new_unique(),
-            serum_market: Pubkey::new_unique(),
-            serum_bids: Pubkey::new_unique(),
-            serum_asks: Pubkey::new_unique(),
-            serum_event_queue: Pubkey::new_unique(),
-            serum_coin_vault: Pubkey::new_unique(),
-            serum_pc_vault: Pubkey::new_unique(),
-            serum_vault_signer: Pubkey::new_unique(),
-        };
+            coin_vault,
+            pc_vault,
+            coin_mint,
+            pc_mint,
+            swap_fee_numerator: 25,
+            swap_fee_denominator: 10_000,
+            need_take_pnl_coin: pnl_coin,
+            need_take_pnl_pc: pnl_pc,
+            status: 6,
+            pool_open_time: 0,
+        }
+    }
 
-        let result = extract_vault_mints(&state);
-        assert!(result.is_some());
-        let (va, vb, ma, mb) = result.unwrap();
-        assert_eq!(va, cv);
-        assert_eq!(vb, pv);
-        // Mints are Pubkey::default() for V4 (not stored in state)
-        assert_eq!(ma, Pubkey::default());
-        assert_eq!(mb, Pubkey::default());
+    fn v4_quoter() -> (Arc<PoolRegistry>, Arc<crate::pool::cache::PoolCache>, Arc<crate::stream::account_mirror::AccountMirror>, Quoter) {
+        let registry = Arc::new(PoolRegistry::new());
+        let cache = Arc::new(crate::pool::cache::PoolCache::new(60_000));
+        let mirror = Arc::new(crate::stream::account_mirror::AccountMirror::new());
+        let rpc = Arc::new(RpcClient::new("http://localhost:8899".to_string()));
+        let quoter = Quoter::with_mirror(Arc::clone(&registry), Arc::clone(&cache), rpc, Arc::clone(&mirror));
+        (registry, cache, mirror, quoter)
+    }
+
+    fn v4_pool(registry: &PoolRegistry, cache: &crate::pool::cache::PoolCache, mirror: &crate::stream::account_mirror::AccountMirror, coin: Pubkey, pc: Pubkey, vaults: (u64, u64), pnl: (u64, u64)) -> Pubkey {
+        let (pool, cv, pv) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+        registry.add(PoolEntry { address: pool, pool_type: PoolType::RaydiumV4, mint_a: coin, mint_b: pc });
+        cache.insert(pool, v4_state(cv, pv, coin, pc, pnl.0, pnl.1));
+        mirror.update_vault_balance(cv, vaults.0);
+        mirror.update_vault_balance(pv, vaults.1);
+        pool
+    }
+
+    fn quote_req(input_mint: Pubkey, output_mint: Pubkey, amount: u64, only_direct_routes: bool) -> QuoteRequest {
+        QuoteRequest { input_mint, output_mint, amount, slippage_bps: 50, only_direct_routes, exclude_dexes: vec![], dexes: vec![], max_accounts: 64 }
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_quote_matches_the_mainnet_ray_log_both_ways() {
+        // 58oQChx4… SOL/USDC, tx 75pWHXMn…: vault balances before the swap, the
+        // pool's need_take_pnl, and the ray_log out amounts.
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_470_889_557_717, 21_208_903_794_498), (39_925_487, 4_739_163));
+        let out: u64 = quoter.quote(&quote_req(SOL_NATIVE_MINT, USDC_MINT, 33_157_350, true)).await.unwrap().amount_out.parse().unwrap();
+        assert_eq!(out, 3_930_460);
+        // pc → coin on the same reserves (tx 4r7FMgx8…: its own pre-balances)
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_424_565_685_852, 21_214_253_619_335), (39_925_487, 4_739_163));
+        let resp = quoter.quote(&quote_req(USDC_MINT, SOL_NATIVE_MINT, 250_000_000, true)).await.unwrap();
+        assert_eq!(resp.amount_out, "2097368298");
+        assert_eq!(resp.routes[0].pool.dex, "Raydium V4");
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_pools_route_as_a_two_hop_leg() {
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        let token = Pubkey::new_unique();
+        v4_pool(&registry, &cache, &mirror, token, SOL_NATIVE_MINT, (5_000_000_000_000, 100_000_000_000), (0, 0));
+        v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (178_470_889_557_717, 21_208_903_794_498), (39_925_487, 4_739_163));
+        let resp = quoter.quote(&quote_req(token, USDC_MINT, 1_000_000_000, false)).await.unwrap();
+        assert_eq!(resp.routes.len(), 2);
+        assert!(resp.routes.iter().all(|r| r.pool.dex == "Raydium V4"));
+        let hop1: u64 = resp.routes[0].pool.amount_out.parse().unwrap();
+        let (h1, _) = crate::execution::amms::raydium_v4::swap_base_in_out(5_000_000_000_000, 100_000_000_000, 1_000_000_000, 25, 10_000).unwrap();
+        assert_eq!(hop1, h1);
+    }
+
+    #[tokio::test]
+    async fn raydium_v4_closed_pool_is_not_quoted() {
+        let (registry, cache, mirror, quoter) = v4_quoter();
+        let pool = v4_pool(&registry, &cache, &mirror, SOL_NATIVE_MINT, USDC_MINT, (1_000_000_000, 1_000_000_000), (0, 0));
+        if let Some(PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, .. }) = cache.get(&pool) {
+            cache.insert(pool, PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, swap_fee_numerator: 25, swap_fee_denominator: 10_000, need_take_pnl_coin: 0, need_take_pnl_pc: 0, status: 3, pool_open_time: 0 });
+        }
+        assert!(quoter.quote(&quote_req(SOL_NATIVE_MINT, USDC_MINT, 1_000, true)).await.is_err(), "WithdrawOnly pool");
     }
 
     #[test]

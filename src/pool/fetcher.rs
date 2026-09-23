@@ -44,7 +44,7 @@ pub async fn fetch_pool_state(
     let pool_data = fetch_account(rpc, pool_address).await?;
 
     match pool_type {
-        PoolType::RaydiumV4 => parse_raydium_v4(rpc, pool_address, &pool_data).await,
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, &pool_data),
         PoolType::RaydiumCpmm => {
             let mut st = parse_raydium_cpmm(pool_address, &pool_data)?;
             if let PoolState::RaydiumCpmm { config, trade_fee_bps, creator_fee_ppm, .. } = &mut st {
@@ -92,7 +92,13 @@ pub async fn fetch_pool_state(
         PoolType::Orca => parse_orca(pool_address, &pool_data),
         PoolType::FluxBeam => parse_fluxbeam(pool_address, &pool_data),
         PoolType::FlashTrade => parse_flash_trade(pool_address, &pool_data),
-        PoolType::Byreal => parse_byreal(pool_address, &pool_data),
+        PoolType::Byreal => {
+            let mut st = parse_byreal(pool_address, &pool_data)?;
+            if let PoolState::Byreal { amm_config, tick_spacing, fee_rate, .. } = &mut st {
+                *fee_rate = clmm_fee_rate_u16(rpc, amm_config, *tick_spacing, *fee_rate).await;
+            }
+            Ok(st)
+        }
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, &pool_data),
         PoolType::DefiTunaPools => parse_defituna_pools(pool_address, &pool_data),
         PoolType::Saros => parse_saros(pool_address, &pool_data),
@@ -113,9 +119,9 @@ pub async fn fetch_pool_state(
 }
 
 /// Parse pool state directly from raw account bytes — zero RPC.
-/// Returns Ok(state) for the 14 sync pool types that only need the pool account data.
-/// Returns Err for the 5 async pool types that need additional RPC calls (Raydium V4,
-/// PumpFun bonding, PumpFun AMM, Meteora Standard, Meteora DBC).
+/// Returns Ok(state) for the 15 sync pool types that only need the pool account data.
+/// Returns Err for the 4 async pool types that need additional RPC calls (PumpFun
+/// bonding, PumpFun AMM, Meteora Standard, Meteora DBC).
 ///
 /// Used by Geyser account updates to parse inline from notification payloads.
 pub fn parse_pool_state_from_bytes(
@@ -135,6 +141,7 @@ pub fn parse_pool_state_from_bytes(
 
     match pool_type {
         // Sync parsers — work from pool data alone (zero RPC)
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, &account),
         PoolType::RaydiumCpmm => parse_raydium_cpmm(pool_address, &account),
         PoolType::RaydiumCl => parse_raydium_clmm(pool_address, &account),
         PoolType::RaydiumLp => parse_raydium_lp(pool_address, &account),
@@ -160,7 +167,7 @@ pub fn parse_pool_state_from_bytes(
 /// Returns true if this pool type can be parsed from raw bytes without RPC.
 pub fn is_sync_parseable(pool_type: PoolType) -> bool {
     matches!(pool_type,
-        PoolType::RaydiumCpmm | PoolType::RaydiumCl | PoolType::RaydiumLp |
+        PoolType::RaydiumV4 | PoolType::RaydiumCpmm | PoolType::RaydiumCl | PoolType::RaydiumLp |
         PoolType::MeteoraDlmm | PoolType::MeteoraDamm | PoolType::Orca |
         PoolType::FluxBeam | PoolType::FlashTrade | PoolType::Byreal |
         PoolType::DefiTunaFusion | PoolType::DefiTunaPools | PoolType::Saros |
@@ -208,69 +215,38 @@ fn read_pubkey(data: &[u8], offset: usize) -> TradeResult<Pubkey> {
 }
 
 // -- Raydium V4 --
-// AmmInfo layout: authority(32) open_orders(32) target_orders(32)
-// coin_vault(32) pc_vault(32) ... serum_market(32) ...
-// Total AmmInfo ~752 bytes
-async fn parse_raydium_v4(
-    rpc: &RpcClient,
-    pool_address: &Pubkey,
-    pool_data: &Account,
-) -> TradeResult<PoolState> {
+// AmmInfo (752 bytes, no discriminator): status u64@0, nonce@8, … fees
+// {…, swap_fee_numerator@176, swap_fee_denominator@184}, state_data
+// {need_take_pnl_coin@192, need_take_pnl_pc@200, …, pool_open_time@224, …},
+// coin_vault@336, pc_vault@368, coin_vault_mint@400, pc_vault_mint@432,
+// lp_mint@464, open_orders@496, market@528, market_program@560,
+// target_orders@592.
+fn parse_raydium_v4(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
-    if data.len() < 680 {
+    if pool_data.owner != RAYDIUM_V4_PROG_ID {
+        return Err(TradeError::Execution(format!("raydium v4: account owned by {}", pool_data.owner)));
+    }
+    if data.len() < 752 {
         return Err(TradeError::Execution("raydium v4 account too small".into()));
     }
-
-    let coin_vault = read_pubkey(data, 336)?;
-    let pc_vault = read_pubkey(data, 368)?;
-    let open_orders = read_pubkey(data, 432)?;
-    let serum_market = read_pubkey(data, 464)?;
-    let serum_program = read_pubkey(data, 496)?;
-    let target_orders = read_pubkey(data, 528)?;
-
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    // Fetch serum market to get bids, asks, event_queue, vaults, vault_signer.
-    // Post Serum-shutdown many market accounts have been reclaimed (82 bytes / Token account).
-    // The Raydium V4 program still works for AMM-only swaps -- pass the market address
-    // as a placeholder for all serum fields when the market is closed.
-    let market_data = fetch_account(rpc, &serum_market).await?;
-    let mdata = &market_data.data;
-
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().unwrap());
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                &market_data.owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            // Serum market closed -- use market address as placeholder for all fields.
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
-
+    let rd = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    let (swap_fee_numerator, swap_fee_denominator) = (rd(176), rd(184));
+    if swap_fee_denominator == 0 || swap_fee_numerator >= swap_fee_denominator {
+        return Err(TradeError::Execution(format!("raydium v4 swap fee implausible: {swap_fee_numerator}/{swap_fee_denominator}")));
+    }
     Ok(PoolState::RaydiumV4 {
         amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
+        authority: *RAYDIUM_V4_AUTHORITY,
+        coin_vault: read_pubkey(data, 336)?,
+        pc_vault: read_pubkey(data, 368)?,
+        coin_mint: read_pubkey(data, 400)?,
+        pc_mint: read_pubkey(data, 432)?,
+        swap_fee_numerator,
+        swap_fee_denominator,
+        need_take_pnl_coin: rd(192),
+        need_take_pnl_pc: rd(200),
+        status: rd(0),
+        pool_open_time: rd(224),
     })
 }
 
@@ -824,6 +800,8 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, account)?,
         PoolType::MeteoraDamm => parse_meteora_damm(pool_address, account)?,
         PoolType::RaydiumLp => parse_raydium_lp(pool_address, account)?,
+        // not state-priced (vault balances), but its PnL / status live in the pool
+        PoolType::RaydiumV4 => parse_raydium_v4(pool_address, account)?,
         other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
     };
     match (&mut st, prev) {
@@ -834,7 +812,8 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
             curve.creator_fee_rate = prev_curve.creator_fee_rate;
         }
         (PoolState::RaydiumClmm { fee_rate, .. }, Some(PoolState::RaydiumClmm { fee_rate: prev_fee, .. }))
-        | (PoolState::PancakeSwap { fee_rate, .. }, Some(PoolState::PancakeSwap { fee_rate: prev_fee, .. })) => *fee_rate = *prev_fee,
+        | (PoolState::PancakeSwap { fee_rate, .. }, Some(PoolState::PancakeSwap { fee_rate: prev_fee, .. }))
+        | (PoolState::Byreal { fee_rate, .. }, Some(PoolState::Byreal { fee_rate: prev_fee, .. })) => *fee_rate = *prev_fee,
         _ => {}
     }
     Ok(st)
@@ -1367,60 +1346,48 @@ fn parse_flash_trade(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<
     })
 }
 
+// -- Byreal CLMM (Raydium CLMM fork) --
+// Pool account = Raydium's 1544-byte PoolState (same offsets as PancakeSwap
+// below), plus Byreal fee fields in Raydium's padding (`quote::byreal_fee`).
+/// Anchor discriminator of Byreal's `PoolState` account.
+const BYREAL_POOL_DISCRIMINATOR: [u8; 8] = [0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46];
+
 fn parse_byreal(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
-    if data.len() < 8 + 9 * 32 {
+    if data.len() < 1176 {
         return Err(TradeError::Execution("byreal pool too small".into()));
     }
-    // Orca Whirlpool fork -- same interleaved layout
-    let off = 8;
-    let token_mint_a = read_pubkey(data, off + 93)?;
-    let token_vault_a = read_pubkey(data, off + 125)?;
-    let token_mint_b = read_pubkey(data, off + 173)?;
-    let token_vault_b = read_pubkey(data, off + 205)?;
-
-    let tick_spacing = if data.len() >= off + 35 {
-        u16::from_le_bytes(data[off + 33..off + 35].try_into().unwrap()) as i32
-    } else {
-        1
-    };
-
-    // liquidity: u128 at off+41 (same as Orca)
-    let liquidity = if data.len() >= off + 57 {
-        u128::from_le_bytes(data[off + 41..off + 57].try_into().unwrap())
-    } else {
-        0
-    };
-
-    // sqrt_price_x64: u128 at off+57
-    let sqrt_price_x64 = if data.len() >= off + 73 {
-        u128::from_le_bytes(data[off + 57..off + 73].try_into().unwrap())
-    } else {
-        0
-    };
-
-    let tick_current = if data.len() >= off + 77 {
-        i32::from_le_bytes(data[off + 73..off + 77].try_into().unwrap())
-    } else {
-        0
-    };
-
-    let (oracle, _) = Pubkey::find_program_address(
-        &[b"oracle", pool_address.as_ref()],
-        &BYREAL_PROG_ID,
-    );
+    if data[..8] != BYREAL_POOL_DISCRIMINATOR {
+        return Err(TradeError::Execution(format!("byreal: {pool_address} is not a pool state")));
+    }
+    let amm_config = read_pubkey(data, 9)?;
+    let token_mint_a = read_pubkey(data, 73)?;
+    let token_mint_b = read_pubkey(data, 105)?;
+    let token_vault_a = read_pubkey(data, 137)?;
+    let token_vault_b = read_pubkey(data, 169)?;
+    let observation = read_pubkey(data, 201)?;
+    let tick_spacing = u16::from_le_bytes(data[235..237].try_into().unwrap()) as i32;
+    let liquidity = u128::from_le_bytes(data[237..253].try_into().unwrap());
+    let sqrt_price_x64 = u128::from_le_bytes(data[253..269].try_into().unwrap());
+    let tick_current = i32::from_le_bytes(data[269..273].try_into().unwrap());
+    let fee = crate::quote::byreal_fee::ByrealFee::parse(data)
+        .ok_or_else(|| TradeError::Execution("byreal pool too small".into()))?;
 
     Ok(PoolState::Byreal {
         pool: *pool_address,
+        amm_config,
         token_vault_a,
         token_vault_b,
-        oracle,
+        observation,
         token_mint_a,
         token_mint_b,
         tick_current,
         tick_spacing,
         sqrt_price_x64,
         liquidity,
+        // AmmConfig.trade_fee_rate, read by `fetch_pool_state`; 25 bps until then
+        fee_rate: 2500,
+        fee,
     })
 }
 
@@ -1851,14 +1818,6 @@ fn pubkey_from_str(s: &str) -> Pubkey {
 /// Returns an empty Vec for sync-parseable types.
 pub fn extract_companion_keys(pool_type: PoolType, data: &[u8]) -> Vec<Pubkey> {
     match pool_type {
-        PoolType::RaydiumV4 => {
-            // Serum market at offset 464
-            if data.len() >= 496 {
-                read_pubkey(data, 464).into_iter().collect()
-            } else {
-                vec![]
-            }
-        }
         PoolType::Meteora => {
             // a_vault at 104, b_vault at 136
             if data.len() >= 168 {
@@ -1883,63 +1842,6 @@ pub fn extract_companion_keys(pool_type: PoolType, data: &[u8]) -> Vec<Pubkey> {
         // All other types are already sync-parseable.
         _ => vec![],
     }
-}
-
-/// Parse RaydiumV4 using cached serum market data (no RPC).
-pub fn parse_raydium_v4_with_companion(
-    pool_address: &Pubkey,
-    pool_data: &[u8],
-    serum_market_data: &[u8],
-    serum_market_owner: &Pubkey,
-) -> TradeResult<PoolState> {
-    if pool_data.len() < 680 {
-        return Err(TradeError::Execution("raydium v4 account too small".into()));
-    }
-
-    let coin_vault = read_pubkey(pool_data, 336)?;
-    let pc_vault = read_pubkey(pool_data, 368)?;
-    let open_orders = read_pubkey(pool_data, 432)?;
-    let serum_market = read_pubkey(pool_data, 464)?;
-    let serum_program = read_pubkey(pool_data, 496)?;
-    let target_orders = read_pubkey(pool_data, 528)?;
-    let authority = *RAYDIUM_V4_AUTHORITY;
-
-    let mdata = serum_market_data;
-    let (serum_bids, serum_asks, serum_event_queue, serum_coin_vault, serum_pc_vault, serum_vault_signer) =
-        if mdata.len() >= 388 {
-            let bids = read_pubkey(mdata, 104)?;
-            let asks = read_pubkey(mdata, 136)?;
-            let event_queue = read_pubkey(mdata, 168)?;
-            let coin_v = read_pubkey(mdata, 200)?;
-            let pc_v = read_pubkey(mdata, 232)?;
-            let nonce = u64::from_le_bytes(mdata[264..272].try_into().map_err(|_|
-                TradeError::Execution("raydium v4: nonce slice".into()))?);
-            let vault_signer = Pubkey::create_program_address(
-                &[serum_market.as_ref(), &nonce.to_le_bytes()],
-                serum_market_owner,
-            )
-            .map_err(|_| TradeError::Execution("failed to derive serum vault signer".into()))?;
-            (bids, asks, event_queue, coin_v, pc_v, vault_signer)
-        } else {
-            (serum_market, serum_market, serum_market, serum_market, serum_market, serum_market)
-        };
-
-    Ok(PoolState::RaydiumV4 {
-        amm_id: *pool_address,
-        authority,
-        open_orders,
-        target_orders,
-        coin_vault,
-        pc_vault,
-        serum_program,
-        serum_market,
-        serum_bids,
-        serum_asks,
-        serum_event_queue,
-        serum_coin_vault,
-        serum_pc_vault,
-        serum_vault_signer,
-    })
 }
 
 /// Parse PumpFun bonding curve using pre-discovered companion data (no RPC).
@@ -2110,16 +2012,6 @@ pub fn parse_with_mirror(
     match pool_type {
         // Sync types — no mirror needed
         pt if is_sync_parseable(pt) => parse_pool_state_from_bytes(pt, pool_address, data, owner),
-
-        PoolType::RaydiumV4 => {
-            let market_key = read_pubkey(data, 464)?;
-            let market_data = mirror.get_companion(&market_key).ok_or_else(||
-                TradeError::Execution("raydium v4: serum market not in mirror".into()))?;
-            // We need the market owner for vault_signer derivation. Since Serum is closed,
-            // the owner doesn't matter (placeholder path). Use a default.
-            let market_owner = Pubkey::default();
-            parse_raydium_v4_with_companion(pool_address, data, &market_data, &market_owner)
-        }
 
         PoolType::PumpFunAmm => {
             // Sync layout parser + vault balances from mirror
@@ -2683,46 +2575,80 @@ mod tests {
 
     // -- Byreal --
 
+    /// First 277 bytes of the mainnet Byreal SOL/USDC pool
+    /// 9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq (1544-byte Raydium-layout PoolState).
+    const BYREAL_SOL_USDC_HEAD: &str = "9+3j9dfD3kb+L+5YLsVv0o3EkYaL3WHYfedkSjbRQLqlJ34QDGMZ3i0O5g+zIL5ZpbxeXsNo7D0wbV4rc72JMFhn16FkdzmaAQabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWE+P+p8vsA0tRWI2pmfJWcDgCvYd1Z8DtaHbhyB+fCP8fKh9AAWLHxqPXRnLTvQYUQMIDXWKE4rJcPOdBLvnQoTJGcSSIj+UCpR/pbiCz8GHBSB03Hx1cNFGFm0ROoEwl4JBgEAO4RL5b0AAAAAAAAAAAAAAHRVmtjZOU9YAAAAAAAAAADYrP//AAAAAA==";
+
+    fn byreal_account() -> Account {
+        use base64::Engine;
+        let mut acct = make_account(1544);
+        let head = base64::engine::general_purpose::STANDARD.decode(BYREAL_SOL_USDC_HEAD).unwrap();
+        acct.data[..head.len()].copy_from_slice(&head);
+        acct
+    }
+
     #[test]
     fn test_parse_byreal_success() {
-        let mut acct = make_account(296);
-        let pool_addr = Pubkey::new_unique();
-
-        let token_mint_a = Pubkey::new_unique();
-        let token_vault_a = Pubkey::new_unique();
-        let token_mint_b = Pubkey::new_unique();
-        let token_vault_b = Pubkey::new_unique();
-
-        write_pubkey(&mut acct.data, 101, &token_mint_a);
-        write_pubkey(&mut acct.data, 133, &token_vault_a);
-        write_pubkey(&mut acct.data, 181, &token_mint_b);
-        write_pubkey(&mut acct.data, 213, &token_vault_b);
-
-        write_u16(&mut acct.data, 41, 4);
-        write_i32(&mut acct.data, 81, 123);
-
-        let result = parse_byreal(&pool_addr, &acct).unwrap();
+        let pool_addr = pubkey_from_str("9GTj99g9tbz9U6UYDsX6YeRTgUnkYG6GTnHv3qLa5aXq");
+        let result = parse_byreal(&pool_addr, &byreal_account()).unwrap();
         match result {
             PoolState::Byreal {
                 pool,
-                token_vault_a: va,
-                token_vault_b: vb,
-                token_mint_a: ma,
-                token_mint_b: mb,
+                amm_config,
+                token_vault_a,
+                token_vault_b,
+                observation,
+                token_mint_a,
+                token_mint_b,
                 tick_current,
                 tick_spacing,
-                ..
+                sqrt_price_x64,
+                liquidity,
+                fee_rate,
+                fee,
             } => {
                 assert_eq!(pool, pool_addr);
-                assert_eq!(va, token_vault_a);
-                assert_eq!(vb, token_vault_b);
-                assert_eq!(ma, token_mint_a);
-                assert_eq!(mb, token_mint_b);
-                assert_eq!(tick_current, 123);
-                assert_eq!(tick_spacing, 4);
+                assert_eq!(amm_config, pubkey_from_str("4E6xP73xzTs4aCvY92hbXRwWkYptNwvViPZmLcZEBUk4"));
+                assert_eq!(token_mint_a, SOL_NATIVE_MINT);
+                assert_eq!(token_mint_b, USDC_MINT);
+                assert_eq!(token_vault_a, pubkey_from_str("5BzogZvHNEuwstR4iwTWdd7jknFBZqJQWVjxPsDfEUD6"));
+                assert_eq!(token_vault_b, pubkey_from_str("HL8turx8hJEEPVH4ivxzxwfdxVA1PH3LeYbSmh3hYfzz"));
+                assert_eq!(observation, pubkey_from_str("3T6qNbQqWYDfSTew1ifsNedtoeDP8LRuCegmUH27ykEZ"));
+                assert_eq!(tick_spacing, 1);
+                assert_eq!(tick_current, -21288);
+                assert_eq!(liquidity, 815_595_750_459);
+                assert_eq!(sqrt_price_x64, 6_363_368_406_302_479_732);
+                assert_eq!(fee_rate, 2500, "AmmConfig fee is read by fetch_pool_state");
+                assert_eq!((fee.pool_trade_fee_rate, fee.flags, fee.decimals_0, fee.decimals_1), (0, 0, 9, 6), "no pool-level fee features");
+                assert!(!fee.is_dynamic());
             }
             _ => panic!("expected Byreal variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_byreal_reads_the_pool_fee_fields() {
+        let pool_addr = Pubkey::new_unique();
+        // the mainnet dynamic-fee SOL/USDC pool's fields: trade_fee_rate 1,
+        // flags 24 (dynamic fee, token 1 quote), buffer 100, 10/20/40/50, USDC feed
+        let mut acct = byreal_account();
+        acct.data[393..397].copy_from_slice(&1u32.to_le_bytes());
+        acct.data[1096] = 24;
+        acct.data[1100..1102].copy_from_slice(&100u16.to_le_bytes());
+        acct.data[1102..1106].copy_from_slice(&[10, 20, 40, 50]);
+        acct.data[1080..1088].copy_from_slice(&1_700_000_000u64.to_le_bytes());
+        let usdc_feed: [u8; 32] = [0xea, 0xa0, 0x20, 0xc6, 0x1c, 0xc4, 0x79, 0x71, 0x28, 0x13, 0x46, 0x1c, 0xe1, 0x53, 0x89, 0x4a, 0x96, 0xa6, 0xc0, 0x0b, 0x21, 0xed, 0x0c, 0xfc, 0x27, 0x98, 0xd1, 0xf9, 0xa9, 0xe9, 0xc9, 0x4a];
+        acct.data[1144..1176].copy_from_slice(&usdc_feed);
+        let PoolState::Byreal { fee, .. } = parse_byreal(&pool_addr, &acct).unwrap() else { panic!() };
+        assert_eq!((fee.pool_trade_fee_rate, fee.flags, fee.open_time, fee.arbitrage_fee_buffer_ppm), (1, 24, 1_700_000_000, 100));
+        assert_eq!((fee.slippage_fee_base, fee.slippage_fee_threshold, fee.imbalance_fee_base, fee.imbalance_fee_x), (10, 20, 40, 50));
+        assert!(fee.is_dynamic());
+        assert_eq!(fee.oracle_1, pubkey_from_str("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"), "sponsored USDC/USD feed");
+        // a launch decay-fee pool (flags 7, init 2 %, −1 % / 255 s)
+        let mut acct = byreal_account();
+        acct.data[1096..1100].copy_from_slice(&[7, 2, 1, 255]);
+        let PoolState::Byreal { fee, .. } = parse_byreal(&pool_addr, &acct).unwrap() else { panic!() };
+        assert_eq!((fee.flags, fee.decay_init_rate, fee.decay_decrease_rate, fee.decay_interval), (7, 2, 1, 255));
     }
 
     #[test]
@@ -2730,6 +2656,8 @@ mod tests {
         let acct = make_account(50);
         let pool_addr = Pubkey::new_unique();
         assert!(parse_byreal(&pool_addr, &acct).is_err());
+        // right size, wrong account type (e.g. a payer picked as the pool)
+        assert!(parse_byreal(&pool_addr, &make_account(1544)).is_err());
     }
 
     // -- DefiTuna Fusion --
@@ -3127,25 +3055,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_byreal_oracle_is_pda() {
-        let mut acct = make_account(296);
-        let pool_addr = Pubkey::new_unique();
-        for &offset in &[101, 133, 181, 213] {
-            write_pubkey(&mut acct.data, offset, &Pubkey::new_unique());
-        }
-        let result = parse_byreal(&pool_addr, &acct).unwrap();
-        if let PoolState::Byreal { oracle, .. } = result {
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"oracle", pool_addr.as_ref()],
-                &BYREAL_PROG_ID,
-            );
-            assert_eq!(oracle, expected);
-        } else {
-            panic!("expected Byreal");
-        }
-    }
-
     // -- Boundary size tests (exact minimum) --
 
     #[test]
@@ -3195,13 +3104,48 @@ mod tests {
 
     // ── Companion parser tests ──
 
+    /// Mainnet Raydium AMM v4 SOL/USDC pool 58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2
+    /// (752-byte AmmInfo, status 6 = SwapOnly, need_take_pnl coin 39,925,487 /
+    /// pc 4,739,163 — the offsets its `ray_log` curve reserves were checked against).
+    const RAYDIUM_V4_SOL_USDC: &str = "BgAAAAAAAAD+AAAAAAAAAAcAAAAAAAAAAwAAAAAAAAAJAAAAAAAAAAYAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAEBCDwAAAAAA9AEAAAAAAAAAAAAAAAAAAEBCDwAAAAAAQEIPAAAAAAABAAAAAAAAAADKmjsAAAAAAMqaOwAAAAAFAAAAAAAAABAnAAAAAAAAGQAAAAAAAAAQJwAAAAAAAAwAAAAAAAAAZAAAAAAAAAAZAAAAAAAAABAnAAAAAAAA7zZhAgAAAABbUEgAAAAAAE64FyutAwAALkI4/Jo0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACzqVos/TzgAAAAAAAAAAABzVLPxIFgFAAAAAAAAAAAAMWNjiHMDAACZN03ShGQFAAAAAAAAAAAAQEusDaXyOAAAAAAAAAAAAEiYZsIJJAAAuHDhLdN5iRVh0un6jyZDGDTrc28vJPwqKk3/H9XcpN/yy7m3YO3bGFcGMDBjrTPXtXKW6gLU4DNeMc6vpMxC3QabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWFsT5PYWOiP+v6gjENnRJfo5qkywMgxSCYqGuPMx4KexvkvOQ/5YJ6K1De7jkwfGqQ6wF0kMIzKd96FEsVQkpLTasTDzvqfGb9UyNwPXk0c7uUyfSZIKynSsTy6pDRHIY0NB1GoKC2mEwX+KZw3uZjlhHHbETUDcxD4vhBFpgr27qvkPHweIeqm+XyL01XiG9EnlnR1bByOEGxucSuhFtlwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOW2K2XLO72m9WiI5m/ujmTcVWAZnA+IsR/ic70Fnoqh9l8Mi0iVAABO2XAAAAAAABAEAAAAAAAAAAAAAAAAAAA=";
+
+    fn raydium_v4_account() -> Account {
+        use base64::Engine;
+        let mut acct = make_account(0);
+        acct.data = base64::engine::general_purpose::STANDARD.decode(RAYDIUM_V4_SOL_USDC).unwrap();
+        acct.owner = RAYDIUM_V4_PROG_ID;
+        acct
+    }
+
     #[test]
-    fn test_extract_companion_keys_raydium_v4() {
-        let mut data = vec![0u8; 680];
-        let market = Pubkey::new_unique();
-        write_pubkey(&mut data, 464, &market);
-        let keys = extract_companion_keys(PoolType::RaydiumV4, &data);
-        assert_eq!(keys, vec![market]);
+    fn test_parse_raydium_v4_mainnet_amm_info() {
+        let pool = pubkey_from_str("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2");
+        let st = parse_raydium_v4(&pool, &raydium_v4_account()).unwrap();
+        let PoolState::RaydiumV4 { amm_id, authority, coin_vault, pc_vault, coin_mint, pc_mint, swap_fee_numerator, swap_fee_denominator, need_take_pnl_coin, need_take_pnl_pc, status, pool_open_time } = st else {
+            panic!("expected RaydiumV4");
+        };
+        assert_eq!(amm_id, pool);
+        assert_eq!(authority, pubkey_from_str("5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"));
+        assert_eq!(coin_vault, pubkey_from_str("DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz"));
+        assert_eq!(pc_vault, pubkey_from_str("HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz"));
+        assert_eq!((coin_mint, pc_mint), (SOL_NATIVE_MINT, USDC_MINT));
+        assert_eq!((swap_fee_numerator, swap_fee_denominator), (25, 10_000));
+        assert_eq!((need_take_pnl_coin, need_take_pnl_pc), (39_925_487, 4_739_163));
+        assert_eq!((status, pool_open_time), (6, 0));
+        // sync: parseable from raw bytes (Geyser / block refresh)
+        assert!(is_sync_parseable(PoolType::RaydiumV4));
+        assert!(parse_pool_state_from_bytes(PoolType::RaydiumV4, &pool, &raydium_v4_account().data, &RAYDIUM_V4_PROG_ID).is_ok());
+    }
+
+    #[test]
+    fn test_parse_raydium_v4_rejects_foreign_or_short_accounts() {
+        let pool = Pubkey::new_unique();
+        let mut foreign = raydium_v4_account();
+        foreign.owner = Pubkey::new_unique();
+        assert!(parse_raydium_v4(&pool, &foreign).is_err());
+        let mut short = raydium_v4_account();
+        short.data.truncate(700);
+        assert!(parse_raydium_v4(&pool, &short).is_err());
     }
 
     #[test]
@@ -3232,50 +3176,14 @@ mod tests {
         assert!(extract_companion_keys(PoolType::RaydiumCpmm, &data).is_empty());
         assert!(extract_companion_keys(PoolType::Orca, &data).is_empty());
         assert!(extract_companion_keys(PoolType::PumpFunAmm, &data).is_empty());
+        assert!(extract_companion_keys(PoolType::RaydiumV4, &data).is_empty());
     }
 
     #[test]
     fn test_extract_companion_keys_too_short() {
         let data = vec![0u8; 10]; // way too short
-        assert!(extract_companion_keys(PoolType::RaydiumV4, &data).is_empty());
         assert!(extract_companion_keys(PoolType::Meteora, &data).is_empty());
         assert!(extract_companion_keys(PoolType::MeteoraDbc, &data).is_empty());
-    }
-
-    #[test]
-    fn test_raydium_v4_with_companion_closed_market() {
-        let pool_addr = Pubkey::new_unique();
-        let mut pool_data = vec![0u8; 680];
-        let market = Pubkey::new_unique();
-        write_pubkey(&mut pool_data, 336, &Pubkey::new_unique()); // coin_vault
-        write_pubkey(&mut pool_data, 368, &Pubkey::new_unique()); // pc_vault
-        write_pubkey(&mut pool_data, 432, &Pubkey::new_unique()); // open_orders
-        write_pubkey(&mut pool_data, 464, &market); // serum_market
-        write_pubkey(&mut pool_data, 496, &Pubkey::new_unique()); // serum_program
-        write_pubkey(&mut pool_data, 528, &Pubkey::new_unique()); // target_orders
-
-        // Short market data = closed serum (< 388 bytes)
-        let market_data = vec![0u8; 82];
-        let market_owner = Pubkey::new_unique();
-
-        let result = parse_raydium_v4_with_companion(&pool_addr, &pool_data, &market_data, &market_owner);
-        assert!(result.is_ok());
-        if let PoolState::RaydiumV4 { serum_bids, serum_asks, serum_market: sm, .. } = result.unwrap() {
-            // Closed market: all serum fields = market address
-            assert_eq!(serum_bids, market);
-            assert_eq!(serum_asks, market);
-            assert_eq!(sm, market);
-        } else {
-            panic!("expected RaydiumV4");
-        }
-    }
-
-    #[test]
-    fn test_raydium_v4_with_companion_too_small() {
-        let result = parse_raydium_v4_with_companion(
-            &Pubkey::new_unique(), &[0u8; 100], &[], &Pubkey::default(),
-        );
-        assert!(result.is_err());
     }
 
     #[test]
