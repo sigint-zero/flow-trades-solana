@@ -258,11 +258,13 @@ async fn main() {
     };
     let stream_manager = Arc::new(stream_manager_inner);
 
-    let geyser_manager = Arc::clone(&stream_manager);
-    tokio::spawn(async move {
-        geyser_manager.spawn().await;
-    });
-    info!("pool state: Geyser gRPC streaming active");
+    if config.geyser_endpoint.is_some() {
+        let geyser_manager = Arc::clone(&stream_manager);
+        tokio::spawn(async move {
+            geyser_manager.spawn().await;
+        });
+        info!("pool state: Geyser gRPC streaming active");
+    }
 
     // RPC blockSubscribe fallback. Geyser is the primary block source, but
     // if no `geyser_endpoint` is configured, the manager's block-handling

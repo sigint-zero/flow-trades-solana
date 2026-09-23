@@ -29,6 +29,36 @@ pub fn latest_slot() -> u64 {
     LATEST_SLOT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Newest block timestamp seen (unix s) and the wall-clock second it arrived.
+static LATEST_BLOCK_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static BLOCK_TIME_SEEN_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn wall_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+pub fn note_block_time(unix: i64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if unix > LATEST_BLOCK_TIME.load(Relaxed) {
+        BLOCK_TIME_SEEN_AT.store(wall_unix(), Relaxed);
+        LATEST_BLOCK_TIME.store(unix, Relaxed);
+    }
+}
+
+/// The cluster clock (`Clock::unix_timestamp`) as best known: the newest block
+/// timestamp, advanced by the wall time since that block arrived; the wall
+/// clock before any block. Fee schedules, dynamic-fee decay and vault profit
+/// unlocks run on the cluster clock, which trails wall time by 1–2 s — at a
+/// period boundary the wall clock picks the wrong period.
+pub fn chain_unix_time() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = LATEST_BLOCK_TIME.load(Relaxed);
+    if t == 0 {
+        return wall_unix().max(0) as u64;
+    }
+    (t + (wall_unix() - BLOCK_TIME_SEEN_AT.load(Relaxed)).max(0)).max(0) as u64
+}
+
 /// Optional swap-stream context. When present on `StreamManager`, every
 /// block update fed by Yellowstone is also passed through the swap parser
 /// and resulting swaps go into the broadcast channel. Lossy by design —

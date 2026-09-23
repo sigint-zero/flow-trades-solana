@@ -385,7 +385,7 @@ pub fn swap_fee_ppm(state: &crate::pool::types::PoolState, pool: &Pubkey, zero_f
         return SwapFee::Base;
     }
     let Some(inp) = DYN_INPUTS.get(pool).map(|r| *r) else { return SwapFee::Unavailable };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = crate::stream::chain_unix_time() as i64;
     match fee.dynamic_fee_rate(fee_base, *sqrt_price_x64, &inp, zero_for_one, amount, now) {
         Some(r) => SwapFee::Rate(r),
         None => SwapFee::Unavailable,

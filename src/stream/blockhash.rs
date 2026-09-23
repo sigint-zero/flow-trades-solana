@@ -1,8 +1,11 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::json;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_client::rpc_request::RpcRequest;
+use solana_client::rpc_response::{Response, RpcBlockhash};
 use solana_sdk::hash::Hash;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -61,14 +64,20 @@ impl BlockhashCache {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                match rpc
-                    .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-                    .await
-                {
-                    Ok((hash, height)) => {
+                // The raw call (not `get_latest_blockhash_with_commitment`) so the
+                // response context's slot is kept: without Geyser or the block
+                // scanner it is the only slot source, and slot-activated fee
+                // schedules (DAMM v2) price at their cliff fee on slot 0.
+                let resp: Result<Response<RpcBlockhash>, _> = rpc
+                    .send(RpcRequest::GetLatestBlockhash, json!([{ "commitment": "confirmed" }]))
+                    .await;
+                match resp.map(|r| (r.context.slot, Hash::from_str(&r.value.blockhash), r.value.last_valid_block_height)) {
+                    Ok((slot, Ok(hash), height)) => {
+                        crate::stream::note_slot(slot);
                         self.set(hash, height).await;
-                        debug!(hash = %hash, height, "blockhash cache refreshed");
+                        debug!(hash = %hash, height, slot, "blockhash cache refreshed");
                     }
+                    Ok((_, Err(e), _)) => warn!(error = %e, "blockhash refresh: unparseable blockhash"),
                     Err(e) => {
                         warn!(error = %e, "blockhash refresh failed");
                         // Keep using stale value; get() will return None once max_age expires

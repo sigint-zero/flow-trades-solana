@@ -703,9 +703,9 @@ pub fn estimate_compute_units(lb_pair: &Pubkey, input_mint: &Pubkey, amount: u64
     Some(swap_compute_units(q.start_bin.abs_diff(q.end_bin)))
 }
 
-/// Wall-clock unix time (fallback when no cluster clock was read).
+/// Cluster time from the block stream (fallback when no Clock was read).
 pub fn now_unix() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    crate::stream::chain_unix_time() as i64
 }
 
 #[cfg(test)]

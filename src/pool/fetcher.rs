@@ -896,19 +896,36 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
         }
         other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
     };
-    match (&mut st, prev) {
-        (PoolState::RaydiumLp { curve, .. }, Some(PoolState::RaydiumLp { curve: prev_curve, .. })) => {
+    if let Some(prev) = prev {
+        carry_over_from_prev(&mut st, prev);
+    }
+    Ok(st)
+}
+
+/// A pool re-parsed from its raw account (block refresh, Geyser account
+/// stream) knows nothing that lives in OTHER accounts: config fee rates
+/// (`AmmConfig`, LaunchLab configs) and the pump.fun AMM fee accounts. Copy
+/// them from the previous full fetch of the same pool.
+pub fn carry_over_from_prev(st: &mut PoolState, prev: &PoolState) {
+    match (&mut *st, prev) {
+        (PoolState::RaydiumLp { curve, .. }, PoolState::RaydiumLp { curve: prev_curve, .. }) => {
             curve.curve_type = prev_curve.curve_type;
             curve.protocol_fee_rate = prev_curve.protocol_fee_rate;
             curve.platform_fee_rate = prev_curve.platform_fee_rate;
             curve.creator_fee_rate = prev_curve.creator_fee_rate;
         }
-        (PoolState::RaydiumClmm { fee_rate, .. }, Some(PoolState::RaydiumClmm { fee_rate: prev_fee, .. }))
-        | (PoolState::PancakeSwap { fee_rate, .. }, Some(PoolState::PancakeSwap { fee_rate: prev_fee, .. }))
-        | (PoolState::Byreal { fee_rate, .. }, Some(PoolState::Byreal { fee_rate: prev_fee, .. })) => *fee_rate = *prev_fee,
+        (PoolState::RaydiumClmm { fee_rate, .. }, PoolState::RaydiumClmm { fee_rate: prev_fee, .. })
+        | (PoolState::PancakeSwap { fee_rate, .. }, PoolState::PancakeSwap { fee_rate: prev_fee, .. })
+        | (PoolState::Byreal { fee_rate, .. }, PoolState::Byreal { fee_rate: prev_fee, .. }) => *fee_rate = *prev_fee,
+        (PoolState::RaydiumCpmm { trade_fee_bps, creator_fee_ppm, .. }, PoolState::RaydiumCpmm { trade_fee_bps: prev_fee, creator_fee_ppm: prev_creator, .. }) => {
+            if *trade_fee_bps == 0 {
+                *trade_fee_bps = *prev_fee;
+                *creator_fee_ppm = *prev_creator;
+            }
+        }
         _ => {}
     }
-    Ok(st)
+    st.carry_over_pamm_fee_accounts(prev);
 }
 
 /// Raydium-style CLMM `AmmConfig.trade_fee_rate` as hundredths of a basis
@@ -1092,8 +1109,9 @@ async fn parse_meteora(
     })
 }
 
+/// Cluster time (vault locked-profit unlocks run on it).
 fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    crate::stream::chain_unix_time()
 }
 
 /// Refresh a Meteora Standard pool's vault shares from vault a/b data and
@@ -2133,6 +2151,25 @@ mod tests {
     use super::*;
     use solana_sdk::account::Account;
     use solana_sdk::pubkey::Pubkey;
+
+    #[test]
+    fn raw_reparse_keeps_config_fees_from_the_previous_fetch() {
+        let cpmm = |trade_fee_bps: u16, creator_fee_ppm: u32| PoolState::RaydiumCpmm {
+            pool: Pubkey::new_unique(), authority: Pubkey::new_unique(), config: Pubkey::new_unique(),
+            token_0_vault: Pubkey::new_unique(), token_1_vault: Pubkey::new_unique(),
+            token_0_mint: Pubkey::new_unique(), token_1_mint: Pubkey::new_unique(), observation: Pubkey::new_unique(),
+            trade_fee_bps, protocol_fees_0: 0, protocol_fees_1: 0, fund_fees_0: 0, fund_fees_1: 0,
+            creator_fee_ppm, enable_creator_fee: true, creator_fee_on: 0,
+        };
+        // a raw account parse cannot read AmmConfig: 0 → the fetched rate is kept
+        let mut raw = cpmm(0, 0);
+        carry_over_from_prev(&mut raw, &cpmm(4, 500));
+        assert!(matches!(raw, PoolState::RaydiumCpmm { trade_fee_bps: 4, creator_fee_ppm: 500, .. }));
+        // a parse that did read it wins
+        let mut fresh = cpmm(25, 0);
+        carry_over_from_prev(&mut fresh, &cpmm(4, 500));
+        assert!(matches!(fresh, PoolState::RaydiumCpmm { trade_fee_bps: 25, .. }));
+    }
 
     /// Helper: create an Account with zeroed data of the given size.
     fn make_account(size: usize) -> Account {

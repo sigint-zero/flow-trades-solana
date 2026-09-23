@@ -827,7 +827,7 @@ pub fn extract_clmm_params(
             // point), unless the pool overrides it or charges a launch decay
             // fee. A dynamic-fee pool adds a per-swap term on top of this
             // base (`quote::byreal_fee::swap_fee_ppm`).
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let now = crate::stream::chain_unix_time();
             if !fee.can_swap(now) {
                 return None;
             }

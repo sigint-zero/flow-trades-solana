@@ -591,6 +591,9 @@ async fn run_block_subscribe(
     while let Some(notification) = stream.next().await {
         let update = notification.value;
         crate::stream::note_slot(update.slot);
+        if let Some(t) = update.block.as_ref().and_then(|b| b.block_time) {
+            crate::stream::note_block_time(t);
+        }
         if let Some(block) = update.block {
             *summary_slots += 1;
 

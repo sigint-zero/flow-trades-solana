@@ -621,7 +621,7 @@ impl Quoter {
             if reserves.computed_at == 0 {
                 return Eval::Cold; // reserves never computed (old warm file)
             }
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let now = crate::stream::chain_unix_time();
             return Eval::Quoted(super::meteora_std::swap_exact_in(reserves, a_to_b, amount, now).map(|(out, fee)| {
                 let (rin, rout) = if a_to_b { (reserves.token_a_amount, reserves.token_b_amount) } else { (reserves.token_b_amount, reserves.token_a_amount) };
                 (out, fee, rin as u128, rout as u128)
@@ -739,7 +739,7 @@ impl Quoter {
         }
         // Raydium AMM v4: the program's own arithmetic on `vault − need_take_pnl`.
         if let PoolState::RaydiumV4 { coin_mint, swap_fee_numerator, swap_fee_denominator, need_take_pnl_coin, need_take_pnl_pc, status, pool_open_time, .. } = state {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let now = crate::stream::chain_unix_time();
             if !crate::execution::amms::raydium_v4::can_swap(*status, *pool_open_time, now) {
                 return None;
             }
@@ -766,6 +766,13 @@ impl Quoter {
                 }
                 return Some((out, fee, reserve_in, reserve_out));
             }
+        }
+        // A fee measured from this pool's own recent swaps, at ppm resolution.
+        if let Some(ppm) = crate::stream::observed_fees::get_fresh_ppm(&entry.address, OBSERVED_FEE_MAX_AGE) {
+            let fee = (amount as u128 * ppm as u128).div_ceil(1_000_000);
+            let in_less = (amount as u128).checked_sub(fee)?;
+            let out = u64::try_from(reserve_out.checked_mul(in_less)? / reserve_in.checked_add(in_less)?).ok()?;
+            return (out > 0).then_some((out, fee as u64, reserve_in, reserve_out));
         }
         let fee_bps = venue_fee_bps(state, entry.pool_type, &entry.address);
         match leg_out(fee_bps, reserve_in, reserve_out, amount) {
@@ -1650,7 +1657,7 @@ const OBSERVED_FEE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs
 fn quote_dbc(input_mint: &Pubkey, base_mint: &Pubkey, quote_mint: &Pubkey, curve: &super::dbc::DbcCurve, amount: u64) -> Option<LegResult> {
     let quote_to_base = if input_mint == quote_mint { true } else if input_mint == base_mint { false } else { return None };
     let current_point = match curve.config.activation_type {
-        1 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(curve.activation_point),
+        1 => crate::stream::chain_unix_time(),
         _ => {
             let s = crate::stream::latest_slot();
             if s == 0 { curve.activation_point } else { s }
@@ -1678,7 +1685,7 @@ fn quote_damm_v2(
     }
     let a_to_b = if input_mint == mint_a { true } else if input_mint == mint_b { false } else { return None };
     let current_point = match activation_type {
-        1 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(activation_point),
+        1 => crate::stream::chain_unix_time(),
         _ => {
             let s = crate::stream::latest_slot();
             if s == 0 { activation_point } else { s }
@@ -1787,7 +1794,7 @@ mod tests {
         assert_eq!(venue_fee_bps(&st, PoolType::PumpFunAmm, &Pubkey::new_unique()), 120);
         // a streamed observation overrides the table
         let p = Pubkey::new_unique();
-        crate::stream::observed_fees::record(p, 333);
+        crate::stream::observed_fees::record(p, 33_300);
         assert_eq!(venue_fee_bps(&st, PoolType::PumpFunAmm, &p), 333);
         let (out, fee) = leg_out(120, 100_000_000_000, 200_000_000_000_000, 1_000_000_000).unwrap();
         assert_eq!(out, compute_constant_product_out(100_000_000_000, 200_000_000_000_000, 1_000_000_000, 120).unwrap());
