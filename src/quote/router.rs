@@ -612,7 +612,8 @@ impl Quoter {
             if reserves.computed_at == 0 {
                 return Eval::Cold; // reserves never computed (old warm file)
             }
-            return Eval::Quoted(super::meteora_std::swap_exact_in(reserves, a_to_b, amount).map(|(out, fee)| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            return Eval::Quoted(super::meteora_std::swap_exact_in(reserves, a_to_b, amount, now).map(|(out, fee)| {
                 let (rin, rout) = if a_to_b { (reserves.token_a_amount, reserves.token_b_amount) } else { (reserves.token_b_amount, reserves.token_a_amount) };
                 (out, fee, rin as u128, rout as u128)
             }));

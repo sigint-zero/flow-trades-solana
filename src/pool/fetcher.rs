@@ -1022,15 +1022,14 @@ async fn parse_meteora(
 
     // Reserves = the pool's LP share of each vault (2 lp mints + 2 lp accounts).
     let (trade_fee_numerator, trade_fee_denominator, constant_product) = crate::quote::meteora_std::parse_pool_fees(data).unwrap_or((0, 0, false));
-    let mut reserves = crate::quote::meteora_std::MeteoraStdReserves { trade_fee_numerator, trade_fee_denominator, constant_product, ..Default::default() };
+    let (protocol_fee_numerator, protocol_fee_denominator) = crate::quote::meteora_std::parse_protocol_fee(data).unwrap_or((0, 0));
+    let mut reserves = crate::quote::meteora_std::MeteoraStdReserves {
+        trade_fee_numerator, trade_fee_denominator, constant_product, protocol_fee_numerator, protocol_fee_denominator, ..Default::default()
+    };
     if constant_product {
         let extra = rpc.get_multiple_accounts(&[a_vault_lp_mint, b_vault_lp_mint, a_vault_lp, b_vault_lp]).await
             .map_err(|e| TradeError::Rpc(format!("meteora vault lp accounts: {e}")))?;
-        if let Some((a, b)) = meteora_std_amounts(&a_vault_data.data, &b_vault_data.data, &extra) {
-            reserves.token_a_amount = a;
-            reserves.token_b_amount = b;
-            reserves.computed_at = unix_now();
-        }
+        meteora_std_update(&mut reserves, &a_vault_data.data, &b_vault_data.data, &extra);
     }
 
     Ok(PoolState::Meteora {
@@ -1056,18 +1055,14 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// (token_a_amount, token_b_amount) from vault a/b data and
+/// Refresh a Meteora Standard pool's vault shares from vault a/b data and
 /// `[lp_mint_a, lp_mint_b, pool_lp_a, pool_lp_b]` accounts.
-fn meteora_std_amounts(vault_a: &[u8], vault_b: &[u8], extra: &[Option<Account>]) -> Option<(u64, u64)> {
-    use crate::quote::meteora_std::VaultView;
+fn meteora_std_update(reserves: &mut crate::quote::meteora_std::MeteoraStdReserves, vault_a: &[u8], vault_b: &[u8], extra: &[Option<Account>]) -> bool {
     if extra.len() < 4 {
-        return None;
+        return false;
     }
-    let supply = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(36..44)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
-    let bal = |i: usize| extra[i].as_ref().and_then(|a| a.data.get(64..72)).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
-    let (va, vb) = (VaultView::parse(vault_a)?, VaultView::parse(vault_b)?);
-    let now = unix_now();
-    Some((va.amount_by_share(bal(2)?, supply(0)?, now), vb.amount_by_share(bal(3)?, supply(1)?, now)))
+    let lp = |i: usize| extra[i].as_ref().map(|a| a.data.as_slice());
+    reserves.update(vault_a, vault_b, [lp(0), lp(1), lp(2), lp(3)], unix_now())
 }
 
 /// Keys to batch-read for a Meteora Standard reserve refresh, in the order
@@ -1089,15 +1084,7 @@ pub fn refresh_meteora_std_from(state: &mut PoolState, accounts: &[Option<Accoun
         return false;
     }
     let (Some(va), Some(vb)) = (&accounts[0], &accounts[1]) else { return false };
-    match meteora_std_amounts(&va.data, &vb.data, &accounts[2..6]) {
-        Some((a, b)) => {
-            reserves.token_a_amount = a;
-            reserves.token_b_amount = b;
-            reserves.computed_at = unix_now();
-            true
-        }
-        None => false,
-    }
+    meteora_std_update(reserves, &va.data, &vb.data, &accounts[2..6])
 }
 
 // -- Meteora DLMM --
