@@ -25,6 +25,7 @@ pub fn pamm(base: Pubkey, quote: Pubkey, br: u64, qr: u64) -> PoolState {
         buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), false), (Pubkey::new_unique(), true)],
         base_supply: 1_000_000_000_000_000,
         virtual_quote_reserve: 0,
+        pamm_flags: Default::default(),
     }
 }
 

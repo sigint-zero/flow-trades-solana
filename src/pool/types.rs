@@ -162,6 +162,24 @@ impl SplSwapFees {
     }
 }
 
+/// The pump.fun AMM pool facts its fee program keys on (`Pool` account:
+/// `creator` @11, `is_mayhem_mode` @243, `is_cashback_coin` @244,
+/// `creator_fee_bps` @261). The default is a canonical pool with no overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PammFlags {
+    /// `pool.creator` is not the pump program's `["pool-authority", base_mint]`
+    /// PDA, i.e. the pool was not created by a pump.fun graduation: it pays the
+    /// flat schedule, not the market-cap tiers.
+    pub non_canonical: bool,
+    /// Mayhem-mode pool: market cap is taken on a fixed 1e15 supply.
+    pub mayhem: bool,
+    /// Cashback coin: the creator fee is credited to the trader's volume accumulator.
+    pub cashback: bool,
+    /// Per-pool creator fee rate; replaces the schedule's creator rate when
+    /// non-zero and the global config allows it.
+    pub creator_fee_bps: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolState {
     /// Raydium AMM v4 (`AmmInfo`, 752 bytes). The program prices swaps on
@@ -304,11 +322,14 @@ pub enum PoolState {
         /// so the quote engine needs it; 0 = unknown → the most expensive tier is
         /// assumed (a conservative quote, never a spurious revert).
         base_supply: u64,
-        /// Virtual quote reserve (u64 at pool offset 245, mid-2026 update): the
+        /// Virtual quote reserve (i128 at pool offset 245, mid-2026 update): the
         /// curve prices on `quote_reserve + virtual_quote_reserve`, not on the
         /// vault balance alone (verified byte-exact on live Buy/Sell events).
         #[serde(default)]
         virtual_quote_reserve: u64,
+        /// Pool facts that select the fee schedule (see `PammFlags`).
+        #[serde(default)]
+        pamm_flags: PammFlags,
     },
     Meteora {
         pool: Pubkey,

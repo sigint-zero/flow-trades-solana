@@ -1846,6 +1846,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         assert!(extract_clmm_params(&state, &Pubkey::new_unique()).is_none());

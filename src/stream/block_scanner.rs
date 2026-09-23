@@ -896,6 +896,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((base, quote)));

@@ -608,6 +608,12 @@ async fn parse_pumpfun(
 // 171-202: pool_quote_vault (32)
 // 203-210: lp_supply (u64)
 // 211-242: coin_creator (32)
+// 243:   is_mayhem_mode (bool)
+// 244:   is_cashback_coin (bool)
+// 245-260: virtual_quote_reserves (i128)
+// 261-268: creator_fee_bps (u64)
+// 269:   can_edit_creator_fee (bool)
+// 270:   is_holder_reward (bool)
 /// Parse PumpFun AMM pool layout (sync, no RPC needed).
 fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
@@ -619,6 +625,18 @@ fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> Trade
     let quote_mint = read_pubkey(data, 75)?;
     let pool_base_vault = read_pubkey(data, 139)?;
     let pool_quote_vault = read_pubkey(data, 171)?;
+    let flag = |o: usize| data.get(o).is_some_and(|b| *b != 0);
+    let pamm_flags = crate::pool::types::PammFlags {
+        non_canonical: !is_pump_pool(pool_address, &read_pubkey(data, 11)?, &base_mint),
+        mayhem: flag(243),
+        cashback: flag(244),
+        creator_fee_bps: data.get(261..269).map(|b| u64::from_le_bytes(b.try_into().unwrap()).min(10_000) as u16).unwrap_or(0),
+    };
+    // i128 on chain; a negative value would be a program invariant violation
+    let virtual_quote_reserve = data
+        .get(245..261)
+        .map(|b| i128::from_le_bytes(b.try_into().unwrap()).clamp(0, u64::MAX as i128) as u64)
+        .unwrap_or(0);
 
     Ok(PoolState::PumpFunAmm {
         pool: *pool_address,
@@ -632,8 +650,23 @@ fn parse_pumpfun_amm_layout(pool_address: &Pubkey, pool_data: &Account) -> Trade
         protocol_fee_recipient: Pubkey::default(),
         buyback_accounts: Vec::new(),
         base_supply: 0,
-            virtual_quote_reserve: if data.len() >= 253 { u64::from_le_bytes(data[245..253].try_into().unwrap()) } else { 0 },
+        virtual_quote_reserve,
+        pamm_flags,
     })
+}
+
+/// pump.fun's canonical-pool test: the pool was created by a pump.fun
+/// graduation iff `pool.creator` is the pump program's
+/// `["pool-authority", base_mint]` PDA. Cached per pool (both are immutable).
+fn is_pump_pool(pool: &Pubkey, pool_creator: &Pubkey, base_mint: &Pubkey) -> bool {
+    static CANONICAL: LazyLock<dashmap::DashMap<Pubkey, bool>> = LazyLock::new(dashmap::DashMap::new);
+    if let Some(v) = CANONICAL.get(pool) {
+        return *v;
+    }
+    let pda = Pubkey::find_program_address(&[b"pool-authority", base_mint.as_ref()], &PUMP_FUN_PROG_ID).0;
+    let v = pda == *pool_creator;
+    CANONICAL.insert(*pool, v);
+    v
 }
 
 /// Resolve, from a RECENT pAMM swap on this pool, (a) the currently valid
@@ -938,7 +971,14 @@ async fn parse_pumpfun_amm(rpc: &RpcClient, pool_address: &Pubkey, pool_data: &A
                     fetch_token_balance(rpc, pool_quote_vault),
                 )
             },
-            resolve_pamm_fee_accounts(rpc, pool_address),
+            async {
+                // derivable from the global config: no getSignatures/getTransaction
+                if crate::execution::amms::pumpfun_amm::recipients_loaded() {
+                    (Pubkey::default(), Vec::new())
+                } else {
+                    resolve_pamm_fee_accounts(rpc, pool_address).await
+                }
+            },
             fetch_mint_supply(rpc, base_mint),
         );
         if let Ok((b, q)) = bal {

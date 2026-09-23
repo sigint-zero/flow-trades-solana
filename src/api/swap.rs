@@ -499,7 +499,7 @@ async fn load_pool_state(
         }
     };
     let mut dirty = false;
-    if pool_state.needs_pamm_fee_accounts() {
+    if pool_state.needs_pamm_fee_accounts() && !crate::execution::amms::pumpfun_amm::recipients_loaded() {
         // else: leave it — the executor refuses with a clear error, and the
         // next /swap retries the resolve (the pool may have a swap by then).
         dirty |= ensure_pamm_fee_accounts(&state.rpc, &mut pool_state).await;

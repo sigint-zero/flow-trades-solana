@@ -270,6 +270,7 @@ mod tests {
             buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let order = SwapOrder {
@@ -322,6 +323,7 @@ mod tests {
             buyback_accounts: vec![(Pubkey::new_unique(), true), (Pubkey::new_unique(), true)],
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let order = SwapOrder {

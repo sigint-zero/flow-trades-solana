@@ -1782,6 +1782,7 @@ mod tests {
             protocol_fee_recipient: Pubkey::default(), buyback_accounts: Vec::new(),
             base_supply: 1_000_000_000_000_000,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         assert_eq!(venue_fee_bps(&st, PoolType::PumpFunAmm, &Pubkey::new_unique()), 120);
         // a streamed observation overrides the table
@@ -1815,6 +1816,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let result = extract_reserves_inline(&state, &base_mint);
@@ -1838,6 +1840,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
 
         let result = extract_reserves_inline(&state, &quote_mint);
@@ -2217,6 +2220,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         assert!(extract_vault_mints(&state).is_none());
     }
@@ -2603,6 +2607,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {
@@ -2730,6 +2735,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Pool 2: TOKEN_B / SOL
@@ -2752,6 +2758,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Quote: TOKEN_A -> TOKEN_B (no direct pool, must route through SOL)
@@ -2819,6 +2826,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         registry.add(PoolEntry {
@@ -2840,6 +2848,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {
@@ -2895,6 +2904,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         // Indirect pools: TOKEN_A / SOL and TOKEN_B / SOL (worse total output due to double fees)
@@ -2918,6 +2928,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let pool2 = Pubkey::new_unique();
@@ -2940,6 +2951,7 @@ mod tests {
             buyback_accounts: Vec::new(),
             base_supply: 0,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         });
 
         let req = QuoteRequest {

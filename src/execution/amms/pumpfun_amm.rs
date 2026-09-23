@@ -1,13 +1,12 @@
 //! PumpFun AMM (PumpSwap, `pAMMBay6…`) executor + the venue's fee model.
 //!
-//! **Accounts** follow the PumpSwap IDL plus the pump_fees buyback accounts:
-//! every swap must carry the buyback fee-recipient accounts as trailing
-//! *remaining accounts*.
-//! Those are per-pool/creator (buyback vault(s) + ATAs, 2–3+ accounts, some
-//! Token-2022) and not derivable PDAs, so they are copied verbatim from a recent
-//! on-chain swap (`pool::fetcher::resolve_pamm_fee_accounts`) and carried in
-//! `PoolState::PumpFunAmm`. Without them the program errors with 6058; with an
-//! incomplete set, 6023.
+//! **Accounts** follow the PumpSwap IDL plus trailing *remaining accounts*:
+//! the trader's cashback accumulator accounts (cashback coins), `pool_v2`
+//! (coins with a creator) and a buyback fee recipient + its quote ATA. All are
+//! derived from the `GlobalConfig` recipient lists read at startup
+//! ([`load_fee_tiers`]); before that read they are copied verbatim from a
+//! recent on-chain swap (`pool::fetcher::resolve_pamm_fee_accounts`). Without
+//! them the program errors with 6058; with an incomplete set, 6023.
 //!
 //! **Buys are exact-INPUT** (`buy_exact_quote_in`): the user spends exactly
 //! `amount_in` quote and the program enforces `min_base_amount_out`. The
@@ -41,9 +40,9 @@ use super::AmmExecutor;
 pub const BUY_DISC: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 /// `sha256("global:sell")[..8]`.
 pub const SELL_DISC: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
-/// `buy_exact_quote_in` — the exact-INPUT buy pump.fun added in 2026 (≈half
-/// of all mainnet pAMM buys by Sept 2026, disc `c62e1552b4d9e870`). Not
-/// built by this executor yet; recognised so the scanners count it as a swap.
+/// `buy_exact_quote_in` — pump.fun's exact-INPUT buy (disc
+/// `c62e1552b4d9e870`): the buy this executor builds, and recognised by the
+/// scanners as a swap.
 pub const BUY_EXACT_QUOTE_IN_DISC: [u8; 8] = [0xc6, 0x2e, 0x15, 0x52, 0xb4, 0xd9, 0xe8, 0x70];
 
 // Constant addresses from official PumpSwap IDL / mainnet
@@ -157,16 +156,148 @@ pub fn parse_fee_config(data: &[u8]) -> TradeResult<Vec<FeeTier>> {
     Ok(tiers)
 }
 
-/// Read the live tier table from chain and install it. On any failure the
-/// caller keeps the default — never trades on a half-read table.
+/// The schedules `FeeConfig` holds besides the SOL tiers, and the pAMM global
+/// switch for per-pool creator rates. Which one a trade pays is
+/// [`pamm_fee_tier`]'s decision (pump-fees `fees_for_quote_mint`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeSchedules {
+    /// Pools not created by a pump.fun graduation.
+    pub flat: FeeTier,
+    /// Canonical pools quoted in a listed stable (USDC); empty = use the SOL tiers.
+    pub stable_tiers: Vec<FeeTier>,
+    /// Canonical pools quoted in anything else; all-zero = unset → `flat`.
+    pub exotic_flat: FeeTier,
+    /// `GlobalConfig.creator_fee_configurable`: a pool's own non-zero
+    /// `creator_fee_bps` replaces the schedule's creator rate.
+    pub creator_fee_configurable: bool,
+}
+
+/// Mainnet values: flat 25/5/0, exotic 20/5/5; stable tiers are
+/// only known once read from chain, so the default prices USDC pools on the
+/// SOL tiers. The global per-pool creator switch is on.
+fn default_schedules() -> FeeSchedules {
+    FeeSchedules {
+        flat: FeeTier { market_cap_lamports: 0, lp_bps: 25, protocol_bps: 5, creator_bps: 0 },
+        stable_tiers: Vec::new(),
+        exotic_flat: FeeTier { market_cap_lamports: 0, lp_bps: 20, protocol_bps: 5, creator_bps: 5 },
+        creator_fee_configurable: true,
+    }
+}
+
+static FEE_SCHEDULES: RwLock<Option<FeeSchedules>> = RwLock::new(None);
+
+fn with_schedules<R>(f: impl FnOnce(&FeeSchedules) -> R) -> R {
+    static DEFAULT: std::sync::LazyLock<FeeSchedules> = std::sync::LazyLock::new(default_schedules);
+    let guard = FEE_SCHEDULES.read().unwrap_or_else(|p| p.into_inner());
+    match guard.as_ref() {
+        Some(s) => f(s),
+        None => f(&DEFAULT),
+    }
+}
+
+/// Install the non-tier schedules directly (tests).
+pub fn set_fee_schedules(s: FeeSchedules) {
+    *FEE_SCHEDULES.write().unwrap_or_else(|p| p.into_inner()) = Some(s);
+}
+
+/// Decode everything in `FeeConfig` after the SOL tiers:
+/// `flat_fees(3×u64)` (before the tiers), then `stable_fee_tiers: Vec<FeeTier>`
+/// and `exotic_flat_fees(3×u64)`. Older accounts end after the SOL tiers.
+pub fn parse_fee_schedules(data: &[u8], creator_fee_configurable: bool) -> TradeResult<FeeSchedules> {
+    let err = |m: &str| TradeError::Execution(format!("pamm fee_config: {m}"));
+    let bps = |b: &[u8]| -> TradeResult<u16> {
+        let v = u64::from_le_bytes(b[..8].try_into().unwrap());
+        u16::try_from(v).ok().filter(|b| *b <= 10_000).ok_or_else(|| err("fee bps out of range"))
+    };
+    let fees_at = |o: usize| -> TradeResult<FeeTier> {
+        let f = data.get(o..o + 24).ok_or_else(|| err("truncated fees"))?;
+        Ok(FeeTier { market_cap_lamports: 0, lp_bps: bps(&f[0..])?, protocol_bps: bps(&f[8..])?, creator_bps: bps(&f[16..])? })
+    };
+    let tiers_at = |o: usize| -> TradeResult<(Vec<FeeTier>, usize)> {
+        let n = u32::from_le_bytes(data.get(o..o + 4).ok_or_else(|| err("short"))?.try_into().unwrap()) as usize;
+        if n > 256 {
+            return Err(err("implausible tier count"));
+        }
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = data.get(o + 4 + i * 40..o + 44 + i * 40).ok_or_else(|| err("truncated tier"))?;
+            let f = fees_at(o + 4 + i * 40 + 16)?;
+            v.push(FeeTier { market_cap_lamports: u128::from_le_bytes(t[..16].try_into().unwrap()), ..f });
+        }
+        v.sort_by_key(|t| t.market_cap_lamports);
+        Ok((v, o + 4 + n * 40))
+    };
+    let flat_off = 8 + 1 + 32;
+    let flat = fees_at(flat_off)?;
+    let (_, after_sol) = tiers_at(flat_off + 24)?;
+    let (stable_tiers, after_stable) = if data.len() >= after_sol + 4 { tiers_at(after_sol)? } else { (Vec::new(), after_sol) };
+    let exotic_flat = if data.len() >= after_stable + 24 { fees_at(after_stable)? } else { FeeTier { market_cap_lamports: 0, lp_bps: 0, protocol_bps: 0, creator_bps: 0 } };
+    Ok(FeeSchedules { flat, stable_tiers, exotic_flat, creator_fee_configurable })
+}
+
+/// pAMM `GlobalConfig.creator_fee_configurable` (bool @940).
+const GLOBAL_CREATOR_FEE_CONFIGURABLE_OFFSET: usize = 940;
+
+/// The fee recipients a swap may name, from the pAMM `GlobalConfig`:
+/// `protocol_fee_recipients[8]` @57, `reserved_fee_recipient` @385 +
+/// `reserved_fee_recipients[7]` @418 (mayhem pools) and
+/// `buyback_fee_recipients[8]` @643. Unset slots (zero keys) are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PammRecipients {
+    pub protocol: Vec<Pubkey>,
+    pub reserved: Vec<Pubkey>,
+    pub buyback: Vec<Pubkey>,
+}
+
+pub fn parse_global_recipients(data: &[u8]) -> Option<PammRecipients> {
+    let keys = |o: usize, n: usize| -> Option<Vec<Pubkey>> {
+        let b = data.get(o..o + 32 * n)?;
+        Some(b.chunks(32).map(|c| Pubkey::new_from_array(c.try_into().unwrap())).filter(|k| *k != Pubkey::default()).collect())
+    };
+    let mut reserved = keys(385, 1)?;
+    reserved.extend(keys(418, 7)?);
+    Some(PammRecipients { protocol: keys(57, 8)?, reserved, buyback: keys(643, 8)? })
+}
+
+static RECIPIENTS: RwLock<Option<PammRecipients>> = RwLock::new(None);
+
+/// Install the recipient lists directly (tests).
+pub fn set_recipients(r: PammRecipients) {
+    *RECIPIENTS.write().unwrap_or_else(|p| p.into_inner()) = Some(r);
+}
+
+/// The swap's trailing accounts can be derived (the global config was read),
+/// so nothing has to be copied from another trader's swap.
+pub fn recipients_loaded() -> bool {
+    RECIPIENTS.read().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|r| !r.buyback.is_empty() && !r.protocol.is_empty())
+}
+
+/// Round-robin over a recipient list: every recipient ATA is writable, so
+/// spreading swaps across them avoids needless write-lock contention.
+fn pick(list: &[Pubkey]) -> Pubkey {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    list[NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % list.len()]
+}
+
+/// Read the live fee schedules from chain and install them. On any failure the
+/// caller keeps the defaults — never trades on a half-read table.
 pub async fn load_fee_tiers(rpc: &RpcClient) -> TradeResult<usize> {
-    let acct = rpc
-        .get_account(&fee_config_pda())
+    let accts = rpc
+        .get_multiple_accounts(&[fee_config_pda(), GLOBAL_CONFIG])
         .await
         .map_err(|e| TradeError::Rpc(format!("pamm fee_config fetch: {e}")))?;
-    let tiers = parse_fee_config(&acct.data)?;
+    let (Some(fee_config), Some(global)) = (&accts[0], &accts[1]) else {
+        return Err(TradeError::Rpc("pamm fee_config / global config missing".into()));
+    };
+    let tiers = parse_fee_config(&fee_config.data)?;
+    let configurable = global.data.get(GLOBAL_CREATOR_FEE_CONFIGURABLE_OFFSET).is_some_and(|b| *b != 0);
+    let schedules = parse_fee_schedules(&fee_config.data, configurable)?;
     let n = tiers.len();
     *FEE_TIERS.write().unwrap_or_else(|p| p.into_inner()) = Some(tiers);
+    set_fee_schedules(schedules);
+    if let Some(r) = parse_global_recipients(&global.data) {
+        set_recipients(r);
+    }
     Ok(n)
 }
 
@@ -199,32 +330,73 @@ pub fn fee_bps_for_market_cap(market_cap_lamports: u128) -> u16 {
     })
 }
 
-/// Market cap in lamports as the fee program sees it: `price × supply` with
-/// price = quote per base from the EFFECTIVE reserves (vault + virtual quote).
-/// `None` when the pool is not SOL-quoted (the program converts other quotes;
-/// we don't) or a value is 0.
+/// Market cap as the fee program sees it: `price × supply` with price = quote
+/// per base from the EFFECTIVE reserves (vault + virtual quote), in quote
+/// atoms (lamports for SOL pools). Mayhem pools use a fixed 1e15 supply.
+/// `None` when the supply is unknown or a reserve is 0.
 pub fn pamm_market_cap_lamports(state: &PoolState) -> Option<u128> {
-    let PoolState::PumpFunAmm { quote_mint, base_reserve, quote_reserve, base_supply, virtual_quote_reserve, .. } = state else {
+    let PoolState::PumpFunAmm { base_reserve, quote_reserve, base_supply, virtual_quote_reserve, pamm_flags, .. } = state else {
         return None;
     };
-    if *quote_mint != SOL_NATIVE_MINT || *base_reserve == 0 || *base_supply == 0 {
+    let supply = if pamm_flags.mayhem { PUMP_AMM_TOTAL_TOKEN_SUPPLY } else { *base_supply };
+    if *base_reserve == 0 || supply == 0 {
         return None;
     }
-    Some((*quote_reserve as u128 + *virtual_quote_reserve as u128).checked_mul(*base_supply as u128)? / (*base_reserve as u128))
+    Some((*quote_reserve as u128 + *virtual_quote_reserve as u128).checked_mul(supply as u128)? / (*base_reserve as u128))
 }
 
-/// The fee tier this pool is in right now, or the most expensive tier when the
-/// market cap cannot be computed (unknown supply, non-SOL quote). Too HIGH an
-/// assumed fee under-quotes and weakens the floor; too LOW over-quotes and
-/// makes the router revert good trades, so the fallback errs high.
+/// pump-amm `TOTAL_TOKEN_SUPPLY`, the market-cap basis of mayhem-mode pools.
+const PUMP_AMM_TOTAL_TOKEN_SUPPLY: u64 = 1_000_000_000_000_000;
+
+/// Quote mints that select the SOL tiers (pump-fees `is_sol_like_quote_mint`):
+/// the zero key, WSOL and the Token-2022 native mint.
+fn is_sol_like_quote(mint: &Pubkey) -> bool {
+    const NATIVE_MINT_2022: Pubkey = Pubkey::from_str_const("9pan9bMn5HatX4EJdBwg9VgCa7Uz5HL8N1m5D3NdXejP");
+    *mint == Pubkey::default() || *mint == SOL_NATIVE_MINT || *mint == NATIVE_MINT_2022
+}
+
+/// The tier of `tiers` a market cap falls in (pump-fees-math
+/// `calculate_fee_tier`), or the most expensive one when it is unknown — too
+/// HIGH an assumed fee under-quotes and weakens the floor; too LOW over-quotes
+/// and makes the router revert good trades, so the fallback errs high.
+fn tier_for(tiers: &[FeeTier], mcap: Option<u128>) -> Option<FeeTier> {
+    match mcap {
+        Some(mcap) => tiers.iter().rev().find(|t| mcap >= t.market_cap_lamports).or(tiers.first()),
+        None => tiers.iter().max_by_key(|t| t.total_bps()),
+    }
+    .copied()
+}
+
+/// The fees this pool charges right now (lp / protocol / creator bps), picked
+/// the way pump-fees does (`fees_for_quote_mint` + pump-amm `compute_fees`):
+/// a pool not created by a pump.fun graduation pays the flat schedule; a
+/// canonical one pays the market-cap tiers when quoted in SOL, the stable
+/// tiers when quoted in USDC, and the exotic flat schedule (flat while unset)
+/// otherwise. A non-zero per-pool creator rate replaces the schedule's.
 pub fn pamm_fee_tier(state: &PoolState) -> FeeTier {
-    with_tiers(|tiers| {
-        let pick = match pamm_market_cap_lamports(state) {
-            Some(mcap) => tiers.iter().rev().find(|t| mcap >= t.market_cap_lamports).or(tiers.first()),
-            None => tiers.iter().max_by_key(|t| t.total_bps()),
+    let PoolState::PumpFunAmm { quote_mint, pamm_flags, .. } = state else {
+        return FeeTier { market_cap_lamports: 0, lp_bps: 20, protocol_bps: 5, creator_bps: 100 };
+    };
+    let mcap = pamm_market_cap_lamports(state);
+    let (fees, configurable) = with_schedules(|s| {
+        let fees = if pamm_flags.non_canonical {
+            Some(s.flat)
+        } else if is_sol_like_quote(quote_mint) {
+            with_tiers(|tiers| tier_for(tiers, mcap))
+        } else if *quote_mint == USDC_MINT {
+            if s.stable_tiers.is_empty() { with_tiers(|tiers| tier_for(tiers, mcap)) } else { tier_for(&s.stable_tiers, mcap) }
+        } else if s.exotic_flat.total_bps() == 0 {
+            Some(s.flat)
+        } else {
+            Some(s.exotic_flat)
         };
-        pick.copied().unwrap_or(FeeTier { market_cap_lamports: 0, lp_bps: 20, protocol_bps: 5, creator_bps: 100 })
-    })
+        (fees, s.creator_fee_configurable)
+    });
+    let mut fees = fees.unwrap_or(FeeTier { market_cap_lamports: 0, lp_bps: 20, protocol_bps: 5, creator_bps: 100 });
+    if configurable && pamm_flags.creator_fee_bps > 0 {
+        fees.creator_bps = pamm_flags.creator_fee_bps;
+    }
+    fees
 }
 
 /// Total swap fee (bps) this pool charges right now.
@@ -271,7 +443,9 @@ pub fn pamm_quote_exact_in(state: &PoolState, input_mint: &Pubkey, amount_in: u6
         let out = u64::try_from(out).ok()?;
         let fee = pamm_fees(&tier, has_creator, out);
         let net = out.checked_sub(fee)?;
-        if net == 0 || out as u128 >= rq {
+        // the virtual reserve only prices: a sell paying out more than the real
+        // quote vault holds fails on-chain (6063 InsufficientRealQuoteReserves)
+        if net == 0 || out >= *quote_reserve {
             return None;
         }
         Some((net, fee))
@@ -304,6 +478,30 @@ pub fn pamm_quote_out(state: &PoolState, input_mint: &Pubkey, amount_in: u64) ->
 
 // ── Executor ──────────────────────────────────────────────────────────────
 
+/// The remaining accounts after `fee_program`, in pump-swap-sdk order:
+/// [cashback: the trader's volume-accumulator quote ATA (+ the accumulator on
+/// a sell)], [`pool_v2` when the coin has a creator], the buyback recipient and
+/// its quote ATA. The cashback accounts belong to THIS trader — copied from
+/// another trader's swap they fail with 6060/6061.
+#[allow(clippy::too_many_arguments)]
+fn trailing_accounts(user: &Pubkey, base_mint: &Pubkey, quote_mint: &Pubkey, quote_prog: &Pubkey, coin_creator: &Pubkey, cashback: bool, is_buy: bool, buyback: &Pubkey) -> Vec<AccountMeta> {
+    let mut v = Vec::with_capacity(5);
+    if cashback {
+        let (uva, _) = Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &PUMP_FUN_AMM_PROG_ID);
+        v.push(AccountMeta::new(get_associated_token_address_with_program_id(&uva, quote_mint, quote_prog), false));
+        if !is_buy {
+            v.push(AccountMeta::new(uva, false));
+        }
+    }
+    if *coin_creator != Pubkey::default() {
+        let (pool_v2, _) = Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &PUMP_FUN_AMM_PROG_ID);
+        v.push(AccountMeta::new_readonly(pool_v2, false));
+    }
+    v.push(AccountMeta::new_readonly(*buyback, false));
+    v.push(AccountMeta::new(get_associated_token_address_with_program_id(buyback, quote_mint, quote_prog), false));
+    v
+}
+
 pub struct PumpFunAmmExecutor;
 
 impl AmmExecutor for PumpFunAmmExecutor {
@@ -315,32 +513,36 @@ impl AmmExecutor for PumpFunAmmExecutor {
         let (pool, base_mint, quote_mint,
              pool_base_vault, pool_quote_vault, coin_creator,
              base_reserve, quote_reserve,
-             resolved_fee_recipient, buyback_accounts) =
+             resolved_fee_recipient, buyback_accounts, pamm_flags) =
             match pool_state {
                 PoolState::PumpFunAmm {
                     pool, base_mint, quote_mint,
                     pool_base_vault, pool_quote_vault, coin_creator,
                     base_reserve, quote_reserve,
-                    protocol_fee_recipient, buyback_accounts, ..
+                    protocol_fee_recipient, buyback_accounts, pamm_flags, ..
                 } => (pool, base_mint, quote_mint,
                       pool_base_vault, pool_quote_vault, coin_creator,
                       *base_reserve, *quote_reserve,
-                      *protocol_fee_recipient, buyback_accounts),
+                      *protocol_fee_recipient, buyback_accounts, *pamm_flags),
                 _ => return Err(TradeError::Execution("expected PumpFunAmm pool state".into())),
             };
 
-        // No buyback accounts = no valid swap (error 6058 on-chain). They are
-        // resolved lazily from a recent swap on the pool; a brand-new pool with
-        // no swap yet cannot be traded through this executor.
-        if buyback_accounts.is_empty() {
+        // With the global config read, the protocol fee recipient and the
+        // trailing accounts are derived; otherwise they are the ones copied from
+        // a recent swap on the pool, and without those there is no valid swap
+        // (6058 on-chain).
+        let recipients = RECIPIENTS.read().unwrap_or_else(|p| p.into_inner()).clone().filter(|r| !r.buyback.is_empty() && !r.protocol.is_empty());
+        if recipients.is_none() && buyback_accounts.is_empty() {
             return Err(TradeError::Execution(
                 "PumpFun AMM: buyback remaining-accounts unresolved (no recent on-chain swap to read them from)".into()
             ));
         }
-        let protocol_fee_recipient = if resolved_fee_recipient != Pubkey::default() {
-            resolved_fee_recipient
-        } else {
-            PROTOCOL_FEE_RECIPIENT
+        let protocol_fee_recipient = match &recipients {
+            // mayhem pools pay the reserved recipients
+            Some(r) if pamm_flags.mayhem && !r.reserved.is_empty() => pick(&r.reserved),
+            Some(r) if !pamm_flags.mayhem => pick(&r.protocol),
+            _ if resolved_fee_recipient != Pubkey::default() => resolved_fee_recipient,
+            _ => PROTOCOL_FEE_RECIPIENT,
         };
 
         if base_reserve == 0 || quote_reserve == 0 {
@@ -472,16 +674,26 @@ impl AmmExecutor for PumpFunAmmExecutor {
             accounts.push(AccountMeta::new(user_vol, false));                  // [20]
         }
 
-        // Common tail: fee_config + fee_program + the buyback remaining accounts
-        // (verbatim, with their on-chain writability).
+        // Common tail: fee_config + fee_program + the remaining accounts.
         accounts.push(AccountMeta::new_readonly(fee_config, false));
         accounts.push(AccountMeta::new_readonly(FEE_PROGRAM, false));
-        for (pk, writable) in buyback_accounts {
-            accounts.push(if *writable {
-                AccountMeta::new(*pk, false)
-            } else {
-                AccountMeta::new_readonly(*pk, false)
-            });
+        match &recipients {
+            // pump-swap-sdk order: [cashback: the trader's volume-accumulator
+            // quote ATA (+ the accumulator on a sell)], [pool_v2 when the coin has
+            // a creator], buyback recipient, its quote ATA. The cashback accounts
+            // belong to THIS trader — copied from another swap they fail with
+            // 6060/6061.
+            Some(r) => accounts.extend(trailing_accounts(&order.user, base_mint, quote_mint, &quote_prog, coin_creator, pamm_flags.cashback, use_buy_ix, &pick(&r.buyback))),
+            // verbatim, with their on-chain writability
+            None => {
+                for (pk, writable) in buyback_accounts {
+                    accounts.push(if *writable {
+                        AccountMeta::new(*pk, false)
+                    } else {
+                        AccountMeta::new_readonly(*pk, false)
+                    });
+                }
+            }
         }
 
         let swap_ix = Instruction {
@@ -519,6 +731,7 @@ mod tests {
             buyback_accounts: buyback,
             base_supply: 1_000_000_000_000_000,
             virtual_quote_reserve: 0,
+            pamm_flags: Default::default(),
         };
         (s, base_mint, quote_mint)
     }
@@ -704,5 +917,152 @@ mod tests {
         let (sell_out, _) = pamm_quote_out(&s, &base, 1_000_000).unwrap();
         assert!(sell_out > 0);
         assert!(pamm_quote_out(&s, &Pubkey::new_unique(), 1).is_none(), "unrelated mint");
+    }
+
+    fn pool_bytes(parts: &[&str]) -> Vec<u8> {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, parts.concat()).unwrap()
+    }
+
+    /// Mainnet ajiwNziubwRmf9AoBWDtxyob9Wzy7UmHQHpAX8vxQmX: a pool opened by a
+    /// wallet (not a pump.fun graduation), base WSOL / quote a token, no coin creator.
+    fn user_pool(base_reserve: u64, quote_reserve: u64) -> PoolState {
+        let data = pool_bytes(&[
+            "8ZptBBGxbbz+AAB4FZK9swq/LhXli3gyUyYr892OmUbUobufY1bVx3DyfgabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAA",
+            "AAABefpc+F4JzULcIAv+euEDJqp76uZmgy/mH02YOZ/lOa5ZvkoRJgP12Q48/OJd6H+t90Cs2G5dBb4B/k3uyEeqwKCjSFAD",
+            "d4B16g+EZTqwtCCcy9+drHbrqSC3bOcKL7vnrw1FoRGChEBtIwDTObLiGFHnvLweRwCa2l1IwXs+XJFkAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        ]);
+        let pool = Pubkey::from_str_const("ajiwNziubwRmf9AoBWDtxyob9Wzy7UmHQHpAX8vxQmX");
+        crate::pool::fetcher::parse_pumpfun_amm_with_balances(&pool, &data, Some(base_reserve), Some(quote_reserve)).unwrap()
+    }
+
+    #[test]
+    fn a_pool_not_created_by_graduation_pays_the_flat_schedule() {
+        let s = user_pool(180_825_460_340, 185_844_867_554_954);
+        let PoolState::PumpFunAmm { pamm_flags, virtual_quote_reserve, base_mint, .. } = &s else { unreachable!() };
+        assert!(pamm_flags.non_canonical);
+        assert_eq!(*virtual_quote_reserve, 0);
+        assert_eq!(*base_mint, SOL_NATIVE_MINT);
+        let t = pamm_fee_tier(&s);
+        assert_eq!((t.lp_bps, t.protocol_bps, t.creator_bps), (25, 5, 0));
+        // live SellEvent (WSOL in): quote_amount_out 512_462_141_848, lp 1_281_155_355,
+        // protocol 256_231_071, user_quote_amount_out 510_924_755_422
+        let (net, fee) = pamm_quote_exact_in(&s, &SOL_NATIVE_MINT, 500_000_000).unwrap();
+        assert_eq!((net, fee), (510_924_755_422, 1_281_155_355 + 256_231_071));
+        // live BuyEvent (`buy_exact_quote_in`, token in): base_amount_out 282_680_377
+        let s = user_pool(180_827_901_128, 185_842_365_319_929);
+        let quote = Pubkey::from_str_const("9D9kj4GxMfCN2tHN42zheM8kiEWGBx3K9iLFBZcrdDeD");
+        assert_eq!(pamm_quote_exact_in(&s, &quote, 291_847_060_239).unwrap().0, 282_680_377);
+    }
+
+    #[test]
+    fn a_graduated_pool_is_canonical_and_its_own_creator_rate_wins() {
+        // mainnet CLptCY17i5DugNZFEmzjiMh8w43nFRZVg5f3N6yTfrQz: pool.creator is the pump
+        // program's ["pool-authority", base_mint] PDA
+        let data = pool_bytes(&[
+            "8ZptBBGxbbz/AABWOlt/GvfTlUYhR+Xiwrw8ijwHKLWqthfuiaoas2LzNAh7JQ+27QWggH/nEoXkWyfBiNgFIltDtQD+RKkq",
+            "CiY/BpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAGJEQO4ZYgiDq4+27Sz1VFSteXNVKOV3D/kuNox2zt60YtdMx5o",
+            "3JXnIE9NuLTfO0Teu1HEzWEu/CljA0Kbjra1duNSXi+Cz8xe7Q6X69Q8ebPUdGXrAvZA4mck5EncOJLsQmtZ0AMAALgl/AyW",
+            "zWn59UiEl1de62PiZScBwSsGPfQe4VHBLDdSAADIQR4YBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "AAAAAAAAAAAAAAAAAA==",
+        ]);
+        let pool = Pubkey::from_str_const("CLptCY17i5DugNZFEmzjiMh8w43nFRZVg5f3N6yTfrQz");
+        let mut s = crate::pool::fetcher::parse_pumpfun_amm_with_balances(&pool, &data, Some(33_188_888_611_822), Some(520_076_109_318)).unwrap();
+        let PoolState::PumpFunAmm { pamm_flags, virtual_quote_reserve, base_supply, .. } = &mut s else { unreachable!() };
+        assert_eq!(*pamm_flags, crate::pool::types::PammFlags::default(), "canonical, no overrides");
+        assert_eq!(*virtual_quote_reserve, 17_584_505_288);
+        *base_supply = 995_346_287_372_204;
+        // live BuyEvent: 20/5/65 at mcap ≈ 16.1k SOL
+        let t = pamm_fee_tier(&s);
+        assert_eq!((t.lp_bps, t.protocol_bps, t.creator_bps), (20, 5, 65));
+        if let PoolState::PumpFunAmm { pamm_flags, .. } = &mut s {
+            pamm_flags.creator_fee_bps = 40;
+        }
+        assert_eq!(pamm_fee_tier(&s).creator_bps, 40, "per-pool creator rate replaces the tier's");
+        if let PoolState::PumpFunAmm { pamm_flags, quote_mint, .. } = &mut s {
+            pamm_flags.creator_fee_bps = 0;
+            *quote_mint = Pubkey::new_unique();
+        }
+        let t = pamm_fee_tier(&s);
+        assert_eq!((t.lp_bps, t.protocol_bps, t.creator_bps), (20, 5, 5), "exotic quote → exotic flat schedule");
+    }
+
+    #[test]
+    fn fee_schedules_parse_flat_stable_and_exotic() {
+        let fees = |d: &mut Vec<u8>, f: [u64; 3]| f.iter().for_each(|v| d.extend_from_slice(&v.to_le_bytes()));
+        let tiers = |d: &mut Vec<u8>, t: &[(u128, [u64; 3])]| {
+            d.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            for (m, f) in t {
+                d.extend_from_slice(&m.to_le_bytes());
+                fees(d, *f);
+            }
+        };
+        let mut d = vec![0u8; 8 + 1 + 32];
+        fees(&mut d, [25, 5, 0]);
+        tiers(&mut d, &[(0, [2, 93, 30]), (420_000_000_000, [20, 5, 95])]);
+        let old_len = d.len();
+        tiers(&mut d, &[(59_000_000_000, [20, 5, 95]), (0, [2, 93, 30])]);
+        fees(&mut d, [20, 5, 5]);
+        let s = parse_fee_schedules(&d, true).unwrap();
+        assert_eq!((s.flat.lp_bps, s.flat.protocol_bps, s.flat.creator_bps), (25, 5, 0));
+        assert_eq!(s.stable_tiers.iter().map(|t| (t.market_cap_lamports, t.creator_bps)).collect::<Vec<_>>(), vec![(0, 30), (59_000_000_000, 95)]);
+        assert_eq!((s.exotic_flat.lp_bps, s.exotic_flat.protocol_bps, s.exotic_flat.creator_bps), (20, 5, 5));
+        // an account written before the stable/exotic fields ends after the SOL tiers
+        let s = parse_fee_schedules(&d[..old_len], false).unwrap();
+        assert!(s.stable_tiers.is_empty() && s.exotic_flat.total_bps() == 0 && !s.creator_fee_configurable);
+    }
+
+    #[test]
+    fn trailing_accounts_match_live_swaps() {
+        let k = Pubkey::from_str_const;
+        let keys = |v: Vec<AccountMeta>| v.into_iter().map(|a| (a.pubkey, a.is_writable)).collect::<Vec<_>>();
+        // mainnet pool 7b8EyJ7ydnnM6zasgBk1aqWAmyPPB1VwynnngKUBqAHP (graduated coin with a
+        // creator): pool_v2, buyback recipient, its WSOL ATA — the same for buys and sells
+        let expect = vec![
+            (k("GAhF1H2Hyx8X3dDv37FfNq5MKGTWqKFhH1ykJw6YprsD"), false),
+            (k("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"), false),
+            (k("qkYdTGRPHbWTWuBMz45bCiU6a23axRqf6sBHm9295WY"), true),
+        ];
+        for (user, is_buy) in [(k("ADjnhLJY2MBFyfttNeA9wcbp7bYTpEijPwFNSXddVWDW"), true), (k("6xBMM3WpgNXxtjAp5B1o4f97W49F9nfA3ZZtFnSehvGo"), false)] {
+            let got = trailing_accounts(&user, &k("9DCj4JYFVjrVA1jDPivo54ziBB2JLWTrYv31PzEtpump"), &SOL_NATIVE_MINT, &TOKEN_PROGRAM_ID,
+                &Pubkey::new_unique(), false, is_buy, &k("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"));
+            assert_eq!(keys(got), expect);
+        }
+        // mainnet cashback pool 4yqvniCmEi6hZCxYsrfu8gYwC85N7eWniVqBGE3HhLyR (Token-2022
+        // quote), a buy: the TRADER's accumulator quote ATA, pool_v2, buyback, its ATA
+        let (user, base, quote, buyback) = (k("DCvZ7hbDmpD9WqYenydup7WsemsQsFEPCSr1eHNZ16LV"), k("CcEeacMuqBJsgCdVxpgyNs6kqpDpNMLpL66AiKGijRhs"),
+            k("XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"), k("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"));
+        let got = trailing_accounts(&user, &base, &quote, &TOKEN_2022_PROGRAM_ID, &Pubkey::new_unique(), true, true, &buyback);
+        assert_eq!(keys(got), vec![
+            (k("85NLt31KrvLzk36xy2JoxA6Ae8cVMSv6jMJemnqN52Wb"), true),
+            (k("7qMkzua2GBYiQWG2AxdrLSbFzQaCx4oWYV9GxkVc8r3f"), false),
+            (buyback, false),
+            (k("Aoc2fkAqdNGSrvPAcXKHZ2bkgciKbD1TqyxSxvbhcVk5"), true),
+        ]);
+        // the same trader selling adds the accumulator itself after its ATA
+        let uva = Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &PUMP_FUN_AMM_PROG_ID).0;
+        let got = keys(trailing_accounts(&user, &base, &quote, &TOKEN_2022_PROGRAM_ID, &Pubkey::new_unique(), true, false, &buyback));
+        assert_eq!((got.len(), got[1]), (5, (uva, true)));
+    }
+
+    #[test]
+    fn a_sell_cannot_pay_out_more_than_the_real_quote_vault() {
+        // 2 SOL real + 17.58 SOL virtual: the curve would pay ~9.8 SOL for half the base
+        let (s, base, _) = live_state(1_000_000_000_000, 2_000_000_000);
+        assert!(pamm_quote_exact_in(&s, &base, 1_000_000_000_000).is_none());
+        assert!(pamm_quote_exact_in(&s, &base, 50_000_000_000).is_some(), "~0.9 SOL fits");
+    }
+
+    #[test]
+    fn global_recipient_lists_drop_unset_slots() {
+        let mut d = vec![0u8; 949];
+        for i in 0..8 {
+            d[57 + 32 * i] = 1 + i as u8; // protocol recipients
+        }
+        d[385] = 9; // reserved recipient; reserved[7] all unset
+        d[643] = 7; // one buyback recipient, 7 unset slots
+        let r = parse_global_recipients(&d).unwrap();
+        assert_eq!((r.protocol.len(), r.reserved.len(), r.buyback.len()), (8, 1, 1));
+        assert!(parse_global_recipients(&d[..600]).is_none());
     }
 }
