@@ -16,8 +16,9 @@
 //!
 //! Not quoted: migrated or completed curves, pools before activation, buys
 //! that would reach the migration threshold (they complete the curve), sells
-//! below `sqrt_start_price`, rate-limited buys above the limiter's reference
-//! amount, and base-fee modes this module does not know.
+//! below `sqrt_start_price`, buys inside a rate limiter's window (the program
+//! then also demands the instructions sysvar and no other swap of the pool in
+//! the transaction), and base-fee modes this module does not know.
 
 use super::clmm::U256;
 use super::damm_v2::{delta_a, delta_b, next_sqrt_price_from_a, next_sqrt_price_from_b};
@@ -39,6 +40,9 @@ pub struct DbcConfig {
     /// 0 = slot, 1 = unix timestamp
     pub activation_type: u8,
     pub migration_quote_threshold: u64,
+    /// Buys walk the curve no higher than this.
+    #[serde(default)]
+    pub migration_sqrt_price: u128,
     pub sqrt_start_price: u128,
     /// `(sqrt_price, liquidity)` up to the first empty point.
     pub curve: Vec<(u128, u128)>,
@@ -88,8 +92,8 @@ impl DbcConfig {
     /// (cliff u64, second u64, third u64, first u16 @128, mode u8 @130),
     /// dynamic fee @136 (initialized u8, variable_fee_control u32 @148,
     /// bin_step u16 @152), collect_fee_mode @232, activation_type @234,
-    /// migration_quote_threshold u64 @264, sqrt_start_price u128 @392,
-    /// curve 20 × (u128, u128) @408.
+    /// migration_quote_threshold u64 @264, migration_sqrt_price u128 @280,
+    /// sqrt_start_price u128 @392, curve 20 × (u128, u128) @408.
     pub fn parse(d: &[u8]) -> Option<Self> {
         if d.len() < CONFIG_LEN {
             return None;
@@ -102,6 +106,7 @@ impl DbcConfig {
             collect_fee_mode: d[232],
             activation_type: d[234],
             migration_quote_threshold: u64_at(d, 264),
+            migration_sqrt_price: u128_at(d, 280),
             sqrt_start_price: u128_at(d, 392),
             curve,
             cliff_fee_numerator: u64_at(d, 104),
@@ -142,9 +147,9 @@ impl DbcCurve {
         !self.config.curve.is_empty() && self.sqrt_price != 0 && !self.is_complete() && current_point >= self.activation_point
     }
 
-    /// Base fee numerator. `None` for an amount-dependent (rate-limited) fee
-    /// above the limiter's reference amount, or an unknown mode.
-    fn base_fee_numerator(&self, current_point: u64, quote_to_base: bool, amount_in: u64) -> Option<u64> {
+    /// Base fee numerator. `None` inside a rate limiter's window (buys only)
+    /// or for an unknown mode.
+    fn base_fee_numerator(&self, current_point: u64, quote_to_base: bool) -> Option<u64> {
         let c = &self.config;
         let elapsed = current_point.saturating_sub(self.activation_point);
         match c.base_fee_mode {
@@ -162,7 +167,7 @@ impl DbcCurve {
             2 => {
                 // the limiter only prices quote→base buys inside its window
                 let applied = quote_to_base && c.third_factor > 0 && c.first_factor > 0 && elapsed <= c.second_factor;
-                (!applied || amount_in <= c.third_factor).then_some(c.cliff_fee_numerator)
+                (!applied).then_some(c.cliff_fee_numerator)
             }
             _ => None,
         }
@@ -178,8 +183,8 @@ impl DbcCurve {
         if scaled.bits() > 64 { u64::MAX } else { scaled.low_u64() }
     }
 
-    pub fn fee_numerator(&self, current_point: u64, quote_to_base: bool, amount_in: u64) -> Option<u64> {
-        let base = self.base_fee_numerator(current_point, quote_to_base, amount_in)?;
+    pub fn fee_numerator(&self, current_point: u64, quote_to_base: bool) -> Option<u64> {
+        let base = self.base_fee_numerator(current_point, quote_to_base)?;
         Some(base.saturating_add(self.variable_fee_numerator()).min(MAX_FEE_NUMERATOR))
     }
 
@@ -189,7 +194,7 @@ impl DbcCurve {
         if amount_in == 0 || !self.quotable(current_point) {
             return None;
         }
-        let fee_num = self.fee_numerator(current_point, quote_to_base, amount_in)?;
+        let fee_num = self.fee_numerator(current_point, quote_to_base)?;
         let fee_of = |a: u64| u64::try_from((a as u128 * fee_num as u128).div_ceil(FEE_DENOMINATOR as u128)).ok();
         let fee_on_input = quote_to_base && self.config.collect_fee_mode == 0;
         let (actual_in, input_fee) = if fee_on_input {
@@ -219,10 +224,13 @@ impl DbcCurve {
         Some(DbcQuote { amount_out, fee, next_sqrt_price: next })
     }
 
-    /// Price rises: walk the points above the current price.
+    /// Price rises: walk the points above the current price, stopping at the
+    /// migration price.
     fn quote_to_base(&self, amount: u64) -> Option<(u64, u128)> {
         let (mut out, mut cur, mut left) = (0u64, self.sqrt_price, amount);
+        let stop = if self.config.migration_sqrt_price == 0 { u128::MAX } else { self.config.migration_sqrt_price };
         for &(point, liquidity) in &self.config.curve {
+            let point = point.min(stop);
             if point <= cur {
                 continue;
             }
@@ -238,8 +246,11 @@ impl DbcCurve {
             if left == 0 {
                 return Some((out, cur));
             }
+            if cur == stop {
+                break;
+            }
         }
-        None // past the last point
+        None // past the migration price / last point: InsufficientLiquidity
     }
 
     /// Price falls: walk the points below the current price; segment `i`
@@ -342,6 +353,7 @@ mod tests {
                 collect_fee_mode: 0,
                 activation_type: 0,
                 migration_quote_threshold: 85_000_000_000,
+                migration_sqrt_price: 13_043_817_825_309_819,
                 sqrt_start_price: 3_141_367_320_245_630,
                 curve: vec![
                     (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
@@ -378,20 +390,22 @@ mod tests {
         assert_eq!(q.fee, (raw as u128 * 20_000_000).div_ceil(1_000_000_000) as u64);
         // linear scheduler: 60 % − 1.45 %/period, 40 periods of 1 unit
         c.config = DbcConfig { cliff_fee_numerator: 600_000_000, first_factor: 40, second_factor: 1, third_factor: 14_500_000, base_fee_mode: 0, ..c.config.clone() };
-        assert_eq!(c.fee_numerator(c.activation_point, true, 1), Some(600_000_000));
-        assert_eq!(c.fee_numerator(c.activation_point + 10, true, 1), Some(455_000_000));
-        assert_eq!(c.fee_numerator(c.activation_point + 1_000, true, 1), Some(20_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point, true), Some(600_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point + 10, true), Some(455_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point + 1_000, true), Some(20_000_000));
         // exponential: 50 % × (1 − 18.86 %)^period, 12 periods of 5 s
         c.config = DbcConfig { cliff_fee_numerator: 500_000_000, first_factor: 12, second_factor: 5, third_factor: 1_886, base_fee_mode: 1, ..c.config.clone() };
-        let one = c.fee_numerator(c.activation_point + 5, true, 1).unwrap();
+        let one = c.fee_numerator(c.activation_point + 5, true).unwrap();
         assert!((one as i64 - 405_700_000).abs() < 10, "{one}");
-        assert!(c.fee_numerator(c.activation_point + 60, true, 1).unwrap() < c.fee_numerator(c.activation_point + 55, true, 1).unwrap());
-        // rate limiter: flat below the reference amount, not quoted above it inside the window
+        assert!(c.fee_numerator(c.activation_point + 60, true).unwrap() < c.fee_numerator(c.activation_point + 55, true).unwrap());
+        // rate limiter: buys inside its window are not quoted; sells and later buys pay the cliff
         c.config = DbcConfig { cliff_fee_numerator: 10_000_000, first_factor: 10, second_factor: 100, third_factor: 1_000_000_000, base_fee_mode: 2, ..c.config.clone() };
-        assert_eq!(c.fee_numerator(c.activation_point + 1, true, 500_000_000), Some(10_000_000));
-        assert_eq!(c.fee_numerator(c.activation_point + 1, true, 2_000_000_000), None);
-        assert_eq!(c.fee_numerator(c.activation_point + 1, false, 2_000_000_000), Some(10_000_000));
-        assert_eq!(c.fee_numerator(c.activation_point + 101, true, 2_000_000_000), Some(10_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point + 1, true), None);
+        assert_eq!(c.fee_numerator(c.activation_point + 1, false), Some(10_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point + 101, true), Some(10_000_000));
+        // an all-zero limiter is a flat fee
+        c.config = DbcConfig { first_factor: 0, second_factor: 0, third_factor: 0, ..c.config.clone() };
+        assert_eq!(c.fee_numerator(c.activation_point + 1, true), Some(10_000_000));
     }
 
     #[test]
@@ -402,7 +416,7 @@ mod tests {
         c.config.variable_fee_control = 20_000;
         c.volatility_accumulator = 50_000;
         // (50_000·100)² · 20_000 / 1e11, rounded up = 5_000_000
-        assert_eq!(c.fee_numerator(c.activation_point, false, 1), Some(25_000_000));
+        assert_eq!(c.fee_numerator(c.activation_point, false), Some(25_000_000));
     }
 
     #[test]
@@ -438,6 +452,10 @@ mod tests {
         assert!(full.swap_exact_in(false, 1_000_000, 449_600_000).is_none());
         // selling more base than the curve holds above its start price
         assert!(c.swap_exact_in(false, u64::MAX / 2, 449_600_000).is_none());
+        // the walk stops at the migration price (just below the last point)
+        let mut top = c.clone();
+        top.config.migration_quote_threshold = u64::MAX;
+        assert!(top.quote_to_base(u64::MAX / 4).is_none(), "InsufficientLiquidity past the migration price");
     }
 
     #[test]

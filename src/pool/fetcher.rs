@@ -3404,7 +3404,7 @@ mod tests {
         assert_eq!((curve.activation_point, curve.is_migrated), (449_545_766, false));
         let cfg = &curve.config;
         assert_eq!((cfg.collect_fee_mode, cfg.activation_type, cfg.base_fee_mode, cfg.cliff_fee_numerator, cfg.dynamic_fee), (0, 0, 0, 20_000_000, false));
-        assert_eq!((cfg.migration_quote_threshold, cfg.sqrt_start_price), (85_000_000_000, 3_141_367_320_245_630));
+        assert_eq!((cfg.migration_quote_threshold, cfg.migration_sqrt_price, cfg.sqrt_start_price), (85_000_000_000, 13_043_817_825_309_819, 3_141_367_320_245_630));
         assert_eq!(cfg.curve, vec![
             (6_401_204_812_200_420, 3_929_368_168_768_468_756_200_000_000_000_000),
             (13_043_817_825_332_782, 2_425_988_008_058_820_449_100_000_000_000_000),
