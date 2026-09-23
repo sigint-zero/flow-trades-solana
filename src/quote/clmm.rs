@@ -52,6 +52,18 @@ fn to_u128(v: U256) -> Option<u128> {
     if v.bits() > 128 { None } else { Some(v.low_u128()) }
 }
 
+/// a·b as a 256-bit number, from four 64×64-bit products.
+#[inline]
+fn wide_mul(a: u128, b: u128) -> U256 {
+    let (a0, a1) = (a as u64 as u128, a >> 64);
+    let (b0, b1) = (b as u64 as u128, b >> 64);
+    let (ll, lh, hl, hh) = (a0 * b0, a0 * b1, a1 * b0, a1 * b1);
+    let mid = (ll >> 64) + (lh as u64 as u128) + (hl as u64 as u128);
+    let lo = (ll as u64 as u128) | (mid << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+    U256([lo as u64, (lo >> 64) as u64, hi as u64, (hi >> 64) as u64])
+}
+
 #[inline]
 fn u512(v: U256) -> U512 {
     let mut w = [0u64; 8];
@@ -59,8 +71,23 @@ fn u512(v: U256) -> U512 {
     U512(w)
 }
 
-/// a·b / d on 256-bit operands with a 512-bit product, rounded down or up.
+/// a·b / d on 256-bit operands, rounded down or up. A product that fits 256
+/// bits is divided in 256 bits, which is several times cheaper than 512.
 fn mul_div_256(a: U256, b: U256, d: U256, round_up: bool) -> Option<U256> {
+    if d.is_zero() {
+        return None;
+    }
+    match a.overflowing_mul(b) {
+        (p, false) => {
+            let (q, r) = p.div_mod(d);
+            if round_up && !r.is_zero() { q.checked_add(U256::one()) } else { Some(q) }
+        }
+        _ => mul_div_512(a, b, d, round_up),
+    }
+}
+
+/// a·b / d with a 512-bit product, rounded down or up.
+fn mul_div_512(a: U256, b: U256, d: U256, round_up: bool) -> Option<U256> {
     if d.is_zero() {
         return None;
     }
@@ -81,7 +108,7 @@ pub fn mul_div_floor(a: u128, b: u128, d: u128) -> Option<u128> {
     if let Some(p) = a.checked_mul(b) {
         return Some(p / d);
     }
-    to_u128(u256(a) * u256(b) / u256(d))
+    to_u128(wide_mul(a, b) / u256(d))
 }
 
 /// ceil(a·b / d)
@@ -93,7 +120,7 @@ pub fn mul_div_ceil(a: u128, b: u128, d: u128) -> Option<u128> {
     if let Some(p) = a.checked_mul(b) {
         return Some(p.div_ceil(d));
     }
-    let (q, r) = (u256(a) * u256(b)).div_mod(u256(d));
+    let (q, r) = wide_mul(a, b).div_mod(u256(d));
     let q = to_u128(q)?;
     if r.is_zero() { Some(q) } else { q.checked_add(1) }
 }
@@ -149,7 +176,7 @@ pub fn orca_sqrt_price_at_tick(tick: i32) -> u128 {
         let mut ratio: u128 = if tick & 1 != 0 { 79232123823359799118286999567 } else { 79228162514264337593543950336 };
         for (i, r) in RATIOS.iter().enumerate() {
             if tick & (2 << i) != 0 {
-                ratio = ((u256(ratio) * u256(*r)) >> 96).low_u128();
+                ratio = (wide_mul(ratio, *r) >> 96).low_u128();
             }
         }
         ratio >> 32
@@ -183,8 +210,8 @@ fn amount0_delta(mut a: u128, mut b: u128, liquidity: u128, round_up: bool) -> O
     if a == 0 {
         return None;
     }
-    let num = u256(liquidity) * u256(b - a);
-    to_u128(mul_div_256(num, U256::one() << 64, u256(a) * u256(b), round_up)?)
+    let num = wide_mul(liquidity, b - a);
+    to_u128(mul_div_256(num, U256::one() << 64, wide_mul(a, b), round_up)?)
 }
 
 /// Token-1 (b) amount between two sqrt prices: L·(B−A)/2^64.
@@ -208,7 +235,7 @@ fn next_sqrt_price_from_input(sqrt_p: u128, liquidity: u128, amount: u128, a_to_
     if a_to_b {
         // L·2^64·P / (L·2^64 + amount·P), rounded up — the price falls.
         let num = u256(liquidity) << 64;
-        let denom = num.checked_add(u256(amount) * u256(sqrt_p))?;
+        let denom = num.checked_add(wide_mul(amount, sqrt_p))?;
         to_u128(mul_div_256(num, u256(sqrt_p), denom, true)?)
     } else {
         // P + amount·2^64 / L — the price rises.
@@ -1037,6 +1064,56 @@ pub fn swap_exact_in_pool_within(pool: &ClmmPool, ticks: &TickData, a_to_b: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Random numbers of random bit length, so both paths and their edges are hit.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn u128(&mut self) -> u128 {
+            let v = ((self.next() as u128) << 64) | self.next() as u128;
+            match self.next() % 8 {
+                0 => u128::MAX - (v & 0xff),
+                1 => v & 0xff,
+                _ => v >> (self.next() % 128),
+            }
+        }
+    }
+
+    #[test]
+    fn wide_mul_matches_u256_product() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..200_000 {
+            let (a, b) = (rng.u128(), rng.u128());
+            assert_eq!(wide_mul(a, b), u256(a) * u256(b), "{a} * {b}");
+        }
+        assert_eq!(wide_mul(u128::MAX, u128::MAX), u256(u128::MAX) * u256(u128::MAX));
+    }
+
+    #[test]
+    fn mul_div_256_matches_the_512_bit_path() {
+        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+        let (mut fast, mut wide) = (0, 0);
+        for _ in 0..200_000 {
+            let a = wide_mul(rng.u128(), rng.u128()) >> (rng.next() % 128) as usize;
+            let b = wide_mul(rng.u128(), rng.u128()) >> (rng.next() % 256) as usize;
+            let d = wide_mul(rng.u128(), rng.u128()) >> (rng.next() % 256) as usize;
+            let round_up = rng.next() & 1 == 1;
+            if a.overflowing_mul(b).1 { wide += 1 } else { fast += 1 }
+            assert_eq!(mul_div_256(a, b, d, round_up), mul_div_512(a, b, d, round_up), "{a} * {b} / {d}");
+        }
+        assert!(fast > 10_000 && wide > 10_000, "both paths exercised: {fast} / {wide}");
+        let (max, one, two) = (U256::MAX, U256::one(), U256::from(2u8));
+        for d in [one, two, max] {
+            for round_up in [false, true] {
+                assert_eq!(mul_div_256(max, one, d, round_up), mul_div_512(max, one, d, round_up));
+            }
+        }
+    }
 
     #[test]
     fn mul_div_matches_wide_reference() {
