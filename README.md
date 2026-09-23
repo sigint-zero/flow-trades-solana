@@ -95,7 +95,7 @@ pool the server has seen; the first quote of an unseen pool costs one to three R
 | Byreal | tick-array walk (Raydium layout, incl. sparse arrays); `AmmConfig` fee, per-pool override, launch decay fee, dynamic fee (Pyth arbitrage term) | Raydium CLMM fork; `swap_v3_dyn` for dynamic-fee pools; a swap the imbalance term would apply to is not quoted |
 | Meteora DAMM v2 | sqrt-price curve; fee scheduler, dynamic fee, collect mode | |
 | Meteora Standard | x·y=k on the pool's LP share of two dynamic vaults | stable curve not quoted |
-| Meteora DLMM | — | streamed only |
+| Meteora DLMM | bin walk; per-bin dynamic fee (volatility accumulator), fee mode, limit orders, bitmap extension | up to 3 bin arrays per swap |
 | Meteora DBC | — | streamed only |
 | Saros | x·y=k; observed fee | |
 | Dooar | x·y=k; on-chain fee schedule | |
@@ -117,6 +117,7 @@ Quote vs router-simulated output on mainnet, direct routes, 0.05–50 SOL, both 
 | Raydium CPMM, Raydium CLMM, LaunchLab, Orca, PancakeSwap, DefiTuna Fusion, Meteora Standard, Meteora DAMM v2 | 0 bps on a fresh state; ~2 bps when the pool trades between quote and simulation |
 | pump.fun AMM, pools with a coin creator | 0 bps |
 | pump.fun AMM, no coin creator | about −65 bps (fee schedule not in the tier config) |
+| Meteora DLMM | 0 atoms vs the program's own swap event on a same-slot state; ~1–5 bps when the pool trades between quote and simulation |
 | Saros | −10 … −25 bps |
 | Raydium V4, Byreal, FluxBeam | 0 bps on a fresh state; the busy V4 SOL/USDC pool ±0.4 bps and Byreal dynamic-fee pools up to ~5 bps when the pool or the Pyth price moves between quote and simulation |
 | Multi-hop (v1) | within ~5 bps; later hops are quoted on the previous hop's guaranteed output |

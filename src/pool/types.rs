@@ -330,6 +330,9 @@ pub enum PoolState {
         event_authority: Pubkey,
         /// Bin array PDAs derived from active_id
         bin_arrays: Vec<Pubkey>,
+        /// Fee parameters, active bin and liquidity bitmap (see `quote::dlmm`).
+        #[serde(default)]
+        pair: crate::quote::dlmm::DlmmPair,
     },
     MeteoraDamm {
         pool: Pubkey,
@@ -763,6 +766,7 @@ mod tests {
             host_fee_in: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             bin_arrays: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            pair: Default::default(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();

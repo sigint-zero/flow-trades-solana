@@ -61,7 +61,8 @@ fn is_constant_product(pool_type: PoolType) -> bool {
             | PoolType::Pumpup
             | PoolType::FluxBeam
         // NOT here, quoted with their own math in `quote_state`: Meteora DAMM v2
-        // (single-range sqrt-price curve, `quote::damm_v2`), Raydium LaunchLab
+        // (single-range sqrt-price curve, `quote::damm_v2`), Meteora DLMM (bin
+        // walk, `quote::dlmm`), Raydium LaunchLab
         // (virtual-reserve bonding curve, `quote::launchlab`), Meteora Standard
         // (LP share of dynamic vaults, `quote::meteora_std`), every CLMM venue
         // (`quote::clmm` tick walk).
@@ -83,6 +84,7 @@ fn is_clmm(pool_type: PoolType) -> bool {
 /// Check if a pool type is quotable (constant product or CLMM).
 fn is_quotable(pool_type: PoolType) -> bool {
     is_constant_product(pool_type) || is_clmm(pool_type) || matches!(pool_type, PoolType::MeteoraDamm | PoolType::RaydiumLp | PoolType::Meteora)
+        || pool_type == PoolType::MeteoraDlmm
 }
 
 /// Get the label for a pool type from the program_id_to_label mapping.
@@ -632,6 +634,27 @@ impl Quoter {
             }));
         }
 
+        if let PoolState::MeteoraDlmm { lb_pair, token_x_mint, token_y_mint, pair, .. } = state {
+            // Exact bin walk over the pair's own snapshot (LbPair + bin arrays
+            // read together); without a fresh one the answer is "not yet".
+            let swap_for_y = if input_mint == token_x_mint { true } else if input_mint == token_y_mint { false } else { return Eval::Quoted(None) };
+            let bins = match super::dlmm::BINS.get(lb_pair) {
+                Some(b) if b.is_current(pair, self.cache.ttl()) => b,
+                _ => return Eval::Cold,
+            };
+            let slot = crate::stream::latest_slot().max(bins.slot);
+            return match super::dlmm::swap_exact_in(&bins, swap_for_y, amount, bins.chain_now(), slot, super::dlmm::SWAP_ARRAYS) {
+                Ok(q) if q.amount_out > 0 => {
+                    let (rin, rout) = bins.implied_reserves(swap_for_y);
+                    Eval::Quoted(Some((q.amount_out, q.fee, rin, rout)))
+                }
+                // an array the snapshot lacks (the pair moved since): re-read
+                Err(super::dlmm::WalkError::NotLoaded) => Eval::Cold,
+                // liquidity runs out within the arrays a swap can carry, or disabled
+                _ => Eval::Quoted(None),
+            };
+        }
+
         if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
             return Eval::Quoted(quote_damm_v2(
                 input_mint, token_a_mint, token_b_mint, *liquidity, *sqrt_price, *sqrt_min_price, *sqrt_max_price, fees, *activation_point, *activation_type, *collect_fee_mode, *pool_status, amount,
@@ -758,6 +781,9 @@ impl Quoter {
                     // one getMultipleAccounts: the ±3 tick arrays + bitmap extension
                     let _ = crate::pool::ticks::load_clmm_ticks(&rpc, fresh).await;
                 }
+                if pool_type == PoolType::MeteoraDlmm {
+                    let _ = crate::pool::bins::load_dlmm_bins(&rpc, fresh).await;
+                }
             }
             if let Ok(fresh) = refreshed {
                 if let (Some(m), PoolState::PumpFunAmm { pool_base_vault, pool_quote_vault, base_reserve, quote_reserve, .. }) = (mirror.as_ref(), &fresh) {
@@ -851,6 +877,15 @@ impl Quoter {
             if !fresh_ticks {
                 if let Err(e) = crate::pool::ticks::load_clmm_ticks(&self.rpc, &state).await {
                     debug!(pool = %entry.address, error = %e, "cold: tick arrays failed");
+                    return None;
+                }
+            }
+        }
+        if let PoolState::MeteoraDlmm { pair, .. } = &state {
+            let fresh_bins = super::dlmm::BINS.get(&entry.address).map(|b| b.is_current(pair, self.cache.ttl())).unwrap_or(false);
+            if !fresh_bins {
+                if let Err(e) = crate::pool::bins::load_dlmm_bins(&self.rpc, &state).await {
+                    debug!(pool = %entry.address, error = %e, "cold: dlmm bin arrays failed");
                     return None;
                 }
             }
@@ -2363,10 +2398,10 @@ mod tests {
 
         let mint_a = Pubkey::new_unique();
         let mint_b = Pubkey::new_unique();
-        // MeteoraDlmm is not supported for quoting
+        // DefiTuna Pools is not supported for quoting
         registry.add(PoolEntry {
             address: Pubkey::new_unique(),
-            pool_type: PoolType::MeteoraDlmm,
+            pool_type: PoolType::DefiTunaPools,
             mint_a,
             mint_b,
         });

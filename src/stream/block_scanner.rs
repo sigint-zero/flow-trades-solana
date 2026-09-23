@@ -643,6 +643,9 @@ async fn run_block_subscribe(
                                 if crate::pool::fetcher::is_state_priced(pool_type) {
                                     let _ = crate::pool::ticks::load_clmm_ticks(&rpc, &state).await;
                                 }
+                                if pool_type == PoolType::MeteoraDlmm {
+                                    let _ = crate::pool::bins::load_dlmm_bins(&rpc, &state).await;
+                                }
                                 if let Some((mint_a, mint_b)) = extract_mints_from_state(&state) {
                                     // token program + Token-2022 transfer fee, once per mint
                                     crate::pool::mints::ensure_mint_info(&rpc, &[mint_a, mint_b]).await;
@@ -968,6 +971,7 @@ mod tests {
             host_fee_in: Pubkey::new_unique(),
             event_authority: Pubkey::new_unique(),
             bin_arrays: vec![],
+            pair: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_x, mint_y)));

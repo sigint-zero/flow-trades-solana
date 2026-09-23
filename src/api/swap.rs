@@ -294,6 +294,9 @@ pub(crate) async fn build_swap_from_quote(
     } else {
         400_000
     };
+    // A Meteora DLMM hop's cost grows with the bins it walks (a full array is
+    // ≈ 0.5M CU): budget the walk its quote made.
+    let compute_limit = if req.compute_limit.is_none() { compute_limit.max(dlmm_route_compute_units(quote)) } else { compute_limit };
 
     let tx_config = TxBuildConfig {
         compute_unit_limit: compute_limit,
@@ -316,6 +319,26 @@ pub(crate) async fn build_swap_from_quote(
     };
 
     Ok((swap_ixs, tx_config, user_pubkey))
+}
+
+/// Compute units for a route with Meteora DLMM hops: each DLMM hop's own
+/// estimate (`quote::dlmm::estimate_compute_units`) plus 200k per other hop,
+/// capped at the 1.4M transaction maximum. 0 when no hop is DLMM.
+fn dlmm_route_compute_units(quote: &QuoteResponse) -> u32 {
+    let mut total: u32 = 0;
+    let mut any = false;
+    for r in &quote.routes {
+        let est = (r.pool.dex == "Meteora DLMM")
+            .then(|| {
+                let pool = Pubkey::from_str(&r.pool.pool_address).ok()?;
+                let input = Pubkey::from_str(&r.pool.input_token).ok()?;
+                crate::quote::dlmm::estimate_compute_units(&pool, &input, r.pool.amount_in.parse().ok()?)
+            })
+            .flatten();
+        any |= est.is_some();
+        total = total.saturating_add(est.unwrap_or(200_000));
+    }
+    if any { total.min(1_400_000) } else { 0 }
 }
 
 /// Wrap ALL swap instructions in the flow-router CPI for on-chain fee enforcement.
@@ -499,6 +522,13 @@ async fn load_pool_state(
     }
     if dirty {
         state.cache.insert(*pool_address, pool_state.clone());
+    }
+    // DLMM: the executor picks bin arrays + bitmap extension from the pair's
+    // bins in memory (normally loaded by the quote that preceded this swap)
+    if pool_type == PoolType::MeteoraDlmm && !crate::quote::dlmm::BINS.contains_key(pool_address) {
+        if let Err(e) = crate::pool::bins::load_dlmm_bins(&state.rpc, &pool_state).await {
+            tracing::warn!(pool = %pool_address, error = %e, "dlmm bin arrays unreadable — swap built from the pair's own bitmap");
+        }
     }
     Ok(pool_state)
 }

@@ -785,6 +785,7 @@ pub fn is_state_priced(pool_type: PoolType) -> bool {
     matches!(
         pool_type,
         PoolType::RaydiumCl | PoolType::Orca | PoolType::PancakeSwap | PoolType::Byreal | PoolType::DefiTunaFusion | PoolType::MeteoraDamm | PoolType::RaydiumLp
+            | PoolType::MeteoraDlmm
     )
 }
 
@@ -800,6 +801,7 @@ pub fn reparse_pool_state(pool_type: PoolType, pool_address: &Pubkey, account: &
         PoolType::DefiTunaFusion => parse_defituna_fusion(pool_address, account)?,
         PoolType::MeteoraDamm => parse_meteora_damm(pool_address, account)?,
         PoolType::RaydiumLp => parse_raydium_lp(pool_address, account)?,
+        PoolType::MeteoraDlmm => parse_meteora_dlmm(pool_address, account)?,
         // not state-priced (vault balances), but its PnL / status live in the pool
         PoolType::RaydiumV4 => parse_raydium_v4(pool_address, account)?,
         other => return Err(TradeError::Execution(format!("{other:?} is not state-priced"))),
@@ -1049,6 +1051,7 @@ pub fn refresh_meteora_std_from(state: &mut PoolState, accounts: &[Option<Accoun
 // status(1), require_base_factor_seed(1), base_factor_seed(2), activation_type(1), _pad(1),
 // token_x_mint(32), token_y_mint(32), reserve_x(32), reserve_y(32),
 // protocol_fee(16), _padding_1(32), reward_infos(2x144=288), oracle(32), ...
+// Fee parameters, active bin and bitmap for quoting: `quote::dlmm::DlmmPair`.
 fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult<PoolState> {
     let data = &pool_data.data;
     if data.len() < 584 {
@@ -1099,6 +1102,7 @@ fn parse_meteora_dlmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         host_fee_in,
         event_authority,
         bin_arrays,
+        pair: crate::quote::dlmm::DlmmPair::parse(data).unwrap_or_default(),
     })
 }
 
@@ -2340,6 +2344,7 @@ mod tests {
                 host_fee_in: _,
                 event_authority: _,
                 bin_arrays,
+                pair: _,
             } => {
                 assert_eq!(lb_pair, pool_addr);
                 assert_eq!(rx, reserve_x);

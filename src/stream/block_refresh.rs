@@ -9,9 +9,9 @@
 //!    vault is written to the mirror (constant-product venues and pump.fun AMM
 //!    are priced from vault balances, so this alone makes them block-fresh).
 //! 2. **Async, per block:** pools whose price lives in the pool account (CLMM
-//!    venues, DAMM v2) and that were touched by the block are re-read in ONE
-//!    `getMultipleAccounts` (100 per call), re-parsed, and their tick arrays
-//!    reloaded in a second batched call.
+//!    venues, DAMM v2, DLMM) and that were touched by the block are re-read in
+//!    ONE `getMultipleAccounts` (100 per call), re-parsed, and their tick
+//!    arrays / DLMM bin arrays reloaded in a second batched call.
 //!
 //! What this cannot do: pools touched by a swap this block but not yet in the
 //! registry (discovery handles those), and vault changes that leave no token
@@ -197,7 +197,8 @@ pub async fn refresh_touched(ctx: &BlockRefreshCtx, mut touched: Vec<(Pubkey, Po
         }
     }
     let states_only: Vec<_> = fresh_states.iter().map(|(_, s)| s.clone()).collect();
-    let ticks = crate::pool::ticks::load_clmm_ticks_many(&ctx.rpc, &states_only).await;
+    let ticks = crate::pool::ticks::load_clmm_ticks_many(&ctx.rpc, &states_only).await
+        + crate::pool::bins::load_dlmm_bins_many(&ctx.rpc, &states_only).await;
     let n = fresh_states.len() + meteora_n;
     REFRESH_STATS.refreshed.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     REFRESH_STATS.ticks.fetch_add(ticks as u64, std::sync::atomic::Ordering::Relaxed);
