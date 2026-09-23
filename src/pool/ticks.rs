@@ -93,6 +93,7 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
         initialized_arrays,
         bitmap_extension,
         fetched_at: Instant::now(),
+        layout: plan.layout,
     });
     debug!(pool = %plan.pool, ticks = data.ticks.len(), arrays = data.initialized_arrays.len(), ext = data.bitmap_extension.is_some(), "loaded clmm ticks");
     TICKS.insert(plan.pool, Arc::clone(&data));
