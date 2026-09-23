@@ -56,7 +56,7 @@ pub fn ticks_around(n_ticks: usize) -> TickData {
     ticks.sort_unstable_by_key(|(t, _)| *t);
     let span = 88 * ORCA_SPACING;
     let cur = ORCA_TICK.div_euclid(span) * span;
-    TickData { ticks, covered_lo: cur - 3 * span, covered_hi: cur + 4 * span - 1, initialized_arrays: vec![cur - span, cur, cur + span], bitmap_extension: None, limit_orders: vec![], fetched_at: Instant::now() }
+    TickData { ticks, covered_lo: cur - 3 * span, covered_hi: cur + 4 * span - 1, initialized_arrays: vec![cur - span, cur, cur + span], bitmap_extension: None, limit_orders: vec![], adaptive_fee: None, fetched_at: Instant::now() }
 }
 
 pub struct World {

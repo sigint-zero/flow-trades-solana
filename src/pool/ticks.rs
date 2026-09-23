@@ -41,11 +41,13 @@ pub struct TickFetchPlan {
     pub spacing: i32,
     pub starts: Vec<i32>,
     /// Account keys in order: the arrays for `starts`, then (Raydium layouts)
-    /// the bitmap extension PDA, then (Byreal dynamic-fee pools) the vaults and
-    /// oracle accounts its fee reads (`quote::byreal_fee::dyn_input_keys`).
+    /// the bitmap extension PDA, then (Orca whirlpools) the `Oracle` PDA or
+    /// (Byreal dynamic-fee pools) the vaults and oracle accounts its fee reads
+    /// (`quote::byreal_fee::dyn_input_keys`).
     pub keys: Vec<Pubkey>,
     pub extension: Option<Pubkey>,
-    /// The pool state, when its fee needs the extra accounts above.
+    pub oracle: Option<Pubkey>,
+    /// The pool state, when its fee needs the Byreal accounts above.
     pub dyn_fee_state: Option<PoolState>,
 }
 
@@ -60,11 +62,16 @@ pub fn tick_fetch_plan(state: &PoolState) -> Option<TickFetchPlan> {
     if let Some(e) = extension {
         keys.push(e);
     }
+    // adaptive-fee whirlpools keep their volatility state in an oracle account
+    let oracle = (program == ORCA_PROG_ID).then(|| Pubkey::find_program_address(&[b"oracle", pool.as_ref()], &program).0);
+    if let Some(o) = oracle {
+        keys.push(o);
+    }
     let dyn_keys = crate::quote::byreal_fee::dyn_input_keys(state);
     if let Some(k) = dyn_keys {
         keys.extend(k);
     }
-    Some(TickFetchPlan { layout, pool, span, spacing, starts, keys, extension, dyn_fee_state: dyn_keys.map(|_| state.clone()) })
+    Some(TickFetchPlan { layout, pool, span, spacing, starts, keys, extension, oracle, dyn_fee_state: dyn_keys.map(|_| state.clone()) })
 }
 
 /// Build `TickData` from the accounts fetched for `plan.keys` (same order) and
@@ -92,12 +99,18 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
     }
     ticks.sort_unstable_by_key(|(t, _)| *t);
     limit_orders.sort_unstable_by_key(|(t, _)| *t);
+    let n = plan.starts.len();
     let bitmap_extension = match plan.extension {
-        Some(e) if accounts.get(plan.starts.len()).map(|a| a.is_some()).unwrap_or(false) => Some(e),
+        Some(e) if accounts.get(n).map(|a| a.is_some()).unwrap_or(false) => Some(e),
+        _ => None,
+    };
+    let oracle_index = n + plan.extension.is_some() as usize;
+    let adaptive_fee = match (plan.oracle, accounts.get(oracle_index)) {
+        (Some(_), Some(Some(acct))) => crate::quote::clmm::OrcaAdaptiveFee::parse(&acct.data, &plan.pool),
         _ => None,
     };
     if let Some(st) = &plan.dyn_fee_state {
-        let from = plan.starts.len() + plan.extension.is_some() as usize;
+        let from = oracle_index + plan.oracle.is_some() as usize;
         crate::quote::byreal_fee::publish_dyn_inputs(st, &accounts[from..]);
     }
     let data = Arc::new(TickData {
@@ -107,6 +120,7 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
         initialized_arrays,
         bitmap_extension,
         limit_orders,
+        adaptive_fee,
         fetched_at: Instant::now(),
     });
     debug!(pool = %plan.pool, ticks = data.ticks.len(), arrays = data.initialized_arrays.len(), ext = data.bitmap_extension.is_some(), "loaded clmm ticks");

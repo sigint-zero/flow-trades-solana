@@ -109,6 +109,8 @@ pub const MAX_TICK: i32 = 443_636;
 /// Raydium's swap price limits (a swap with no explicit limit runs to MIN+1 / MAX−1).
 const RAYDIUM_MIN_SQRT_PRICE_X64: u128 = 4_295_048_016;
 const RAYDIUM_MAX_SQRT_PRICE_X64: u128 = 79_226_673_521_066_979_257_578_248_091;
+/// Orca's (and Fusion's) upper price limit.
+const ORCA_MAX_SQRT_PRICE_X64: u128 = 79_226_673_515_401_279_992_447_579_055;
 
 /// Raydium CLMM (and its forks) `tick_math::get_sqrt_price_at_tick`.
 pub fn raydium_sqrt_price_at_tick(tick: i32) -> u128 {
@@ -371,6 +373,229 @@ impl RaydiumDynamicFee {
     }
 }
 
+// ── Orca adaptive fee (`Oracle` account) ──────────────────────────────────
+
+/// Orca `Oracle` account (PDA `["oracle", whirlpool]`, 254 B): adaptive fee
+/// constants and variables. A whirlpool whose oracle exists charges its
+/// static fee plus a volatility fee re-read every `tick_group_size` ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OrcaAdaptiveFee {
+    pub trade_enable_timestamp: u64,
+    pub filter_period: u16,
+    pub decay_period: u16,
+    pub reduction_factor: u16,
+    pub adaptive_fee_control_factor: u32,
+    pub max_volatility_accumulator: u32,
+    pub tick_group_size: u16,
+    pub last_reference_update_timestamp: u64,
+    pub last_major_swap_timestamp: u64,
+    pub volatility_reference: u32,
+    pub tick_group_index_reference: i32,
+    pub volatility_accumulator: u32,
+}
+
+/// `sha256("account:Oracle")[..8]`
+pub const ORCA_ORACLE_DISCRIMINATOR: [u8; 8] = [139, 194, 131, 179, 140, 179, 229, 244];
+/// An adaptive-fee reference older than this is reset (`MAX_REFERENCE_AGE`).
+const ORCA_MAX_REFERENCE_AGE: u64 = 3_600;
+
+impl OrcaAdaptiveFee {
+    /// Parse an `Oracle` account belonging to `whirlpool`.
+    pub fn parse(d: &[u8], whirlpool: &Pubkey) -> Option<Self> {
+        if d.len() < 126 || d[..8] != ORCA_ORACLE_DISCRIMINATOR || d[8..40] != whirlpool.to_bytes() {
+            return None;
+        }
+        let u16_at = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        let group = u16_at(62);
+        if group == 0 {
+            return None;
+        }
+        Some(Self {
+            trade_enable_timestamp: u64_at(40),
+            filter_period: u16_at(48),
+            decay_period: u16_at(50),
+            reduction_factor: u16_at(52),
+            adaptive_fee_control_factor: u32_at(54),
+            max_volatility_accumulator: u32_at(58),
+            tick_group_size: group,
+            last_reference_update_timestamp: u64_at(82),
+            last_major_swap_timestamp: u64_at(90),
+            volatility_reference: u32_at(98),
+            tick_group_index_reference: u32_at(102) as i32,
+            volatility_accumulator: u32_at(106),
+        })
+    }
+
+    /// `AdaptiveFeeVariables::update_reference` (a clock behind the stored
+    /// timestamps is treated as equal to them).
+    fn update_reference(&mut self, tick_group_index: i32, now: u64) {
+        let max_timestamp = self.last_reference_update_timestamp.max(self.last_major_swap_timestamp);
+        let now = now.max(max_timestamp);
+        if now - self.last_reference_update_timestamp > ORCA_MAX_REFERENCE_AGE {
+            self.tick_group_index_reference = tick_group_index;
+            self.volatility_reference = 0;
+            self.last_reference_update_timestamp = now;
+            return;
+        }
+        let elapsed = now - max_timestamp;
+        if elapsed < self.filter_period as u64 {
+            return;
+        }
+        self.tick_group_index_reference = tick_group_index;
+        self.volatility_reference = if elapsed < self.decay_period as u64 {
+            (self.volatility_accumulator as u64 * self.reduction_factor as u64 / 10_000) as u32
+        } else {
+            0
+        };
+        self.last_reference_update_timestamp = now;
+    }
+
+    fn update_volatility_accumulator(&mut self, tick_group_index: i32) {
+        let delta = (self.tick_group_index_reference as i64 - tick_group_index as i64).unsigned_abs();
+        let v = self.volatility_reference as u64 + delta * VOLATILITY_ACCUMULATOR_SCALE;
+        self.volatility_accumulator = v.min(self.max_volatility_accumulator as u64) as u32;
+    }
+
+    fn total_fee_rate(&self, static_fee: u32) -> u32 {
+        let crossed = self.volatility_accumulator as u128 * self.tick_group_size as u128;
+        let adaptive = (self.adaptive_fee_control_factor as u128 * crossed * crossed).div_ceil(100_000u128 * 10_000 * 10_000);
+        (static_fee as u128 + adaptive.min(MAX_DYNAMIC_FEE_RATE as u128)).min(MAX_DYNAMIC_FEE_RATE as u128) as u32
+    }
+}
+
+/// Orca `tick_index_from_sqrt_price`.
+pub fn orca_tick_at_sqrt_price(sqrt_price: u128) -> i32 {
+    let msb = 127 - sqrt_price.leading_zeros();
+    let log2p_integer_x32 = (msb as i128 - 64) << 32;
+    let mut bit: i128 = 0x8000_0000_0000_0000;
+    let mut log2p_fraction_x64: i128 = 0;
+    let mut r = if msb >= 64 { sqrt_price >> (msb - 63) } else { sqrt_price << (63 - msb) };
+    for _ in 0..14 {
+        r *= r;
+        let more_than_two = (r >> 127) as u32;
+        r >>= 63 + more_than_two;
+        log2p_fraction_x64 += bit * more_than_two as i128;
+        bit >>= 1;
+    }
+    let log2p_x32 = log2p_integer_x32 + (log2p_fraction_x64 >> 32);
+    let logbp_x64 = log2p_x32 * 59_543_866_431_248i128;
+    let tick_low = ((logbp_x64 - 184_467_440_737_095_516i128) >> 64) as i32;
+    let tick_high = ((logbp_x64 + 15_793_534_762_490_258_745i128) >> 64) as i32;
+    if tick_low == tick_high || orca_sqrt_price_at_tick(tick_high) > sqrt_price { tick_low } else { tick_high }
+}
+
+/// The swap's per-step fee: static, Raydium dynamic (re-read every tick
+/// spacing) or Orca adaptive (re-read every tick group).
+enum StepFee {
+    Static,
+    Raydium { fee: RaydiumDynamicFee, ts_index: i32 },
+    Orca { fee: OrcaAdaptiveFee, group_index: i32, core_lower: Option<(i32, u128)>, core_upper: Option<(i32, u128)> },
+}
+
+impl StepFee {
+    fn new(pool: &ClmmPool) -> Option<Self> {
+        if let Some(mut fee) = pool.fee_ext.dynamic_fee {
+            let ts_index = tick_spacing_index(pool.tick_current, pool.tick_spacing);
+            fee.update_reference(ts_index, pool.now);
+            return Some(StepFee::Raydium { fee, ts_index });
+        }
+        let Some(mut fee) = pool.adaptive_fee else { return Some(StepFee::Static) };
+        if pool.now < fee.trade_enable_timestamp {
+            return None; // trading not enabled yet
+        }
+        let group = fee.tick_group_size as i32;
+        let group_index = pool.tick_current.div_euclid(group);
+        fee.update_reference(group_index, pool.now);
+        // tick groups beyond the "core" range already saturate the accumulator
+        let delta = (fee.max_volatility_accumulator.saturating_sub(fee.volatility_reference) as u64).div_ceil(VOLATILITY_ACCUMULATOR_SCALE) as i32;
+        let (lo, hi) = (fee.tick_group_index_reference - delta, fee.tick_group_index_reference + delta);
+        let (lo_tick, hi_tick) = (lo * group, hi * group + group);
+        let core_lower = (lo_tick > MIN_TICK).then(|| (lo, orca_sqrt_price_at_tick(lo_tick)));
+        let core_upper = (hi_tick < MAX_TICK).then(|| (hi, orca_sqrt_price_at_tick(hi_tick)));
+        Some(StepFee::Orca { fee, group_index, core_lower, core_upper })
+    }
+
+    /// (fee rate, bounded target, adaptive update skipped) for the next step.
+    fn step(&mut self, base: u32, target: u128, liquidity: u128, spacing: i32, layout: TickLayout, a_to_b: bool) -> (u32, u128, bool) {
+        match self {
+            StepFee::Static => (base, target, true),
+            StepFee::Raydium { fee, ts_index } => {
+                fee.update_volatility_accumulator(*ts_index);
+                let rate = fee.total_fee_rate(base, spacing);
+                if liquidity == 0 || fee.volatility_accumulator == fee.max_volatility_accumulator {
+                    return (rate, target, true);
+                }
+                let b_tick = if a_to_b { ts_index.saturating_mul(spacing) } else { ts_index.saturating_add(1).saturating_mul(spacing) }.clamp(MIN_TICK, MAX_TICK);
+                let b_price = layout.sqrt_price_at_tick(b_tick);
+                let bounded = if (a_to_b && target <= b_price) || (!a_to_b && target >= b_price) { b_price } else { target };
+                (rate, bounded, false)
+            }
+            StepFee::Orca { fee, group_index, core_lower, core_upper } => {
+                fee.update_volatility_accumulator(*group_index);
+                let rate = fee.total_fee_rate(base);
+                if fee.adaptive_fee_control_factor == 0 || liquidity == 0 {
+                    return (rate, target, true);
+                }
+                if let Some((lo, lo_price)) = core_lower {
+                    if *group_index < *lo {
+                        return (rate, if a_to_b { target } else { target.min(*lo_price) }, true);
+                    }
+                }
+                if let Some((hi, hi_price)) = core_upper {
+                    if *group_index > *hi {
+                        return (rate, if a_to_b { target.max(*hi_price) } else { target }, true);
+                    }
+                }
+                let group = fee.tick_group_size as i32;
+                let b_tick = if a_to_b { *group_index * group } else { *group_index * group + group }.clamp(MIN_TICK, MAX_TICK);
+                let b_price = orca_sqrt_price_at_tick(b_tick);
+                (rate, if a_to_b { target.max(b_price) } else { target.min(b_price) }, false)
+            }
+        }
+    }
+
+    /// After a step: move to the next tick spacing / group, or re-derive it
+    /// from where the price landed when bounding was skipped.
+    fn advance(&mut self, skipped: bool, sqrt_p: u128, next_tick_price: u128, next_tick: i32, tick: i32, spacing: i32, a_to_b: bool) {
+        let dir = if a_to_b { -1 } else { 1 };
+        match self {
+            StepFee::Static => {}
+            StepFee::Raydium { fee, ts_index } => {
+                if skipped {
+                    let t = if sqrt_p == next_tick_price { next_tick } else { tick };
+                    *ts_index = tick_spacing_index(t, spacing);
+                    if !a_to_b && t % spacing == 0 {
+                        *ts_index -= 1;
+                    }
+                    if fee.volatility_accumulator != fee.max_volatility_accumulator {
+                        fee.update_volatility_accumulator(*ts_index);
+                    }
+                }
+                *ts_index += dir;
+            }
+            StepFee::Orca { fee, group_index, .. } => {
+                if skipped {
+                    let group = fee.tick_group_size as i32;
+                    let (t, on_boundary) = if sqrt_p == next_tick_price {
+                        (next_tick, next_tick % group == 0)
+                    } else {
+                        let t = orca_tick_at_sqrt_price(sqrt_p);
+                        (t, t % group == 0 && sqrt_p == orca_sqrt_price_at_tick(t))
+                    };
+                    let last = if on_boundary && !a_to_b { t / group - 1 } else { t.div_euclid(group) };
+                    if (a_to_b && last < *group_index) || (!a_to_b && last > *group_index) {
+                        *group_index = last;
+                        fee.update_volatility_accumulator(*group_index);
+                    }
+                }
+                *group_index += dir;
+            }
+        }
+    }
+}
+
 /// `tick_spacing_index_from_tick`: floor(tick / spacing).
 #[inline]
 fn tick_spacing_index(tick: i32, spacing: i32) -> i32 {
@@ -429,6 +654,8 @@ pub struct TickData {
     /// (tick index, unfilled limit-order amount), ascending by tick — Raydium
     /// CLMM ticks holding limit orders (they count as initialised).
     pub limit_orders: Vec<(i32, u64)>,
+    /// Orca adaptive-fee state (the whirlpool's `Oracle`), read with the ticks.
+    pub adaptive_fee: Option<OrcaAdaptiveFee>,
     pub fetched_at: Instant,
 }
 
@@ -623,6 +850,8 @@ pub struct ClmmPool {
     pub fee_ppm: u32,
     /// Raydium CLMM fee side / dynamic fee (default for every other venue).
     pub fee_ext: RaydiumFeeExt,
+    /// Orca adaptive fee (the whirlpool's `Oracle`), when it has one.
+    pub adaptive_fee: Option<OrcaAdaptiveFee>,
     /// Unix time the dynamic fee's volatility reference decays against.
     pub now: u64,
 }
@@ -638,7 +867,7 @@ pub fn swap_exact_in(
     a_to_b: bool,
     amount_in: u64,
 ) -> Option<WalkResult> {
-    let pool = ClmmPool { layout: TickLayout::Orca, sqrt_price_x64, liquidity, tick_current, tick_spacing: 1, fee_ppm, fee_ext: RaydiumFeeExt::default(), now: 0 };
+    let pool = ClmmPool { layout: TickLayout::Orca, sqrt_price_x64, liquidity, tick_current, tick_spacing: 1, fee_ppm, fee_ext: RaydiumFeeExt::default(), adaptive_fee: None, now: 0 };
     swap_exact_in_pool(&pool, ticks, a_to_b, amount_in)
 }
 
@@ -654,13 +883,13 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
     let layout = pool.layout;
     let spacing = pool.tick_spacing;
     let fee_on_input = pool.fee_ext.fee_on_input(a_to_b);
-    let mut dynamic = pool.fee_ext.dynamic_fee;
-    let mut ts_index = 0i32;
-    if let Some(d) = dynamic.as_mut() {
-        ts_index = tick_spacing_index(pool.tick_current, spacing);
-        d.update_reference(ts_index, pool.now);
-    }
-    let limit = if a_to_b { RAYDIUM_MIN_SQRT_PRICE_X64 + 1 } else { RAYDIUM_MAX_SQRT_PRICE_X64 - 1 };
+    let mut step_fee = StepFee::new(pool)?;
+    let limit = match (layout, a_to_b) {
+        (TickLayout::Raydium, true) => RAYDIUM_MIN_SQRT_PRICE_X64 + 1,
+        (TickLayout::Raydium, false) => RAYDIUM_MAX_SQRT_PRICE_X64 - 1,
+        (_, true) => RAYDIUM_MIN_SQRT_PRICE_X64,
+        (_, false) => ORCA_MAX_SQRT_PRICE_X64,
+    };
 
     let mut remaining = amount_in as u128;
     let mut sqrt_p = pool.sqrt_price_x64;
@@ -695,22 +924,9 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
         }
         let mut liq_next = liq;
         loop {
-            // Dynamic fee: re-price every tick spacing; without it one step to the tick.
-            let mut fee = pool.fee_ppm;
-            let mut skipped = true;
-            let mut bounded = target;
-            if let Some(d) = dynamic.as_mut() {
-                d.update_volatility_accumulator(ts_index);
-                fee = d.total_fee_rate(pool.fee_ppm, spacing);
-                if liq != 0 && d.volatility_accumulator != d.max_volatility_accumulator {
-                    skipped = false;
-                    let b_tick = if a_to_b { ts_index.saturating_mul(spacing) } else { ts_index.saturating_add(1).saturating_mul(spacing) }.clamp(MIN_TICK, MAX_TICK);
-                    let b_price = layout.sqrt_price_at_tick(b_tick);
-                    if (a_to_b && target <= b_price) || (!a_to_b && target >= b_price) {
-                        bounded = b_price;
-                    }
-                }
-            }
+            // Dynamic / adaptive fee: re-price every tick spacing (group);
+            // without one, a single step to the tick.
+            let (fee, bounded, skipped) = step_fee.step(pool.fee_ppm, target, liq, spacing, layout, a_to_b);
             let next = if sqrt_p != bounded {
                 if liq == 0 {
                     bounded // no liquidity in this range: the price jumps for free
@@ -755,19 +971,7 @@ pub fn swap_exact_in_pool(pool: &ClmmPool, ticks: &TickData, a_to_b: bool, amoun
                 }
             }
             sqrt_p = next;
-            if let Some(d) = dynamic.as_mut() {
-                if skipped {
-                    let t = if sqrt_p == tick_price { target_tick } else { tick };
-                    ts_index = tick_spacing_index(t, spacing);
-                    if !a_to_b && t % spacing == 0 {
-                        ts_index -= 1;
-                    }
-                    if d.volatility_accumulator != d.max_volatility_accumulator {
-                        d.update_volatility_accumulator(ts_index);
-                    }
-                }
-                ts_index += if a_to_b { -1 } else { 1 };
-            }
+            step_fee.advance(skipped, sqrt_p, tick_price, target_tick, tick, spacing, a_to_b);
             if remaining == 0 || sqrt_p == target {
                 break;
             }
@@ -833,6 +1037,7 @@ mod tests {
             tick_spacing: 10,
             fee_ppm: 100,
             fee_ext: RaydiumFeeExt::default(),
+            adaptive_fee: None,
             now: 0,
         };
         let td = flat(-21_600, -21_001, vec![(-21_380, 1_649_403_211), (-21_310, 114_466_501), (-21_300, 36_703_672_101), (-21_250, -857_056_650_693)]);
@@ -861,6 +1066,7 @@ mod tests {
             tick_spacing: 120,
             fee_ppm: 10_000,
             fee_ext,
+            adaptive_fee: None,
             now: 1_790_127_277,
         };
         let td = flat(64_800, 72_000 - 1, vec![(65_880, 1_416_888_411_491_391), (66_000, 145_497_606_779_696), (66_120, 1_707_608_173_276_316), (66_240, -1_853_105_780_056_012), (66_360, -15_661_387_187_829)]);
@@ -888,6 +1094,7 @@ mod tests {
             tick_spacing: 10,
             fee_ppm: 1_800,
             fee_ext: RaydiumFeeExt { fee_on: 0, dynamic_fee: Some(dynamic_fee) },
+            adaptive_fee: None,
             now: 1_790_127_519,
         };
         let td = flat(-81_085, -79_885, vec![
@@ -908,7 +1115,7 @@ mod tests {
         // tick's price (fee on the input), then the swap continues past it.
         let (l, p) = (1_000_000_000_000u128, Q64);
         let mut td = flat(-6_000, 6_000, vec![(60, 0)]);
-        let base = ClmmPool { layout: TickLayout::Raydium, sqrt_price_x64: p, liquidity: l, tick_current: 0, tick_spacing: 60, fee_ppm: 3_000, fee_ext: RaydiumFeeExt::default(), now: 0 };
+        let base = ClmmPool { layout: TickLayout::Raydium, sqrt_price_x64: p, liquidity: l, tick_current: 0, tick_spacing: 60, fee_ppm: 3_000, fee_ext: RaydiumFeeExt::default(), adaptive_fee: None, now: 0 };
         let without = swap_exact_in_pool(&base, &td, false, 10_000_000_000).unwrap();
         td.limit_orders = vec![(60, 1_000_000_000)];
         let with = swap_exact_in_pool(&base, &td, false, 10_000_000_000).unwrap();
@@ -934,6 +1141,7 @@ mod tests {
             tick_spacing: 4,
             fee_ppm: 400,
             fee_ext: RaydiumFeeExt::default(),
+            adaptive_fee: None,
             now: 0,
         };
         let mut td = flat(66_176, 69_343, vec![
@@ -946,6 +1154,83 @@ mod tests {
         assert_eq!(swap_exact_in_pool(&pool, &td, false, 50_000_000).unwrap().amount_out, 57_633);
         assert_eq!(swap_exact_in_pool(&pool, &td, false, 5_404_214).unwrap().amount_out, 6_238);
         assert_eq!(swap_exact_in_pool(&pool, &td, false, 540_421).unwrap().amount_out, 624);
+    }
+
+    #[test]
+    fn orca_adaptive_fee_reprices_every_tick_group() {
+        // Orca adaptive-fee whirlpool BCvzjDbA… (spacing 4, static 0.04 %,
+        // tick group 4): 2_291_341 in (A→B), simulated router output
+        // 3_858_341. The volatility fee grows by one accumulator step per
+        // tick group the price crosses.
+        let fee = OrcaAdaptiveFee {
+            trade_enable_timestamp: 0,
+            filter_period: 30,
+            decay_period: 600,
+            reduction_factor: 5_000,
+            adaptive_fee_control_factor: 60_000,
+            max_volatility_accumulator: 880_000,
+            tick_group_size: 4,
+            last_reference_update_timestamp: 1_790_128_367,
+            last_major_swap_timestamp: 1_790_128_564,
+            volatility_reference: 29_808,
+            tick_group_index_reference: 1_305,
+            volatility_accumulator: 29_808,
+        };
+        let pool = ClmmPool {
+            layout: TickLayout::Orca,
+            sqrt_price_x64: 23_949_917_230_897_821_664,
+            liquidity: 6_218_180_143,
+            tick_current: 5_221,
+            tick_spacing: 4,
+            fee_ppm: 400,
+            fee_ext: RaydiumFeeExt::default(),
+            adaptive_fee: Some(fee),
+            now: 1_790_128_566,
+        };
+        let td = flat(3_872, 6_335, vec![
+            (3_984, 129_476_030), (4_168, -449_442_999), (4_260, -798_314_398), (4_308, 13_090_896), (4_764, 2_234_077_118),
+            (5_208, -861_704_873), (5_484, 1_426_466_181), (5_548, -1_426_466_181), (5_860, 7_146_839_978), (5_932, 933_124_847),
+        ]);
+        let r = swap_exact_in_pool(&pool, &td, true, 2_291_341).unwrap();
+        assert_eq!(r.amount_out, 3_858_341);
+        // it ends several tick groups below the one it started in (5_220..5_224)
+        assert!(orca_tick_at_sqrt_price(r.end_sqrt_price_x64) < 5_216);
+        // the static fee alone over-quotes
+        let static_fee = ClmmPool { adaptive_fee: None, ..pool };
+        assert!(swap_exact_in_pool(&static_fee, &td, true, 2_291_341).unwrap().amount_out > 3_858_341);
+        // trading not yet enabled: no quote
+        let gated = ClmmPool { adaptive_fee: Some(OrcaAdaptiveFee { trade_enable_timestamp: 1_790_128_567, ..fee }), ..pool };
+        assert!(swap_exact_in_pool(&gated, &td, true, 2_291_341).is_none());
+    }
+
+    #[test]
+    fn orca_tick_index_from_sqrt_price_inverts_the_table() {
+        for t in [-443_636, -60_000, -5_345, -1, 0, 1, 5_221, 66_240, 443_635] {
+            let p = orca_sqrt_price_at_tick(t);
+            assert_eq!(orca_tick_at_sqrt_price(p), t);
+            assert_eq!(orca_tick_at_sqrt_price(p + 1), t);
+            assert_eq!(orca_tick_at_sqrt_price(p - 1), t - 1);
+        }
+    }
+
+    #[test]
+    fn parses_the_orca_oracle() {
+        let pool = Pubkey::new_unique();
+        let mut d = vec![0u8; 254];
+        d[..8].copy_from_slice(&ORCA_ORACLE_DISCRIMINATOR);
+        d[8..40].copy_from_slice(pool.as_ref());
+        d[48..50].copy_from_slice(&30u16.to_le_bytes());
+        d[54..58].copy_from_slice(&60_000u32.to_le_bytes());
+        d[62..64].copy_from_slice(&4u16.to_le_bytes());
+        d[102..106].copy_from_slice(&(-7i32).to_le_bytes());
+        d[106..110].copy_from_slice(&29_808u32.to_le_bytes());
+        let f = OrcaAdaptiveFee::parse(&d, &pool).unwrap();
+        assert_eq!((f.filter_period, f.adaptive_fee_control_factor, f.tick_group_size, f.tick_group_index_reference, f.volatility_accumulator), (30, 60_000, 4, -7, 29_808));
+        assert_eq!(f.total_fee_rate(400), 486);
+        assert!(OrcaAdaptiveFee::parse(&d, &Pubkey::new_unique()).is_none(), "another pool's oracle");
+        let mut sha = d.clone();
+        sha[0] ^= 1;
+        assert!(OrcaAdaptiveFee::parse(&sha, &pool).is_none(), "discriminator");
     }
 
     #[test]
@@ -985,7 +1270,7 @@ mod tests {
     }
 
     fn flat(lo: i32, hi: i32, ticks: Vec<(i32, i128)>) -> TickData {
-        TickData { ticks, covered_lo: lo, covered_hi: hi, initialized_arrays: vec![], bitmap_extension: None, limit_orders: vec![], fetched_at: Instant::now() }
+        TickData { ticks, covered_lo: lo, covered_hi: hi, initialized_arrays: vec![], bitmap_extension: None, limit_orders: vec![], adaptive_fee: None, fetched_at: Instant::now() }
     }
 
     #[test]

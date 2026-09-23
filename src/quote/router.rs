@@ -581,7 +581,8 @@ impl Quoter {
             };
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             let pool = clmm::ClmmPool {
-                layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext, now,
+                layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext,
+                adaptive_fee: ticks.adaptive_fee, now,
             };
             let out = match clmm::swap_exact_in_pool(&pool, &ticks, params.a_to_b, amount) {
                 Some(r) if r.amount_out > 0 => r.amount_out,
