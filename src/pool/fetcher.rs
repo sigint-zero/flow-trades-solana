@@ -1177,9 +1177,12 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
     let token_b_vault = read_pubkey(data, 264)?;
     // Curve (verified on mainnet): liquidity u128@360 (×2^64), sqrt_min@424,
     // sqrt_max@440, sqrt_price@456, activation_point u64@472, activation_type
-    // u8@480, pool_status@481, collect_fee_mode@484.
+    // u8@480, pool_status@481, collect_fee_mode@484, tracked reserves
+    // token_a_amount / token_b_amount u64@680/688 (compounding pools' curve).
     let rd128 = |o: usize| if data.len() >= o + 16 { u128::from_le_bytes(data[o..o + 16].try_into().unwrap()) } else { 0 };
     let (liquidity, sqrt_min_price, sqrt_max_price, sqrt_price) = (rd128(360), rd128(424), rd128(440), rd128(456));
+    let rd64 = |o: usize| if data.len() >= o + 8 { u64::from_le_bytes(data[o..o + 8].try_into().unwrap()) } else { 0 };
+    let (token_a_amount, token_b_amount) = (rd64(680), rd64(688));
     let activation_point = if data.len() >= 480 { u64::from_le_bytes(data[472..480].try_into().unwrap()) } else { 0 };
     let (activation_type, pool_status, collect_fee_mode) = if data.len() >= 485 { (data[480], data[481], data[484]) } else { (0, 0, 0) };
     let fees = crate::quote::damm_v2::DammFees::parse(data).unwrap_or_default();
@@ -1194,6 +1197,8 @@ fn parse_meteora_damm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         sqrt_price,
         sqrt_min_price,
         sqrt_max_price,
+        token_a_amount,
+        token_b_amount,
         fees,
         activation_point,
         activation_type,

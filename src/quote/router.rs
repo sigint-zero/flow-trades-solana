@@ -674,9 +674,9 @@ impl Quoter {
             return Eval::Quoted(quote_dbc(input_mint, base_mint, quote_mint, curve, amount));
         }
 
-        if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
+        if let PoolState::MeteoraDamm { token_a_mint, token_b_mint, liquidity, sqrt_price, sqrt_min_price, sqrt_max_price, token_a_amount, token_b_amount, fees, activation_point, activation_type, collect_fee_mode, pool_status, .. } = state {
             return Eval::Quoted(quote_damm_v2(
-                input_mint, token_a_mint, token_b_mint, *liquidity, *sqrt_price, *sqrt_min_price, *sqrt_max_price, fees, *activation_point, *activation_type, *collect_fee_mode, *pool_status, amount,
+                input_mint, token_a_mint, token_b_mint, *liquidity, *sqrt_price, *sqrt_min_price, *sqrt_max_price, (*token_a_amount, *token_b_amount), fees, *activation_point, *activation_type, *collect_fee_mode, *pool_status, amount,
             ));
         }
 
@@ -1648,13 +1648,14 @@ fn quote_dbc(input_mint: &Pubkey, base_mint: &Pubkey, quote_mint: &Pubkey, curve
     Some((q.amount_out, q.fee, reserve_in, reserve_out))
 }
 
-/// Meteora DAMM v2 leg: single-range sqrt-price curve + fee scheduler.
+/// Meteora DAMM v2 leg: single-range sqrt-price curve (or constant product on
+/// the tracked `reserves` for a compounding pool) + base/dynamic fee.
 /// Without a known current point the CLIFF (highest) fee is assumed — the
 /// conservative side for a min_out.
 #[allow(clippy::too_many_arguments)]
 fn quote_damm_v2(
     input_mint: &Pubkey, mint_a: &Pubkey, mint_b: &Pubkey,
-    liquidity: u128, sqrt_price: u128, sqrt_min: u128, sqrt_max: u128,
+    liquidity: u128, sqrt_price: u128, sqrt_min: u128, sqrt_max: u128, reserves: (u64, u64),
     fees: &super::damm_v2::DammFees, activation_point: u64, activation_type: u8, collect_fee_mode: u8, pool_status: u8,
     amount: u64,
 ) -> Option<LegResult> {
@@ -1672,15 +1673,19 @@ fn quote_damm_v2(
     if current_point < activation_point {
         return None; // not tradable yet
     }
-    let fee_num = fees.total_fee_numerator(current_point, activation_point)?;
-    let q = super::damm_v2::swap_exact_in(sqrt_price, liquidity, sqrt_min, sqrt_max, fee_num, collect_fee_mode, a_to_b, amount)?;
+    let curve = if collect_fee_mode == super::damm_v2::COLLECT_FEE_MODE_COMPOUNDING {
+        super::damm_v2::DammCurve::Compounding { reserve_a: reserves.0, reserve_b: reserves.1 }
+    } else {
+        super::damm_v2::DammCurve::Concentrated { liquidity, sqrt_price, sqrt_min, sqrt_max }
+    };
+    let fee_num = fees.total_fee_numerator(current_point, activation_point, a_to_b, amount, sqrt_price)?;
+    let q = super::damm_v2::swap_exact_in(&curve, fee_num, collect_fee_mode, a_to_b, amount)?;
     if q.amount_out == 0 {
         return None;
     }
-    // Reserves implied by the curve inside its range (for price-impact reporting).
-    let res_a = super::damm_v2::delta_a(sqrt_price, sqrt_max, liquidity, false).unwrap_or(0) as u128;
-    let res_b = super::damm_v2::delta_b(sqrt_min, sqrt_price, liquidity, false).unwrap_or(0) as u128;
-    let (reserve_in, reserve_out) = if a_to_b { (res_a, res_b) } else { (res_b, res_a) };
+    // Reserves implied by the curve (for price-impact reporting).
+    let (res_a, res_b) = curve.reserves();
+    let (reserve_in, reserve_out) = if a_to_b { (res_a as u128, res_b as u128) } else { (res_b as u128, res_a as u128) };
     Some((q.amount_out, q.fee, reserve_in, reserve_out))
 }
 
@@ -1838,7 +1843,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let input_mint = Pubkey::new_unique();
         let result = extract_reserves_inline(&state, &input_mint);
@@ -1944,7 +1949,7 @@ mod tests {
             token_b_vault: vb,
             token_a_mint: ma,
             token_b_mint: mb,
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
 
         let (v_a, v_b, m_a, m_b) = extract_vault_mints(&state).unwrap();

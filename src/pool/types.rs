@@ -357,6 +357,12 @@ pub enum PoolState {
         sqrt_min_price: u128,
         #[serde(default)]
         sqrt_max_price: u128,
+        /// Reserves the pool tracks itself (layout v1); the curve of a
+        /// compounding pool (`collect_fee_mode` 2).
+        #[serde(default)]
+        token_a_amount: u64,
+        #[serde(default)]
+        token_b_amount: u64,
         #[serde(default)]
         fees: crate::quote::damm_v2::DammFees,
         #[serde(default)]
@@ -754,7 +760,7 @@ mod tests {
             token_b_vault: Pubkey::new_unique(),
             token_a_mint: Pubkey::new_unique(),
             token_b_mint: Pubkey::new_unique(),
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();

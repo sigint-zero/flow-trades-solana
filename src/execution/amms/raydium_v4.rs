@@ -373,7 +373,7 @@ mod tests {
             token_b_vault: dummy_pubkey(3),
             token_a_mint: dummy_pubkey(4),
             token_b_mint: dummy_pubkey(5),
-            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
+            liquidity: 0, sqrt_price: 0, sqrt_min_price: 0, sqrt_max_price: 0, token_a_amount: 0, token_b_amount: 0, fees: Default::default(), activation_point: 0, activation_type: 0, collect_fee_mode: 0, pool_status: 0,
         };
         let order = make_order(dummy_pubkey(20), dummy_pubkey(21));
 
