@@ -60,6 +60,10 @@ pub struct ByrealFee {
     pub open_time: u64,
     /// `status` u8 @389: bit4 set = swaps disabled.
     pub status: u8,
+    /// Byte @390: padding in Byreal's source, `fee_on` in Raydium CLMM's
+    /// August 2026 layout (0 = fee from the input). Zero on every Byreal pool;
+    /// anything else is a layout this module does not price.
+    pub fee_on: u8,
     /// Dynamic-fee parameters @1100..1106: arbitrage buffer (ppm), trade-size
     /// fee base (1/1000) and threshold (×100 quote units), imbalance fee base
     /// (1/10) and threshold x (percent).
@@ -122,6 +126,7 @@ impl ByrealFee {
             decay_interval: d[1099],
             open_time: u64::from_le_bytes(d[1080..1088].try_into().ok()?),
             status: d[389],
+            fee_on: d[390],
             arbitrage_fee_buffer_ppm: u16::from_le_bytes(d[1100..1102].try_into().ok()?),
             slippage_fee_base: d[1102],
             slippage_fee_threshold: d[1103],
@@ -154,9 +159,9 @@ impl ByrealFee {
         self.flags & 1 != 0
     }
 
-    /// Whether a swap can execute at `now` (unix seconds).
+    /// Whether a swap can execute at `now` (unix seconds) and be priced here.
     pub fn can_swap(&self, now: u64) -> bool {
-        self.status & (1 << 4) == 0 && now > self.open_time
+        self.status & (1 << 4) == 0 && now > self.open_time && self.fee_on == 0
     }
 
     /// `PoolState::calculate_base_trade_fee_rate`: the effective trade fee
@@ -429,6 +434,8 @@ mod tests {
         assert!(f.can_swap(101));
         let disabled = ByrealFee { status: 1 << 4, ..fee() };
         assert!(!disabled.can_swap(u64::MAX));
+        let fee_on_output = ByrealFee { fee_on: 1, ..fee() };
+        assert!(!fee_on_output.can_swap(u64::MAX), "fee taken from the output is not priced");
     }
 
     // The program's own unit tests (libraries/dynamic_fee_math.rs, util/pyth.rs).
