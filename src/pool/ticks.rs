@@ -24,7 +24,7 @@ pub fn tick_source(state: &PoolState) -> Option<(TickLayout, Pubkey, Pubkey, i32
         PoolState::PancakeSwap { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Raydium, PANCAKESWAP_PROG_ID, *pool, *tick_current, *tick_spacing)),
         PoolState::Orca { whirlpool, tick_current, tick_spacing, .. } => Some((TickLayout::Orca, ORCA_PROG_ID, *whirlpool, *tick_current, *tick_spacing)),
         PoolState::Byreal { pool, tick_current, tick_spacing, .. } => Some((TickLayout::Raydium, BYREAL_PROG_ID, *pool, *tick_current, *tick_spacing)),
-        PoolState::DefiTunaFusion { pool, tick_current_index, tick_spacing, .. } => Some((TickLayout::Orca, DEFITUNA_FUSION_PROG_ID, *pool, *tick_current_index, *tick_spacing as i32)),
+        PoolState::DefiTunaFusion { pool, tick_current_index, tick_spacing, .. } => Some((TickLayout::Fusion, DEFITUNA_FUSION_PROG_ID, *pool, *tick_current_index, *tick_spacing as i32)),
         _ => None,
     }
 }
@@ -74,10 +74,11 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
         return Err(TradeError::Execution("tick array batch size mismatch".into()));
     }
     let mut ticks: Vec<(i32, i128)> = Vec::new();
+    let mut limit_orders: Vec<(i32, u64)> = Vec::new();
     let mut initialized_arrays = Vec::new();
     for (i, start) in plan.starts.iter().enumerate() {
         if let Some(acct) = &accounts[i] {
-            if let Some((parsed_start, arr)) = plan.layout.parse_array(&acct.data, plan.spacing) {
+            if let Some((parsed_start, arr, orders)) = plan.layout.parse_array(&acct.data, plan.spacing) {
                 if parsed_start != *start {
                     return Err(TradeError::Execution(format!("tick array {} start {parsed_start} != derived {start}", plan.keys[i])));
                 }
@@ -85,10 +86,12 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
                     initialized_arrays.push(*start);
                 }
                 ticks.extend(arr);
+                limit_orders.extend(orders);
             }
         }
     }
     ticks.sort_unstable_by_key(|(t, _)| *t);
+    limit_orders.sort_unstable_by_key(|(t, _)| *t);
     let bitmap_extension = match plan.extension {
         Some(e) if accounts.get(plan.starts.len()).map(|a| a.is_some()).unwrap_or(false) => Some(e),
         _ => None,
@@ -103,8 +106,8 @@ pub fn publish_ticks(plan: &TickFetchPlan, accounts: &[Option<solana_sdk::accoun
         covered_hi: plan.starts[plan.starts.len() - 1] + plan.span - 1,
         initialized_arrays,
         bitmap_extension,
+        limit_orders,
         fetched_at: Instant::now(),
-        layout: plan.layout,
     });
     debug!(pool = %plan.pool, ticks = data.ticks.len(), arrays = data.initialized_arrays.len(), ext = data.bitmap_extension.is_some(), "loaded clmm ticks");
     TICKS.insert(plan.pool, Arc::clone(&data));

@@ -235,6 +235,9 @@ pub enum PoolState {
         liquidity: u128,
         /// Fee rate in hundredths of a basis point (e.g., 2500 = 25 bps)
         fee_rate: u16,
+        /// Fee side (`fee_on`) and dynamic fee of newer pools.
+        #[serde(default)]
+        fee_ext: crate::quote::clmm::RaydiumFeeExt,
     },
     RaydiumLp {
         pool_state: Pubkey,
@@ -810,6 +813,7 @@ mod tests {
             sqrt_price_x64: 1u128 << 64,
             liquidity: 1_000_000,
             fee_rate: 25,
+            fee_ext: Default::default(),
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: PoolState = serde_json::from_str(&json).unwrap();

@@ -219,7 +219,7 @@ mod tests {
         assert!(ByrealExecutor.build_swap_ix(&o, &st).is_err());
         crate::quote::clmm::TICKS.insert(pool, std::sync::Arc::new(crate::quote::clmm::TickData {
             ticks: vec![(-21_360, 5)], covered_lo: -21_480, covered_hi: -21_000, initialized_arrays: vec![-21_360],
-            bitmap_extension: None, fetched_at: std::time::Instant::now(), layout: crate::quote::clmm::TickLayout::Raydium,
+            bitmap_extension: None, limit_orders: vec![], fetched_at: std::time::Instant::now(),
         }));
         let ix = &ByrealExecutor.build_swap_ix(&o, &st).unwrap().swap[0];
         assert_eq!(ix.data[..8], DISC_SWAP_V3_DYN);

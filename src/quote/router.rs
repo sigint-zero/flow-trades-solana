@@ -561,7 +561,7 @@ impl Quoter {
             // without them the only honest answer is "not yet" (the cold path
             // loads them). The single-range approximation over-quotes as soon
             // as a swap crosses into thinner liquidity, so it is never used.
-            let (tick_current, _tick_spacing) = match clmm_tick_pos(state) {
+            let (layout, _, _, tick_current, tick_spacing) = match crate::pool::ticks::tick_source(state) {
                 Some(t) => t,
                 None => return Eval::Quoted(None),
             };
@@ -575,7 +575,15 @@ impl Quoter {
                 super::byreal_fee::SwapFee::Rate(r) => r,
                 super::byreal_fee::SwapFee::Unavailable => return Eval::Quoted(None),
             };
-            let out = match clmm::swap_exact_in(params.sqrt_price_x64, params.liquidity, tick_current, fee_ppm, &ticks, params.a_to_b, amount) {
+            let fee_ext = match state {
+                PoolState::RaydiumClmm { fee_ext, .. } => *fee_ext,
+                _ => Default::default(),
+            };
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let pool = clmm::ClmmPool {
+                layout, sqrt_price_x64: params.sqrt_price_x64, liquidity: params.liquidity, tick_current, tick_spacing, fee_ppm, fee_ext, now,
+            };
+            let out = match clmm::swap_exact_in_pool(&pool, &ticks, params.a_to_b, amount) {
                 Some(r) if r.amount_out > 0 => r.amount_out,
                 _ => return Eval::Quoted(None),
             };
@@ -1692,11 +1700,6 @@ fn quote_damm_v2(
     let (res_a, res_b) = curve.reserves();
     let (reserve_in, reserve_out) = if a_to_b { (res_a as u128, res_b as u128) } else { (res_b as u128, res_a as u128) };
     Some((q.amount_out, q.fee, reserve_in, reserve_out))
-}
-
-/// (tick_current, tick_spacing) of a tick-array pool.
-fn clmm_tick_pos(state: &PoolState) -> Option<(i32, i32)> {
-    crate::pool::ticks::tick_source(state).map(|(_, _, _, t, s)| (t, s))
 }
 
 fn venue_fee_bps(state: &PoolState, pool_type: PoolType, pool: &Pubkey) -> u16 {

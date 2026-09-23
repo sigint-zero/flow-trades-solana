@@ -1783,6 +1783,7 @@ mod tests {
             sqrt_price_x64: Q64,
             liquidity: 500_000,
             fee_rate: 2500, // hundredths of a bp from the AmmConfig
+            fee_ext: Default::default(),
         };
 
         let params = extract_clmm_params(&state, &mint_0).unwrap();

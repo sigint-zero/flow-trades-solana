@@ -370,6 +370,7 @@ fn parse_raydium_clmm(pool_address: &Pubkey, pool_data: &Account) -> TradeResult
         sqrt_price_x64,
         liquidity,
         fee_rate,
+        fee_ext: crate::quote::clmm::RaydiumFeeExt::parse(data),
     })
 }
 

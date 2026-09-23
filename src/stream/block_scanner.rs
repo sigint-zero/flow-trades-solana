@@ -1026,7 +1026,7 @@ mod tests {
                 tick_array_0: pk(), tick_array_1: pk(), tick_array_2: pk(),
                 token_mint_0: pk(), token_mint_1: pk(),
                 tick_current: 0, tick_spacing: 1,
-                sqrt_price_x64: 0, liquidity: 0, fee_rate: 0,
+                sqrt_price_x64: 0, liquidity: 0, fee_rate: 0, fee_ext: Default::default(),
             },
             crate::pool::types::PoolState::Orca {
                 whirlpool: pk(), token_vault_a: pk(), token_vault_b: pk(),
@@ -1262,7 +1262,7 @@ mod tests {
             token_mint_1: mint_1,
             tick_current: 0,
             tick_spacing: 1,
-            sqrt_price_x64: 0, liquidity: 0, fee_rate: 0,
+            sqrt_price_x64: 0, liquidity: 0, fee_rate: 0, fee_ext: Default::default(),
         };
         let result = extract_mints_from_state(&state);
         assert_eq!(result, Some((mint_0, mint_1)));
